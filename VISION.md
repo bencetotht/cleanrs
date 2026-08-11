@@ -109,10 +109,58 @@ dedupes these; cleanrs must too, and must additionally distinguish "all links
 are inside the scan scope" (deleting the scope frees the blocks) from "links
 exist outside" (it does not).
 
+**Cloud / File Provider storage — the most dangerous case in this list.**
+iCloud Drive (`~/Library/Mobile Documents`) and everything under
+`~/Library/CloudStorage` (Dropbox, Google Drive, OneDrive, and others all use
+File Provider now) contain **dataless files**: large apparent size, near-zero
+allocated. Three distinct hazards:
+
+1. **Deletion propagates.** Removing a dataless file deletes it from the cloud
+   and from every other device. It is user data wearing a local-cache costume.
+   `--trash` does not save you, and there is no undo. The correct operation for
+   reclaiming local space is **evict** (`brctl evict` / File Provider APIs),
+   never delete.
+2. **The realistic failure mode is an intersection, not a top-level path.** No
+   one writes a target for `~/Library/CloudStorage`. But a perfectly ordinary
+   detector — `marker = "package.json"`, `dir = "node_modules"` — fires happily
+   inside a synced folder, and `.next`, `dist`, and `target` have the same
+   exposure. A location deny-list is therefore necessary but **not sufficient**:
+   every path a detector produces must additionally be checked for dataless /
+   ubiquitous status at plan time, and refused.
+3. **Materialization.** If traversal causes dataless files to download, cleanrs
+   could pull hundreds of gigabytes while claiming to save space — a
+   catastrophic and particularly ironic failure. Reading attributes via
+   `getattrlistbulk` should not materialize content, but "should not" is
+   insufficient assurance here. [hyp: verified by an explicit Phase 0 test
+   asserting zero downloaded bytes when scanning a folder of evicted files.]
+
+Usefully, the metrics behave in the safe direction: dataless files have huge
+apparent size and near-zero allocated, so anything ranked by allocated size
+naturally ignores them. Only apparent-ranked output surfaces them, and it
+surfaces them as fake wins — another reason allocated is the default ranking.
+
 **Provider-managed storage.** Docker on macOS stores everything inside a sparse
 disk image. Reclaiming space *inside* the VM does not necessarily shrink the
 image on the host. Reporting the inner figure as recovered host space would be
 misleading.
+
+**Open files.** Unlinking a file that a running process still holds open
+succeeds but returns no blocks until the last descriptor closes. Cleaning
+`node_modules` under a running `next dev` is the everyday instance. This is both
+a safety footgun and a named source of divergence between estimated and observed
+reclamation (§11). [hyp: a targeted `proc_listpids` + descriptor sweep over the
+user's own processes, restricted to a known path set, is cheap — plausibly well
+under a second. `lsof` is slow because of what `lsof` does, not because the
+underlying calls are. To be measured in Phase 0; if it holds, run it as a
+pre-flight warning for direct-deletion targets rather than only as an
+after-the-fact explanation.]
+
+**Multiple volumes share one pool.** APFS volumes within a container share free
+space. Swap lives on `/System/Volumes/VM`, Nix commonly on its own `/nix`
+volume, and `System`, `Preboot`, and `Recovery` are separate volumes again.
+Reconciliation is therefore **container-scoped, not volume-scoped** (§5); a
+single-volume equation cannot balance and cannot see storage the design has
+already committed to reporting.
 
 **TCC / Full Disk Access.** An unsandboxed CLI without Full Disk Access receives
 `EPERM` across parts of `~/Library`. Silently skipping those paths yields a
@@ -131,33 +179,73 @@ distinction is exposed in the UI rather than collapsed into one "size" column.
 |---|---|
 | **Apparent** | Exact logical length (`st_size`) of everything within scan coverage. |
 | **Allocated** | Attributed allocation as reported by the filesystem (`st_blocks`). Sparse-correct. Comparable to default `du`. |
-| **Immediately private** | Bytes the filesystem reports as freed immediately if this file were deleted — i.e. not trapped in a clone or snapshot. Derived from `ATTR_CMNEXT_PRIVATESIZE` [ref: getattrlist.2]. |
-| **Estimated reclaimable** | A group- or path-level estimate of what deletion would return, carrying a **confidence** level and a one-line explanation. |
-| **Actually reclaimed** | Observed after a cleanup: provider-reported figures plus measured volume free-space delta. |
+| **Immediately private** | Bytes the filesystem reports as freed immediately if **this file alone** were deleted — i.e. not trapped in a clone or snapshot. Derived from `ATTR_CMNEXT_PRIVATESIZE` [ref: getattrlist.2]. Per-file only; see §3.1 before summing it. |
+| **Estimated reclaimable** | A group- or path-level **interval** bracketing what deletion would return, with a derived confidence and a one-line explanation. |
+| **Actually reclaimed** | Observed after a cleanup: provider-reported figures plus measured container free-space delta (§5.1). |
 
-**Estimated reclaimable is the headline**, and it is always shown with its
-confidence:
+**Estimated reclaimable is the headline.**
 
-```
-18.2 GiB estimated reclaimable · medium confidence
-Shared APFS extents and snapshots may reduce the result
-```
+### 3.1 Group reclamation is superadditive — never sum private sizes
 
-### 3.1 Confidence must be decidable, not decorative
+`PRIVATESIZE` answers "what if *this file alone* were deleted." That makes it
+**superadditive over sets**: if two files share blocks only with each other,
+those blocks appear in neither file's private size, yet deleting both frees
+them. Formally, `reclaim(A ∪ B) ≥ reclaim(A) + reclaim(B)`.
 
-If most figures read "medium," users learn to ignore the label. Confidence is
-therefore computed from explicit conditions, tuned so that **high is the common
-case** for ordinary build artifacts:
+Summing per-file private sizes therefore produces a lower bound, and it is worst
+precisely where cleanrs is most useful — build trees such as `DerivedData`,
+where the build system clones internally, or Bun's package installs, which clone
+by design on macOS. A naive sum can report near-zero for a directory whose
+removal would free gigabytes.
 
-| Level | Conditions |
+Compounding this, §2 establishes that a clone ID identifies files that
+*originated* from the same stream, not which extents remain shared after
+divergence. So the exact figure is not computable from available metadata at
+all.
+
+The response is to stop pretending it is a point value and **report an
+interval**:
+
+| Bound | Definition | Meaning |
+|---|---|---|
+| **Floor** | Σ per-file `PRIVATESIZE` over the set | What you get if every clone family has members outside the set. |
+| **Ceiling** | Allocated, with each clone family counted **once** | What you get if every family is wholly contained in the set. |
+
+The truth lies between, moving toward the ceiling as `ATTR_CMNEXT_CLONE_REFCNT`
+matches the number of family members actually observed within scope. Hardlinks
+are treated identically: all links inside the set pushes toward the ceiling, any
+link outside pins toward the floor. Snapshot coverage pushes toward the floor
+regardless.
+
+### 3.2 Confidence is interval tightness, not a separate judgment
+
+Confidence is not a hand-tuned label attached after the fact. It falls out of
+the arithmetic:
+
+| Level | Condition |
 |---|---|
-| **high** | Every file in scope has link count 1 (or all links within scope), no clone references outside scope (`ATTR_CMNEXT_CLONE_REFCNT` indicates sole reference), `PRIVATESIZE` ≈ allocated, no snapshot covers the path, and the whole subtree is being removed. |
-| **medium** | Clone references or snapshot coverage detected, but bounded — a lower bound on reclaimable space can still be stated. |
-| **low** | Provider-managed storage, significant snapshot coverage, or incomplete scan coverage (permissions). Report a range, or decline to give a figure. |
+| **high** | Floor and ceiling agree within a small tolerance — typically no sharing at all, so the interval collapses to one number. |
+| **medium** | A bounded interval: sharing exists, but both ends are derivable. |
+| **low** | Either end is underivable — provider-managed storage, incomplete coverage from denied paths, or significant snapshot coverage. Report the range explicitly, or decline to give a figure. |
 
-A `--explain <path>` mode prints exactly which condition demoted a figure.
+This has the property §3.1's problem demanded: for the common case — a
+`node_modules`, a `.next`, most `target/` directories, none of which share
+blocks with anything outside themselves — floor equals ceiling, and the tool
+reports a single number at high confidence without special-casing.
 
-### 3.2 Accounting is a research task, not a solved one
+The UI shows a single figure when the interval is tight, and the range when it
+is not:
+
+```
+18.2 GiB reclaimable · high confidence
+
+12.4–18.2 GiB reclaimable · medium confidence
+Cloned blocks shared with paths outside this selection
+```
+
+`--explain <path>` prints which files or families widened the interval.
+
+### 3.3 Accounting is a research task, not a solved one
 
 **Exact freeable bytes is an aspiration, not a claimed capability.** Phase 0 of
 the roadmap (§12) is a dedicated spike to determine what is actually derivable,
@@ -167,7 +255,10 @@ evaluating together:
 - `ATTR_CMNEXT_CLONEID` — clone family identity
 - `ATTR_CMNEXT_CLONE_REFCNT` — how many references share the stream
 - hardlink count versus links actually observed within scope
-- snapshot enumeration and coverage
+- snapshot enumeration and coverage, and how snapshot churn moves `PRIVATESIZE`
+  for files that never changed (§10.3)
+- dataless / ubiquitous file attributes, and whether traversal materializes them
+- the cost of detecting open descriptors against a known path set
 - **before/after volume capacity measurement as ground truth**
 
 The last item is the arbiter. Any accounting model is validated by deleting a
@@ -264,29 +355,62 @@ A directory walk will never sum to `df`, and users read that as a bug. Make it a
 feature — but **do not force every byte into a bucket**. Unexplained is a valid,
 honest category.
 
+### 5.1 Reconciliation is container-scoped
+
+Free space belongs to the **APFS container**, not to any one volume. A
+single-volume equation cannot balance, and worse, it cannot even see storage
+this design has already committed to reporting: §7.3 requires `doctor` to
+account for swap, which lives on `/System/Volumes/VM` — a different volume from
+Data — and a Nix store commonly occupies its own `/nix` volume again.
+
+`doctor` therefore enumerates every volume in the container and presents shared
+free space as the single pool it actually is.
+
 ```
 cleanrs doctor
 
-  Volume  /System/Volumes/Data
-    Capacity                                    1.86 TB
-    Used (df)                                   1.71 TB
-    Free (df)                                    153 GB
+  Container  disk3                              1.86 TB capacity
+    Free (shared across volumes)                 153 GB
+    Used                                        1.71 TB
 
-  Observed
-    Files, immediately private (scanned)        1.02 TB    high confidence
-    Purgeable (reported by APFS)                  94 GB
-    Snapshots                                 12 present   size not directly attributable
-    Unexplained gap                              292 GB    not attributed
+  Volumes
+    Data           /System/Volumes/Data         1.61 TB
+    VM             /System/Volumes/VM             16 GB   swap, OS-managed
+    System         /                             11 GB   read-only
+    Nix            /nix                          68 GB
+    Preboot, Recovery                            5.6 GB
+
+  Data volume, attributed
+    Files, clone-deduped allocated              1.31 TB   high confidence
+      of which shared with paths outside scope    88 GB
+    Unexplained                                  292 GB   not attributed
+
+  Container-level, not attributable to paths
+    Purgeable (reported by APFS)                  94 GB   ┐ these overlap:
+    Snapshots                                 12 present  ┘ purgeable largely
+                                                            includes snapshot space
 
   Coverage
     Inaccessible roots                                47   size unknown
     Scan coverage                             incomplete   Full Disk Access not granted
 ```
 
-Note what this does *not* say: it does not claim the inaccessible roots contain
-some number of gigabytes, and it does not pretend the categories sum. Snapshots,
-purgeable space, volume sharing within an APFS container, and ordinary files do
-not form a clean additive equation, and the output should not imply one.
+### 5.2 What the output deliberately refuses to do
+
+- **It does not sum private sizes.** The headline attributed figure is
+  **clone-deduped allocated** (§3.1's ceiling), because summing per-file
+  `PRIVATESIZE` at volume scale counts every shared block zero times, which
+  would both understate files and inflate the unexplained gap into something
+  that looks alarming when it is mostly ordinary clone sharing.
+- **It does not claim a size for inaccessible roots.** Their count and location
+  are known; their contents are exactly what was denied.
+- **It does not present purgeable and snapshots as disjoint rows that add.**
+  Purgeable space largely *contains* snapshot space. Showing them as two flat
+  entries invites exactly the wrong arithmetic, so containment is drawn
+  explicitly.
+- **It does not force the categories to balance.** Snapshots, purgeable space,
+  container-level volume sharing, and ordinary files do not form a clean
+  additive equation, and the layout must not imply one.
 
 `doctor` is also where environment diagnostics live: Full Disk Access status
 with the exact remediation path for the user's terminal binary, index freshness,
@@ -417,6 +541,7 @@ candidate, protected user data, or diagnostic-only system state.
 | Home directory | 295 GB | Primary scan scope and aggregation root. Never a cleanup target itself. Run detectors during the traversal and partition results into ordinary files, known targets, protected data, and unexplained/denied coverage. |
 | `~/Library` | 146 GB | Scan and classify specific descendants. Never offer broad deletion of `~/Library`: `Caches` may contain candidates while `Application Support`, containers, backups, and app runtime state are presumptively user data until a provider says otherwise. |
 | `~/Developer` | 86 GB | One scoped traversal with project/workspace detection. Recognize and deduplicate Cargo workspace `target` directories, `node_modules`, `.next`, `dist`, coverage, and similar generated output. Apply per-project staleness and rebuild-cost policy; never clean every matching directory merely because its name matches. |
+| Cloud / File Provider storage | not in the baseline inventory | `~/Library/Mobile Documents` and `~/Library/CloudStorage` are a **hard deny-list for deletion**, and the deny-list alone is insufficient: any path produced by any detector must be checked for dataless/ubiquitous status at plan time and refused (§2). Report local allocated versus apparent so evictable content is visible, and surface **evict** as the space-reclaiming operation — never delete. Assert during traversal that no content is materialized. |
 | VMware NixOS VM | 29 GB | Detect the `.vmwarevm` bundle and report apparent/allocated/private sizes plus recognizable snapshot/suspend components. The whole VM is `user_data`, explicit-target-only. Offer provider-guided disk compaction or snapshot management only after checking power state and required temporary free space; never delete bundle internals. This is not the Nix-store provider. |
 | OrbStack | 29 GB | Detect OrbStack as the active Docker context and pin every inspect/plan/execute/verify call to that context. Inventory images, build caches, containers, and volumes separately; volumes and OrbStack Linux-machine disks are `user_data`. Never delete the host sparse image directly. Verify both engine-side change and host free-space delta. |
 | Wallpaper cache | 24 GB | Detect the wallpaper agent's cache location by supported macOS version, validate container ownership and generated rendition schema, and report source images separately. The 1,410 BMP files are generated candidates, but cleanup starts `confirmed` rather than unattended until quiescing/regeneration behavior is proven. Journal them as an abnormal cache-growth finding. |
@@ -429,7 +554,7 @@ candidate, protected user data, or diagnostic-only system state.
 | Bun cache | 4.7 GB | Discover the configured path with `bun pm cache`; use `bun pm cache rm` rather than raw deletion. Classify as downloadable/network-required and verify APFS-aware host reclamation because Bun uses clones when installing packages on macOS. |
 | Xcode data | 7.5 GB: 3 GB DerivedData, 4.5 GB simulator devices | Split into different targets. `DerivedData` is generated but potentially expensive to rebuild; remove only stale project subtrees or an explicitly selected whole cache. Unavailable simulator resources may use supported `simctl` cleanup, but simulator device/application data is `user_data` and never selected by a cleanup level. Downloadable simulator runtimes are a separate expensive target. |
 
-This baseline also imposes three cross-provider requirements:
+This baseline also imposes four cross-provider requirements:
 
 1. **No double counting.** Nested scan areas, APFS clones, pnpm links, Bun
    clones, and VM sparse images must remain distinguishable in both totals and
@@ -438,8 +563,13 @@ This baseline also imposes three cross-provider requirements:
    inspected — including Docker context and endpoint — and aborts if that
    identity changes before execution.
 3. **Detection without deletion is success.** VM state, volumes, simulator app
-   data, and swap are valuable findings even when cleanrs correctly refuses to
-   remove them.
+   data, swap, and synced cloud content are valuable findings even when cleanrs
+   correctly refuses to remove them.
+4. **Detectors are scoped, and scope is not enough.** A generic marker-based
+   detector (`package.json` → `node_modules`) will match inside synced cloud
+   folders, inside VM bundles, and inside provider-owned storage. Every
+   candidate path passes the §8.2 invariants *and* the cloud/dataless refusal
+   before it can enter a plan.
 
 ---
 
@@ -462,7 +592,7 @@ The rules:
   *"moved, not yet reclaimed"* — never "reclaimed."
 - **Scheduled runs never use Trash.**
 - **Bytes moved to Trash and bytes reclaimed are separate journal fields**
-  (§11), and the observed volume free-space delta is recorded independently of
+  (§11), and the observed container free-space delta is recorded independently of
   both.
 
 ### 8.2 Path invariants for direct deletion
@@ -484,8 +614,33 @@ enforced in code, and property-tested:
 8. Bound total unattended deletion per run; exceeding it requires confirmation.
 9. `children_only` must never resolve, after normalization, to a path broader
    than the declared target.
+10. **Refuse any path under `~/Library/Mobile Documents` or
+    `~/Library/CloudStorage`, and refuse any individual file carrying dataless
+    or ubiquitous status**, wherever it lives (§2). This check runs on candidate
+    paths at plan time, not only on target roots, because the hazard arrives via
+    ordinary detectors matching inside synced folders.
 
-### 8.3 Other mechanics
+### 8.3 Open files
+
+Unlinking a file held open by a running process returns no blocks until the last
+descriptor closes. The estimate will be right and the observed delta will not,
+and a developer machine hits this routinely — `node_modules` beneath a running
+dev server is the standard case.
+
+Handling, in order of preference pending the Phase 0 measurement in §2:
+
+- **If the targeted descriptor sweep proves cheap**, run it as a pre-flight
+  check on direct-deletion targets and warn — naming the holding process —
+  before applying.
+- **Regardless**, treat it as a named, expected discrepancy class in the
+  journal. When `container_free_delta` falls well short of the estimate, open
+  descriptors are among the first explanations `history` should offer, alongside
+  snapshot coverage and clone sharing.
+
+This is deliberately not a blocking check. cleanrs should explain the shortfall,
+not refuse to work while any process is running.
+
+### 8.4 Other mechanics
 
 - **Dry-run is the default.** `clean` plans and prints; `--apply` executes.
 - **Never run as root by default.** Refuse with an explanation absent an
@@ -494,7 +649,7 @@ enforced in code, and property-tested:
   unattended execution.
 - **Journal everything** (§11).
 
-### 8.4 Staleness
+### 8.5 Staleness
 
 `atime` is unreliable on APFS — updates are lazy and it is a poor proxy for
 recent use. Use instead the `mtime` of the project marker (`Cargo.toml`,
@@ -634,7 +789,16 @@ a target can be inspected and sized before it is ever written to a file, and
 
 ## 10. The index
 
-A cached scan makes the tool feel instant. Two constraints shape it.
+A cached scan makes the tool feel instant. Three constraints shape it, and the
+governing invariant is:
+
+> **The index caches the tree, not the verdict.**
+
+Durable per-file facts — apparent size, allocated size, inode, link count, clone
+ID, mtime — are properties of the file and may be cached. Anything derived from
+volume-global state — private size, the reclaimable interval, confidence — is a
+*conclusion*, and conclusions go stale for reasons the file itself never
+witnessed.
 
 ### 10.1 Directory mtime is not a valid cache key
 
@@ -665,7 +829,34 @@ Incremental scanning is an optimisation that degrades to correct. It must never
 be a mode that silently lies. The fallback path is exercised in tests, not
 merely written down.
 
-### 10.3 Size and format are open questions
+### 10.3 Snapshots are a staleness channel FSEvents cannot see
+
+FSEvents is not the only way cached data goes stale. **Snapshot creation and
+expiry change `PRIVATESIZE` for files that experienced no filesystem event at
+all.** A file untouched for months can move from "0 bytes private, pinned by a
+snapshot" to "8 GB private" the moment that snapshot expires, and no event
+fires. Cached reclaimability can therefore rot hourly with a perfectly valid
+event stream. Directory mtime is not the only invalid cache key here.
+
+Recomputing private size on read is the correct answer semantically but defeats
+the index: it is a full re-stat, which is exactly what the cache existed to
+avoid. The workable compromise:
+
+- **Tag cached private sizes with a snapshot generation token** — the snapshot
+  set identity and count for the volume, cheap to obtain. A token mismatch marks
+  those figures *degraded*, downgrading confidence rather than invalidating the
+  whole index.
+- **Recompute lazily and locally.** Only the subtree the user actually opens or
+  targets is re-derived, not the whole tree.
+- **Estimates in a plan are always re-derived, never read from cache.** Browsing
+  may show slightly stale figures; a cleanup plan never may.
+
+That last rule is worth holding independently of snapshots. It also covers
+ordinary drift between scan time and apply time, and it pairs naturally with the
+§8.2 revalidation invariants — the plan re-reads the world it is about to
+change.
+
+### 10.4 Size and format are open questions
 
 An earlier draft claimed the index would be "a few MB" for millions of files,
 which contradicted the in-memory arena estimate in the same document. Both
@@ -705,19 +896,37 @@ UI contract: index age is always visible. `--no-cache` bypasses for one run;
 | Field | Meaning |
 |---|---|
 | `bytes_selected` | What the plan targeted (allocated size of the selection). |
-| `estimated_reclaimable` | cleanrs's estimate, with its confidence level. |
+| `estimated_floor` / `estimated_ceiling` | The reclaimable interval (§3.1) and its derived confidence. |
 | `provider_estimated` | The provider's own pre-run estimate, where available. |
 | `provider_reported` | What the provider says it reclaimed. |
-| `volume_free_delta` | Measured free-space change on the volume. |
+| `container_free_delta` | Measured free-space change on the **container**, since that is where free space actually lives (§5.1). |
 | `bytes_trashed` | Moved but **not** reclaimed. |
+| `bytes_evicted` | Cloud content evicted rather than deleted — local space returned, remote copy intact. |
 
-`volume_free_delta` is **observed evidence, not attribution** — other processes
-allocate and free space concurrently, and snapshot expiry is asynchronous. It is
-reported as such, never as a precise figure for what cleanrs did.
+`container_free_delta` is **observed evidence, not attribution** — other
+processes allocate and free space concurrently, and snapshot expiry is
+asynchronous. It is reported as such, never as a precise figure for what cleanrs
+did.
 
-Together these fields are the calibration loop for §3.2: over many runs, the
-divergence between `estimated_reclaimable` and `volume_free_delta` is the
-measurement that tells us whether the accounting model is any good.
+Together these fields are the calibration loop for §3.3: over many runs, where
+the observed delta falls within `[floor, ceiling]` is the measurement that tells
+us whether the accounting model is any good. An observation *below* the floor is
+especially informative — it means something held blocks that the model believed
+were private.
+
+### 11.1 Named discrepancy classes
+
+When the observed delta falls short of the estimate, `history` should offer the
+known explanations rather than leaving the user to guess:
+
+- **Open descriptors** — blocks not returned until the holding process exits
+  (§8.3).
+- **Snapshot coverage** — blocks pinned until the snapshot expires.
+- **Clone sharing outside the selection** — the interval's floor was the honest
+  answer.
+- **Provider-internal reclamation** — space freed inside a VM disk image without
+  the host image shrinking (§2).
+- **Concurrent activity** — another process allocated during the run.
 
 The journal also needs **rotation** and, because it records private directory,
 project, and client names, an option for **path redaction** (hashing or
@@ -728,19 +937,32 @@ truncating paths while retaining sizes and target ids).
 ## 12. Roadmap
 
 **Phase 0 — Accounting research spike.** Before designing around any accounting
-model, determine empirically what is derivable: the behaviour of
-`PRIVATESIZE`, `CLONEID`, `CLONE_REFCNT`, and link counts across clones,
-divergence, snapshots, and hardlinks; the real cost of requesting the full
-attribute set; and a fixture harness that deletes known trees and compares
-predictions against measured volume deltas. **Output: a written statement of
-what cleanrs can and cannot promise.** Everything downstream depends on it.
+model, determine empirically what is derivable. Specifically:
+
+- The behaviour of `PRIVATESIZE`, `CLONEID`, `CLONE_REFCNT`, and link counts
+  across clones, divergence, snapshots, and hardlinks — and in particular
+  whether the §3.1 floor/ceiling interval actually brackets reality.
+- How snapshot creation and expiry move `PRIVATESIZE` for untouched files
+  (§10.3), and how cheaply a snapshot generation token can be obtained.
+- **Dataless-file safety**: scan a folder of evicted iCloud/CloudStorage
+  content and assert zero bytes downloaded and zero change in local allocation
+  (§2). This gates any traversal of a home directory.
+- The cost of an open-descriptor sweep against a known path set (§8.3).
+- The real cost of requesting the full attribute set in one bulk call.
+- A fixture harness that deletes known trees and compares predictions against
+  measured **container** deltas.
+
+**Output: a written statement of what cleanrs can and cannot promise.**
+Everything downstream depends on it.
 
 1. **Platform layer and a `scan` that prints one number.** `getattrlistbulk` end
    to end, benchmarked against `du`, `diskus`, `gdu` from day one.
-2. **Accounting.** Hardlinks, clone families, private size, snapshot detection,
-   mount boundaries, firmlinks, permission errors as counted locations.
-   Confidence computation per §3.1.
+2. **Accounting.** Hardlinks, clone families, the reclaimable interval, snapshot
+   detection, mount boundaries, firmlinks, dataless-file refusal, permission
+   errors as counted locations. Confidence derivation per §3.2.
 3. **`doctor`.** Cheap on top of step 2, and immediately the most useful command.
+   Container-scoped from the start (§5.1) — retrofitting volume-scoped output
+   would mean rewriting it.
 4. **Targets and `clean --dry-run`.** Manifest, CLI specs, detection, sizing.
 5. **Providers.** inspect/plan/execute/verify for the complete §7.3 acceptance
    baseline: Homebrew; Docker Desktop and OrbStack as distinct contexts; Cargo;
@@ -758,18 +980,20 @@ what cleanrs can and cannot promise.** Everything downstream depends on it.
 ## 13. Command surface
 
 ```
-cleanrs scan [PATH]           One-shot analysis.
+cleanrs scan [PATH]           One-shot analysis. Ranked by allocated by default.
                               --json --apparent --allocated --private --reclaimable
                               --depth N --min-size --exclude --explain
 cleanrs tui  [PATH]           Interactive browser (ratatui).
-cleanrs doctor                Reconcile volume state; report unexplained gap.
+cleanrs doctor                Reconcile container state; report unexplained gap.
+                              --container <id> --all-containers
 cleanrs targets               List detected targets with sizes and confidence.
                               --only --exclude --target... --export
 cleanrs clean                 Reclaim space. Dry-run by DEFAULT.
                               --level safe|standard|aggressive
                               --apply --yes --trash
                               --only --exclude --target... --config
-cleanrs history               Journal of past runs, estimated vs. observed.
+cleanrs history               Journal of past runs, estimated vs. observed,
+                              with discrepancy classes.
 cleanrs schedule install|remove|status
 cleanrs index [--reindex|--clear|--status]
 ```
@@ -777,6 +1001,12 @@ cleanrs index [--reindex|--clear|--status]
 Cross-cutting rules: dry-run default for anything destructive; `--json` on every
 command; meaningful exit codes for scripting; shell completions and a man page
 shipped; `NO_COLOR` respected; non-TTY degrades to plain output.
+
+`scan` ranks by **allocated** size by default. This is not only the honest
+default — it is also a safety property: dataless cloud files have enormous
+apparent size and near-zero allocation, so apparent-ranked output would float
+them to the top of every listing as attractive, catastrophic targets (§2).
+`--apparent` remains available and is labelled accordingly.
 
 ### 13.1 Scheduling
 
@@ -821,7 +1051,7 @@ platform seams in several modules, not one.
 | Parallelism | `rayon` or `crossbeam-deque` | Work-stealing over a directory queue. Not tokio. |
 | Syscalls | `libc` / `nix` + hand-written FFI | `getattrlistbulk` needs custom bindings. |
 | Hashing | `rustc-hash` / `ahash` | Inode and clone-ID sets are hot. |
-| Index | Undecided — benchmark `rkyv`+`memmap2`, custom, `redb`, SQLite | See §10.3. |
+| Index | Undecided — benchmark `rkyv`+`memmap2`, custom, `redb`, SQLite | See §10.4. |
 | Config | `serde` + `toml` | Target manifests. |
 | Errors | `anyhow` + `thiserror`, or `miette` | `miette` gives good CLI diagnostics. |
 | Logging | `tracing` + `tracing-subscriber` | Span timings for perf work. |
@@ -854,12 +1084,23 @@ platform seams in several modules, not one.
 - Fixture trees covering hardlinks, clones created via `clonefile`, clones that
   have since **diverged**, sparse files, symlinks, mount boundaries, unreadable
   directories, deep nesting, and very flat directories.
+- **A mutual-clone fixture**: two or more files that clone *only each other*,
+  where every per-file `PRIVATESIZE` is ~0 but deleting the whole set frees
+  everything. The estimate must produce a ceiling equal to the real reclamation,
+  not a floor of zero. This is the direct regression test for §3.1's
+  superadditivity, and the case a naive implementation gets catastrophically
+  wrong.
 - Snapshot tests (`insta`) over the tree and all reported metrics.
 - Differential testing against `du` on trees with no clones, where the two
   *should* agree on allocated size — divergence there is a cleanrs bug.
-- **Ground-truth harness**: delete a fixture set, measure the real volume delta,
-  compare against the prediction. This is the only test that validates the
-  headline metric.
+- **Ground-truth harness**: delete a fixture set, measure the real container
+  delta, and assert it falls within `[floor, ceiling]`. This is the only test
+  that validates the headline metric. A result below the floor is a hard
+  failure, not a tolerance issue — it means the model believed blocks were
+  private when they were not.
+- **Snapshot-churn test**: take a snapshot, observe `PRIVATESIZE` collapse for
+  untouched files, delete the snapshot, observe it return — with no filesystem
+  events fired throughout. This is the §10.3 staleness channel made executable.
 - Clone semantics self-test per §14.2.
 
 **Performance.**
@@ -890,6 +1131,17 @@ platform seams in several modules, not one.
 - Acceptance tests cover every row in §7.3. Destructive provider tests use
   fixtures or disposable instances; protected rows assert that no cleanup plan
   is produced without the required explicit naming.
+- **Cloud-storage refusal tests**, at two levels: no plan may include any path
+  under `~/Library/Mobile Documents` or `~/Library/CloudStorage`; *and* a
+  `node_modules` planted inside a synced folder — matched by an ordinary,
+  correctly-scoped detector — must be refused on its dataless/ubiquitous status
+  alone. The second test is the one that matters, because it is the failure mode
+  that actually occurs.
+- **Materialization test**: scanning a directory of evicted cloud files
+  downloads nothing and changes local allocation by zero.
+- Open-descriptor test: deleting a file held open by a live process reports the
+  shortfall and names the discrepancy class (§11.1) rather than claiming the
+  space was reclaimed.
 
 ---
 
@@ -956,9 +1208,29 @@ installed macOS SDK and command-line tools on the author's machine.
   host-side cleanup API for its VM bundle has not been found. Treat bundle paths
   and reset behavior as versioned research rather than a supported contract.
 
+**Cloud / File Provider storage**
+- Apple, File Provider framework and `NSFileProviderExtension` — dataless
+  materialization and eviction semantics for `~/Library/CloudStorage`.
+- `brctl(1)` — iCloud eviction from the command line.
+- Apple, "Optimize storage" / evict-vs-delete behaviour for iCloud Drive.
+- **To be verified experimentally (Phase 0):** which metadata reads, if any,
+  trigger materialization of a dataless file; whether `getattrlistbulk` is safe
+  in this respect; and the exact attribute or flag that reliably identifies a
+  dataless or ubiquitous item.
+
+**Container-level accounting**
+- `diskutil apfs list` — container membership and volume roles.
+- APFS shared free-space semantics across volumes in a container; relationship
+  between reported purgeable space and snapshot storage (Oakley, eclecticlight.co).
+
 **To be sourced before implementation**
 - Whether and when Docker Desktop and OrbStack inner reclamation shrinks their
   host-side sparse storage on each supported version.
+- Whether purgeable space, as reported by macOS, is strictly a superset of
+  snapshot storage or merely overlaps it — the `doctor` layout depends on
+  stating the relationship correctly.
+- Cost and privilege requirements of enumerating open descriptors per path via
+  `proc_listpids` / `proc_pidfdinfo` for the current user's processes.
 - OrbStack Linux-machine inspection and supported deletion/compaction semantics.
 - Anthropic-supported Claude Cowork VM inspection, reset, and persistence
   semantics; do not rely on an observed bundle layout as a stable API.
@@ -982,6 +1254,15 @@ installed macOS SDK and command-line tools on the author's machine.
   under what conditions?
 - What is an honest confidence rule for provider-managed space, where cleanrs
   cannot inspect the internals at all?
+- How tight is the floor/ceiling interval in practice on a real developer
+  machine? If it is routinely wide, the interval is honest but not actionable,
+  and the accounting model needs more than clone IDs to narrow it.
+- Should cleanrs offer eviction of cloud content as an action at all, or only
+  report it? Eviction is safe and genuinely frees local space, but it makes
+  cleanrs a participant in sync behaviour, which is a larger surface than
+  deleting build artifacts.
+- Is a snapshot generation token cheap enough to check on every index read, or
+  does it need its own caching?
 - Distribution and Full Disk Access UX across Homebrew, direct download, and
   `cargo install`.
 
@@ -991,17 +1272,29 @@ installed macOS SDK and command-line tools on the author's machine.
 
 - **Apparent size** — logical file length (`st_size`).
 - **Allocated size** — blocks attributed to the file (`st_blocks`).
-- **Immediately private** — bytes freed at once on deletion, not held by a clone
-  or snapshot (`ATTR_CMNEXT_PRIVATESIZE`).
-- **Estimated reclaimable** — a path- or group-level estimate with confidence.
+- **Immediately private** — bytes freed at once if **this file alone** is
+  deleted, not held by a clone or snapshot (`ATTR_CMNEXT_PRIVATESIZE`). Never
+  summed across a set; see *superadditivity*.
+- **Superadditivity** — the property that deleting a set can free more than the
+  sum of what deleting each member individually would free, because members may
+  share blocks only with each other (§3.1).
+- **Floor / ceiling** — the bounds of the reclaimable interval: Σ private size,
+  and clone-family-deduplicated allocated, respectively.
+- **Estimated reclaimable** — the interval `[floor, ceiling]` with derived
+  confidence.
 - **Actually reclaimed** — observed post-run result, from providers and measured
-  volume delta.
+  container delta.
 - **Clone** — an APFS file sharing blocks with another until modified.
 - **Clone family** — files sharing a clone ID; a sharing *candidate* set, not a
   proven partition of shared blocks.
+- **Container** — the APFS partition holding one or more volumes that share a
+  single free-space pool. The unit of reconciliation.
+- **Dataless file** — a File Provider placeholder with logical content stored
+  remotely and little or no local allocation. Deleting one deletes the remote
+  copy; **evicting** one frees local space only.
 - **Firmlink** — a bidirectional link stitching the System and Data volumes.
 - **Purgeable** — space macOS reports as reclaimable on demand but currently
-  occupied.
+  occupied. Largely contains snapshot storage; not a disjoint category.
 - **Target** — a declarative location or command that reclaims space.
 - **Provider** — a tool owning its own storage, cleaned through its own
   interface (inspect/plan/execute/verify).

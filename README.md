@@ -26,9 +26,12 @@ directory entries instead of one `lstat` per file — reporting apparent,
 allocated, and *immediately private* sizes, with clone and hardlink sharing
 accounted for. Browsable in a TUI or scriptable via `--json`.
 
-**Reconcile.** `cleanrs doctor` explains the gap between what the volume reports
+**Reconcile.** `cleanrs doctor` explains the gap between what storage reports
 and what a walk can see: snapshots, purgeable space, and coverage the scan could
-not achieve — without pretending the categories add up.
+not achieve — without pretending the categories add up. Reconciliation is
+**container-scoped**, because APFS volumes share one free-space pool; swap on
+`/System/Volumes/VM` and a Nix store on `/nix` are invisible to any
+single-volume accounting.
 
 **Clean.** Known developer storage sinks — Xcode `DerivedData`, `node_modules`,
 Docker and OrbStack build cache, Homebrew, pnpm/npm/Bun data, cargo artifacts,
@@ -46,17 +49,32 @@ manager caches, VMs, wallpaper cache, swap, and Xcode data—is mapped explicitl
 in [VISION.md §7.3](VISION.md#73-baseline-known-location-coverage).
 
 **Verify.** Every run records what was estimated, what the provider reported,
-and the measured change in free space. Estimates are calibrated against reality
-rather than trusted.
+and the measured change in container free space. Where the result falls short,
+`history` names the reason from a known set — open file descriptors, snapshot
+coverage, clone sharing, provider-internal reclamation — instead of leaving you
+to guess. Estimates are calibrated against reality rather than trusted.
 
 ## Honesty about numbers
 
-Reclaimable space is an **estimate with a stated confidence**, not a promise:
+Reclaimable space is reported as an **interval with a derived confidence**, not
+as a promise:
 
 ```
-18.2 GiB estimated reclaimable · medium confidence
-Shared APFS extents and snapshots may reduce the result
+18.2 GiB reclaimable · high confidence
+
+12.4–18.2 GiB reclaimable · medium confidence
+Cloned blocks shared with paths outside this selection
 ```
+
+The reason is that group deletion is *superadditive*: two files that clone only
+each other each report zero bytes as privately theirs, yet deleting both frees
+everything. Summing per-file figures — which is the obvious implementation —
+under-reports worst exactly where the tool is most useful, in build trees that
+clone internally. So cleanrs brackets the answer instead: a floor of what is
+provably private, a ceiling of clone-deduplicated allocation. When nothing is
+shared the two collapse into one number, which is the common case.
+
+Confidence is that interval's tightness, not an adjective added afterwards.
 
 Exact freeable bytes is a research goal, not a claimed capability. What is
 actually derivable from APFS metadata is the first thing the project will
@@ -68,6 +86,14 @@ establish, before anything is built on top of it.
 - `--apply` deletes permanently, because moving files to the Trash does not
   return space to the disk. `--trash` is an opt-in recovery mode that reports
   *moved, not reclaimed* — and is never used by scheduled runs.
+- **Synced cloud storage is never deleted.** iCloud Drive and
+  `~/Library/CloudStorage` hold dataless files whose deletion propagates to every
+  other device, with no undo. Those locations are refused outright, and — because
+  an ordinary `node_modules` detector will happily match inside a synced folder —
+  every individual candidate path is also checked for dataless status before it
+  can enter a plan. Freeing local space there means **evict**, not delete.
+- Scanning never materializes cloud content. A tool that downloads 200 GB while
+  claiming to save space is worse than useless.
 - Targets are classified by how they recover (`generated`, `downloadable`,
   `user_data`) and what rebuilding costs. No intensity level ever touches
   `user_data` such as Docker volumes; those must be named explicitly.
@@ -87,7 +113,7 @@ establish, before anything is built on top of it.
 ```
 cleanrs scan [PATH]      One-shot analysis (--json, --reclaimable, --explain)
 cleanrs tui  [PATH]      Interactive browser
-cleanrs doctor           Reconcile volume state; report the unexplained gap
+cleanrs doctor           Reconcile container state; report the unexplained gap
 cleanrs targets          List detected cleanup targets with sizes and confidence
 cleanrs clean            Reclaim space — dry-run by default
 cleanrs history          Estimated vs. observed results of past runs
