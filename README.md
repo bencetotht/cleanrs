@@ -2,8 +2,10 @@
 
 Storage usage analyzer and cleaner for developers, written in Rust. Fully transparent.
 
-> **Status: design stage.** No implementation yet. See [VISION.md](VISION.md)
-> for the full design, including what is still an open research question.
+> **Status: Phase 0/1 MVP in progress.** The read-only `scan` and `doctor`
+> commands are implemented. Phase 0's live cloud/snapshot safety experiments
+> remain open; see [the findings](docs/findings-phase0.md) and
+> [VISION.md](VISION.md).
 
 ## Why
 
@@ -133,6 +135,28 @@ cleanrs clean --level standard --apply
 
 macOS first, targeting APFS specifics directly. Linux support is planned;
 several parts of the design have platform seams, not just the filesystem layer.
+
+## Build and try the read-only MVP
+
+Rust 1.85 or newer is required.
+
+```sh
+cargo build --release
+./target/release/cleanrs scan .
+./target/release/cleanrs scan . --reclaimable --depth 2
+./target/release/cleanrs doctor
+./target/release/cleanrs doctor --scan .
+```
+
+`scan` defaults to the current directory and allocated-size ranking. It never
+defaults to the home directory, never follows symlinks, and never reads file
+contents. JSON output, metric selection, depth/minimum-size filters, exclusions,
+path explanations, shell completions, and a generated man page are available in
+`cleanrs --help`. No cleanup or deletion command exists in this phase.
+
+`doctor --scan PATH` reconciles one explicit scan scope against Data-volume
+usage and labels the remainder as unattributed. Without `--scan`, it stays cheap
+and reports the path attribution as unknown rather than inventing a number.
 
 ## License
 

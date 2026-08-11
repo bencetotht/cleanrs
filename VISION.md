@@ -1,7 +1,9 @@
 # cleanrs — Vision & Design
 
-> **Status:** design document. No implementation yet. This file is the reference
-> for what cleanrs is, why it exists, and how it should be built.
+> **Status:** design reference with a Phase 0/1 implementation in progress.
+> Empirical results and unresolved gates are tracked in
+> [docs/findings-phase0.md](docs/findings-phase0.md). This file remains the
+> reference for what cleanrs is, why it exists, and how it should be built.
 >
 > **Claim discipline:** every quantitative statement in this document carries a
 > label — `[ref]` external reference, `[exp]` preliminary experiment, `[target]`
