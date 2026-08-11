@@ -31,8 +31,19 @@ and what a walk can see: snapshots, purgeable space, and coverage the scan could
 not achieve — without pretending the categories add up.
 
 **Clean.** Known developer storage sinks — Xcode `DerivedData`, `node_modules`,
-Docker build cache, Homebrew, cargo artifacts, Nix — classified by how they
-recover and what that costs, reclaimed at a chosen intensity.
+Docker and OrbStack build cache, Homebrew, pnpm/npm/Bun data, cargo artifacts,
+Nix, and validated macOS caches — classified by how they recover and what that
+costs, reclaimed at a chosen intensity.
+
+**Protect.** Large but stateful objects such as VMware machines, Docker volumes,
+Claude's Cowork VM, simulator device data, and macOS swap are still identified
+and explained, but never mistaken for disposable cache data. System-managed
+swap is diagnostic-only; user data requires an explicitly named action.
+
+The initial known-location acceptance inventory—including the motivating
+machine's home, Library and Developer trees, both container runtimes, package
+manager caches, VMs, wallpaper cache, swap, and Xcode data—is mapped explicitly
+in [VISION.md §7.3](VISION.md#73-baseline-known-location-coverage).
 
 **Verify.** Every run records what was estimated, what the provider reported,
 and the measured change in free space. Estimates are calibrated against reality
@@ -62,6 +73,9 @@ establish, before anything is built on top of it.
   `user_data` such as Docker volumes; those must be named explicitly.
 - Where a tool owns its storage, it is cleaned through its own interface —
   inspect, plan, execute, verify — not by deleting files behind its back.
+- Provider identity is part of every target. Docker contexts such as OrbStack
+  and Docker Desktop are inventoried separately, and a plan is pinned to the
+  context it inspected so a context change cannot redirect cleanup.
 - cleanrs **never loads configuration from the current directory**. A cloned
   repository cannot make `cleanrs clean --apply` run its commands. Commands are
   argv arrays executed directly; there is no shell anywhere.

@@ -214,8 +214,11 @@ measured in Phase 0, since requesting more attributes is not free.]
   within-directory case.
 - Bounded in-flight directory count, tunable. [target: a default in the region
   of 64, chosen by measurement.]
-- **Storage-aware defaults.** Oversubscribe on NVMe; on rotational or
-  network-backed mounts parallelism hurts — detect via `statfs` and reduce.
+- **Storage-aware defaults.** Parallelism may help on NVMe and hurt on
+  rotational or network-backed mounts. `statfs` describes mount/filesystem
+  properties but does not by itself reliably identify the physical medium;
+  combine mount metadata with platform device APIs or provider hints, and fall
+  back to a conservative auto setting. Worker counts are benchmark-derived.
 - **Sharded inode / clone-ID sets.** A single shared set is the one place this
   design is likely to develop contention. [hyp]
 - **No async runtime.** This is blocking syscall work; an async scheduler adds
@@ -358,10 +361,19 @@ invocations. Each entry needs real investigation before implementation.
 | Nix | `nix-collect-garbage` | `-d` additionally deletes old generations and destroys rollback capability. Plain GC and `-d` belong at different levels. |
 | Cargo | `cargo clean` / `cargo sweep` | Must resolve workspace roots and honour shared or custom `CARGO_TARGET_DIR`; a member crate inside a workspace must not trigger a duplicate clean of the same directory. |
 | Xcode simulators | `xcrun simctl delete unavailable` | Distinguish unavailable runtimes from in-use devices. |
+| OrbStack | Docker CLI pinned to the OrbStack context; OrbStack CLI for Linux machines | The Docker engine, OrbStack Linux machines, and OrbStack's host-side sparse storage are different resources. Docker volumes and machine disks are user data. Never delete OrbStack's backing files directly. |
+| Docker Desktop | Docker CLI pinned to the Docker Desktop context; Desktop-supported reset/uninstall flows for decommissioning | A currently inactive context can still contain named volumes and container writable layers. “Stale installation” is not proof that its VM disk is disposable. |
+| pnpm | `pnpm store path`, `pnpm store prune`; cache commands where supported | Store and metadata/dlx cache are distinct. Store pruning removes unreferenced packages but can cause later downloads; current cache commands are experimental and must be capability-detected. |
+| npm / npx | `npm config get cache`, `npm cache verify`, `npm cache npx ls/rm`; full clean only when confirmed | `verify` garbage-collects unneeded cache entries. Full cache removal requires force and future downloads; npx entries can be inspected and removed separately on current npm. |
+| Bun | `bun pm cache`, `bun pm cache rm` | The cache path is configurable. Bun uses APFS clones for installs on macOS, so selected cache bytes and host-reclaimed bytes may differ. |
+| VMware Fusion | Inspect `.vmwarevm` bundles; direct the user to Fusion's snapshot and disk-cleanup operations | A bundle is user data. Never delete `.vmdk`, snapshot, suspend, or lock files individually. Snapshot consolidation can require substantial temporary free space. |
+| Claude Cowork VM | Inspect Claude's `vm_bundles` as an application-owned VM | The bundle may contain persistent Cowork/session state and there is no documented stable cleanup API. Report it separately; any reset/removal starts as explicit-target-only and requires Claude to be stopped plus a provider-version capability check. |
+| macOS wallpaper cache | Version- and schema-validated direct-cache provider | Generated BMP renditions can be enormous, but source wallpapers must be distinguished from generated cache. Start as confirmed-only until regeneration and safe quiescing are validated on supported macOS versions. |
+| macOS swap | `doctor` only | `/private/var/vm` is OS-managed transient state. Report current allocation and explain it; never delete swap files or run a pseudo-clean action. |
 
 ### 7.1 Providers are an interface, not a command string
 
-Every provider implements four operations:
+Every **actionable** provider implements four operations:
 
 - **inspect** — what exists, how much space it appears to hold, in what units,
   and whether that space is host-visible or provider-internal.
@@ -370,6 +382,13 @@ Every provider implements four operations:
 - **execute** — run it, capturing stdout/stderr and exit status.
 - **verify** — re-inspect and report the provider's view of what changed,
   separately from the measured host volume delta.
+
+`inspect` is the only mandatory capability. A provider for protected or
+system-managed storage may deliberately return no plan or execution capability;
+for VMware bundles, Claude Cowork state, simulator device data, and swap, that
+is the safe result until a supported action and its preconditions are known.
+Capabilities are versioned and discovered at runtime rather than inferred from
+an executable merely existing on `PATH`.
 
 This is what makes §3's "actually reclaimed" metric obtainable, and it is what
 makes the Docker-on-macOS case (inner reclamation ≠ host reclamation) reportable
@@ -380,6 +399,47 @@ rather than misleading.
 Reserved for artifacts with no owning cleanup command — `DerivedData`,
 `node_modules`, `.next`, `dist`, `__pycache__`. `rm -rf` on storage owned by a
 provider corrupts that provider's state and leaves the user worse off.
+
+### 7.3 Baseline known-location coverage
+
+The following inventory came from the machine that motivated cleanrs. It is a
+**product acceptance baseline**, not a set of hard-coded paths or size
+thresholds. The figures are observations from one point in time, and the first
+three rows overlap: `~/Library` and `~/Developer` are contained by the home
+directory, so their sizes must never be added to the home total again.
+
+Every row must appear in either `targets` or `doctor`; “handled” does not always
+mean “deletable.” A result can be an ordinary scan scope, a provider cleanup
+candidate, protected user data, or diagnostic-only system state.
+
+| Observed area | Reported size | Required cleanrs handling |
+|---|---:|---|
+| Home directory | 295 GB | Primary scan scope and aggregation root. Never a cleanup target itself. Run detectors during the traversal and partition results into ordinary files, known targets, protected data, and unexplained/denied coverage. |
+| `~/Library` | 146 GB | Scan and classify specific descendants. Never offer broad deletion of `~/Library`: `Caches` may contain candidates while `Application Support`, containers, backups, and app runtime state are presumptively user data until a provider says otherwise. |
+| `~/Developer` | 86 GB | One scoped traversal with project/workspace detection. Recognize and deduplicate Cargo workspace `target` directories, `node_modules`, `.next`, `dist`, coverage, and similar generated output. Apply per-project staleness and rebuild-cost policy; never clean every matching directory merely because its name matches. |
+| VMware NixOS VM | 29 GB | Detect the `.vmwarevm` bundle and report apparent/allocated/private sizes plus recognizable snapshot/suspend components. The whole VM is `user_data`, explicit-target-only. Offer provider-guided disk compaction or snapshot management only after checking power state and required temporary free space; never delete bundle internals. This is not the Nix-store provider. |
+| OrbStack | 29 GB | Detect OrbStack as the active Docker context and pin every inspect/plan/execute/verify call to that context. Inventory images, build caches, containers, and volumes separately; volumes and OrbStack Linux-machine disks are `user_data`. Never delete the host sparse image directly. Verify both engine-side change and host free-space delta. |
+| Wallpaper cache | 24 GB | Detect the wallpaper agent's cache location by supported macOS version, validate container ownership and generated rendition schema, and report source images separately. The 1,410 BMP files are generated candidates, but cleanup starts `confirmed` rather than unattended until quiescing/regeneration behavior is proven. Journal them as an abnormal cache-growth finding. |
+| Swap | 16 GB | `doctor` reports this as OS-managed, temporary storage with current allocation and memory-pressure context. It is never a target, and cleanrs never deletes `/private/var/vm/swapfile*`; closing memory-heavy workloads or rebooting is user guidance, not an executed cleanup. |
+| Homebrew cache | 14 GB; provider estimated 3.9 GB reclaimable | Discover the configured cache through Homebrew, obtain a provider dry-run estimate, and keep routine cleanup distinct from scrub (`-s`). Execute through `brew`, respect pinned/retained artifacts, then record Homebrew's result and the host delta. Never infer 14 GB reclaimable from directory size. |
+| pnpm store and cache | 12.5 GB | Discover configured locations (`pnpm store path` and configuration) rather than assuming defaults. Treat `pnpm store prune` as provider-owned removal of unreferenced, re-downloadable packages. Inspect metadata/dlx caches separately and capability-detect experimental cache commands. Network-restored, so not deleted by unattended `safe`. |
+| Docker Desktop VM | 8 GB, possibly stale | Inventory it as a Docker context distinct from OrbStack. Inactivity is evidence for a decommission proposal, not permission to delete. If the daemon is available, enumerate containers, images, build cache, and especially named volumes; if unavailable, report the VM disk as opaque protected data. Full reset/uninstall cleanup is explicit-target-only and must disclose data loss. |
+| npm cache and npx data | 7.4 GB | Resolve the configured cache with npm. Use `npm cache verify` for safe garbage collection; list and age npx entries separately where the installed npm supports `npm cache npx`. Full `npm cache clean --force` is a confirmed network-restored action, not routine raw deletion. |
+| Claude Cowork VM bundle | 6.3 GB allocated; 10 GB apparent | Detect `~/Library/Application Support/Claude/vm_bundles/claudevm.bundle` and display sparse-aware metrics. Treat it as application-owned VM/session data, not a cache solely because it can be recreated. Until Anthropic exposes a stable cleanup/reset interface, removal is explicit-target-only, requires Claude stopped, warns that Cowork state may be lost and the image may be downloaded again, and is never scheduled. |
+| Bun cache | 4.7 GB | Discover the configured path with `bun pm cache`; use `bun pm cache rm` rather than raw deletion. Classify as downloadable/network-required and verify APFS-aware host reclamation because Bun uses clones when installing packages on macOS. |
+| Xcode data | 7.5 GB: 3 GB DerivedData, 4.5 GB simulator devices | Split into different targets. `DerivedData` is generated but potentially expensive to rebuild; remove only stale project subtrees or an explicitly selected whole cache. Unavailable simulator resources may use supported `simctl` cleanup, but simulator device/application data is `user_data` and never selected by a cleanup level. Downloadable simulator runtimes are a separate expensive target. |
+
+This baseline also imposes three cross-provider requirements:
+
+1. **No double counting.** Nested scan areas, APFS clones, pnpm links, Bun
+   clones, and VM sparse images must remain distinguishable in both totals and
+   estimates.
+2. **Context pinning.** A cleanup plan stores the exact provider identity it
+   inspected — including Docker context and endpoint — and aborts if that
+   identity changes before execution.
+3. **Detection without deletion is success.** VM state, volumes, simulator app
+   data, and swap are valuable findings even when cleanrs correctly refuses to
+   remove them.
 
 ---
 
@@ -682,7 +742,10 @@ what cleanrs can and cannot promise.** Everything downstream depends on it.
    Confidence computation per §3.1.
 3. **`doctor`.** Cheap on top of step 2, and immediately the most useful command.
 4. **Targets and `clean --dry-run`.** Manifest, CLI specs, detection, sizing.
-5. **Providers.** inspect/plan/execute/verify for Homebrew, Docker, Cargo, Xcode.
+5. **Providers.** inspect/plan/execute/verify for the complete §7.3 acceptance
+   baseline: Homebrew; Docker Desktop and OrbStack as distinct contexts; Cargo;
+   pnpm, npm/npx, and Bun; Xcode; VMware; Claude Cowork; and the validated
+   wallpaper cache. Swap remains a `doctor` diagnostic, not a provider action.
 6. **`clean --apply`.** Path invariants, permanent deletion, journal, `history`.
 7. **TUI.** Deliberately late — most enjoyable, least load-bearing, and far
    nicer to build against a stable core.
@@ -819,6 +882,14 @@ platform seams in several modules, not one.
 - Trust-boundary test: a repository containing `cleanrs.toml` with a `run`
   target must not execute it under any invocation that does not name it via
   `--config`.
+- Provider identity test: a Docker plan inspected against OrbStack remains
+  explicitly pinned to the captured context even if the process-wide default
+  changes to Docker Desktop. It aborts if that captured endpoint disappears or
+  resolves to a different daemon identity; it must never fall back to the new
+  default context.
+- Acceptance tests cover every row in §7.3. Destructive provider tests use
+  fixtures or disposable instances; protected rows assert that no cleanup plan
+  is produced without the required explicit naming.
 
 ---
 
@@ -859,9 +930,40 @@ installed macOS SDK and command-line tools on the author's machine.
 - `kondo`, `cargo-sweep`, `npkill` — developer artifact cleaning.
 - `dust`, `dua-cli`, `diskus`, `ncdu`, `gdu` — analyzers.
 
+**Known-location providers**
+- Homebrew command reference — `cleanup`, `--dry-run`, `--scrub`, and pruning
+  semantics: <https://docs.brew.sh/Manpage.html>
+- Docker pruning reference and Docker Desktop storage settings — object-specific
+  pruning, contexts/builders, volume exclusions, and sparse VM storage:
+  <https://docs.docker.com/engine/manage-resources/pruning/> and
+  <https://docs.docker.com/desktop/settings-and-maintenance/settings/>
+- OrbStack Docker documentation — OrbStack supplies a Docker engine with
+  containers, images, and persistent volumes: <https://docs.orbstack.dev/docker/>
+- pnpm store documentation — `pnpm store path` and `pnpm store prune` semantics:
+  <https://pnpm.io/cli/store>
+- npm cache documentation — `verify`, full cache cleaning, and npx cache
+  inspection/removal: <https://docs.npmjs.com/cli/v11/commands/npm-cache/>
+- Bun package-manager documentation — configured global cache and
+  `bun pm cache rm`; macOS clonefile installation behavior:
+  <https://bun.sh/docs/pm/cli/pm> and <https://bun.sh/docs/pm/global-cache>
+- VMware Fusion disk cleanup and snapshot guidance — sparse-disk compaction and
+  the temporary-space requirements of consolidation:
+  <https://knowledge.broadcom.com/external/article/328883> and
+  <https://knowledge.broadcom.com/external/article/302480>
+- Apple Support — files moved to Trash do not free storage until Trash is
+  emptied: <https://support.apple.com/102624>
+- Anthropic documents Cowork's use of an isolated Linux VM, but a stable public
+  host-side cleanup API for its VM bundle has not been found. Treat bundle paths
+  and reset behavior as versioned research rather than a supported contract.
+
 **To be sourced before implementation**
-- Docker/Buildx cache reclamation semantics and filter behaviour on macOS,
-  including whether inner reclamation shrinks the host disk image.
+- Whether and when Docker Desktop and OrbStack inner reclamation shrinks their
+  host-side sparse storage on each supported version.
+- OrbStack Linux-machine inspection and supported deletion/compaction semantics.
+- Anthropic-supported Claude Cowork VM inspection, reset, and persistence
+  semantics; do not rely on an observed bundle layout as a stable API.
+- macOS wallpaper cache paths, process-quiescing, and regeneration behavior on
+  each supported macOS release; Apple does not publish a cleanup interface.
 - Nix garbage collection and generation semantics.
 - FSEvents retention guarantees in practice.
 - TCC behaviour for CLI binaries across install methods.
