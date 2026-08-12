@@ -1,7 +1,7 @@
 # cleanrs — Vision & Design
 
 > **Status:** design reference with Phase 0/1 implementation and a read-only
-> Phase 2 `targets` groundwork slice in progress.
+> Phase 2 `targets` plus `clean` planning groundwork slice in progress.
 > Empirical results and unresolved gates are tracked in
 > [docs/findings-phase0.md](docs/findings-phase0.md). This file remains the
 > reference for what cleanrs is, why it exists, and how it should be built.

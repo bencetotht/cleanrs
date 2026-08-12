@@ -443,5 +443,16 @@ that Phase 2 or v0.2 is complete.
 - [ ] Remaining detection work: Cargo workspace/shared-target resolution,
       configured `CARGO_TARGET_DIR`, provider inspection/planning, and every
       §7.3 known-location acceptance row.
-- [ ] `clean` planning and the verifiably inert Phase 2 `--apply` refusal have
-      not been added yet. No execution API exists.
+- [x] Added `clean [PATH]` planning with `safe`/`standard`/`aggressive` level
+      selection, staleness enforcement and override, `--only`/`--exclude`,
+      JSON and human review output, clone/hardlink-deduplicated reclaimability
+      bounds over the complete selection, and an explicit dry-run result. Each
+      planned candidate captures device, inode, and type for later Phase 3
+      revalidation.
+- [x] `clean --apply` is accepted but refuses before scanning or reaching any
+      write API. CLI fixture tests prove both ordinary dry-runs and refused
+      apply requests leave candidate trees untouched.
+- [ ] Phase 3 execution remains gated: no deletion, Trash, provider execution,
+      verification, or journal write API exists until the remaining Phase 2
+      safety/configuration/provider exit criteria and earlier hard gates are
+      closed.

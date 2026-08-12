@@ -229,3 +229,90 @@ fn targets_top_returns_the_largest_candidates_first() {
             .contains("large/node_modules")
     );
 }
+
+#[test]
+fn clean_dry_run_selects_without_deleting() {
+    let fixture = tempdir().unwrap();
+    fs::write(fixture.path().join("package.json"), b"{}").unwrap();
+    fs::create_dir(fixture.path().join("node_modules")).unwrap();
+    let payload = fixture.path().join("node_modules/payload");
+    fs::write(&payload, b"must survive dry-run").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args([
+            "clean",
+            fixture.path().to_str().unwrap(),
+            "--level",
+            "standard",
+            "--ignore-staleness",
+            "--only",
+            "node.modules",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["execution"], "dry-run; no action was run");
+    assert_eq!(json["selected_targets"], 1);
+    assert_eq!(json["targets"][0]["selection"]["status"], "selected");
+    assert!(
+        payload.exists(),
+        "dry-run must leave every candidate untouched"
+    );
+}
+
+#[test]
+fn clean_safe_level_explains_why_network_targets_are_skipped() {
+    let fixture = tempdir().unwrap();
+    fs::write(fixture.path().join("package.json"), b"{}").unwrap();
+    fs::create_dir(fixture.path().join("node_modules")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args([
+            "clean",
+            fixture.path().to_str().unwrap(),
+            "--ignore-staleness",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["selected_targets"], 0);
+    assert!(
+        json["targets"][0]["selection"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("cleanup level")
+    );
+}
+
+#[test]
+fn clean_apply_is_inert_even_for_a_valid_fixture() {
+    let fixture = tempdir().unwrap();
+    fs::write(fixture.path().join("package.json"), b"{}").unwrap();
+    fs::create_dir(fixture.path().join("node_modules")).unwrap();
+    let payload = fixture.path().join("node_modules/payload");
+    fs::write(&payload, b"must survive apply refusal").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args([
+            "clean",
+            fixture.path().to_str().unwrap(),
+            "--apply",
+            "--yes",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not available yet"));
+    assert!(
+        payload.exists(),
+        "inert --apply must not alter its candidate"
+    );
+}
