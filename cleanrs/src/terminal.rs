@@ -15,9 +15,10 @@ use comfy_table::{
 use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
 
+use cleanrs_core::targets::{CandidateSafety, Recoverability};
 use cleanrs_core::{Confidence, DoctorReport, ScanObserver, ScanProgress};
 
-use crate::{Metric, ScanOutput, format_interval, human_bytes};
+use crate::{Metric, ScanOutput, TargetsOutput, format_interval, human_bytes};
 
 /// Presentation policy derived from the actual output streams and `NO_COLOR`.
 pub(crate) struct TerminalUi {
@@ -264,6 +265,105 @@ impl TerminalUi {
         }
     }
 
+    pub(crate) fn print_targets(&self, output: &TargetsOutput) {
+        println!(
+            "{}  {}",
+            self.heading("cleanrs targets"),
+            self.muted(&output.scope.display().to_string())
+        );
+        println!();
+
+        let mut targets = self.table();
+        targets.set_header(vec![
+            self.header("RECLAIMABLE"),
+            self.header("CONFIDENCE"),
+            self.header("CLASS"),
+            self.header("AGE"),
+            self.header("STATUS"),
+            self.header("TARGET"),
+            self.header("PATH"),
+        ]);
+        for target in &output.targets {
+            let age = target.age_days.map_or_else(
+                || "unknown".into(),
+                |days| format!("{days}d / {}d", target.stale_after_days),
+            );
+            let status = match &target.safety {
+                CandidateSafety::Eligible if target.stale == Some(true) => {
+                    self.value("eligible", Color::Green)
+                }
+                CandidateSafety::Eligible => self.value("not stale", Color::Yellow),
+                CandidateSafety::Refused(reason) => {
+                    self.value(format!("refused: {reason}"), Color::Red)
+                }
+            };
+            let class = match target.properties.recoverability {
+                Recoverability::Generated => format!("{:?}", target.class).to_lowercase(),
+                Recoverability::Downloadable => format!("{:?}", target.class).to_lowercase(),
+                Recoverability::UserData => "user data".into(),
+            };
+            targets.add_row(vec![
+                self.value(format_interval(&target.estimate), Color::Cyan),
+                self.confidence(target.estimate.confidence),
+                Cell::new(class),
+                Cell::new(age),
+                status,
+                Cell::new(target.id),
+                Cell::new(target_display_path(&output.scope, &target.path)),
+            ]);
+        }
+        println!("{targets}");
+
+        println!();
+        let mut summary = self.table();
+        summary.set_header(vec![self.header("TARGET SUMMARY"), self.header("VALUE")]);
+        summary.add_row(vec![
+            Cell::new("Showing"),
+            Cell::new(format!(
+                "{} of {}",
+                output.targets.len(),
+                output.total_detected
+            )),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Hidden by filters"),
+            Cell::new(output.hidden),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Eligible and stale"),
+            Cell::new(
+                output
+                    .targets
+                    .iter()
+                    .filter(|target| {
+                        matches!(target.safety, CandidateSafety::Eligible)
+                            && target.stale == Some(true)
+                    })
+                    .count(),
+            ),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Coverage"),
+            if output.coverage_complete {
+                self.value("complete", Color::Green)
+            } else {
+                self.value("incomplete", Color::Red)
+            },
+        ]);
+        summary.add_row(vec![
+            Cell::new("Execution"),
+            self.value("read-only; no action was run", Color::Green),
+        ]);
+        println!("{summary}");
+        if output.default_limit_applied && output.hidden > 0 {
+            println!();
+            println!(
+                "{} Showing the 25 largest targets. Use --top N or --min-size SIZE to adjust.",
+                self.muted("•")
+            );
+        }
+    }
+
     fn table(&self) -> Table {
         let mut table = Table::new();
         if self.stdout_is_terminal {
@@ -346,6 +446,16 @@ fn display_path(root: &Path, path: &Path, depth: usize) -> String {
     }
     let visible = path.strip_prefix(root).unwrap_or(path).display();
     format!("{}{visible}", "  ".repeat(depth.saturating_sub(1)))
+}
+
+fn target_display_path(scope: &Path, path: &Path) -> String {
+    path.strip_prefix(scope)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map_or_else(
+            || path.display().to_string(),
+            |relative| format!("./{}", relative.display()),
+        )
 }
 
 /// An indeterminate spinner backed by the scanner's monotonic counters.

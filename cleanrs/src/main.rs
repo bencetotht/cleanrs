@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use cleanrs_core::accounting::estimate_subtree;
 use cleanrs_core::fs::{Arena, NodeIndex, ScanResult, doctor};
+use cleanrs_core::targets::{BUILTIN_TARGETS, DetectedTarget, detect_workspace_targets};
 use cleanrs_core::{ReclaimEstimate, ScanOptions, Scanner};
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
@@ -31,6 +32,8 @@ enum Commands {
     Scan(ScanArgs),
     /// Inspect container, volume, snapshot, swap, and access state.
     Doctor(DoctorArgs),
+    /// Detect and size cleanup targets without executing anything.
+    Targets(TargetArgs),
     /// Generate shell completions on standard output.
     Completions {
         #[arg(value_enum)]
@@ -38,6 +41,37 @@ enum Commands {
     },
     /// Generate the cleanrs(1) manual page on standard output.
     Man,
+}
+
+#[derive(Debug, clap::Args)]
+struct TargetArgs {
+    /// Explicit workspace scope to inspect. Defaults to the working directory.
+    #[arg(default_value = ".")]
+    path: PathBuf,
+
+    /// Emit stable machine-readable output.
+    #[arg(long)]
+    json: bool,
+
+    /// Include only these stable target IDs; may be supplied more than once.
+    #[arg(long, value_name = "ID")]
+    only: Vec<String>,
+
+    /// Exclude these stable target IDs; may be supplied more than once.
+    #[arg(long, value_name = "ID")]
+    exclude: Vec<String>,
+
+    /// Show at most N largest targets. Human output defaults to 25; JSON is unlimited.
+    #[arg(long, value_name = "N")]
+    top: Option<usize>,
+
+    /// Hide targets whose reclaimable ceiling is below this size (for example 10MiB).
+    #[arg(long, value_parser = parse_size, default_value = "0")]
+    min_size: u64,
+
+    /// Directory worker count (blocking workers; no async runtime).
+    #[arg(long)]
+    workers: Option<usize>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -137,6 +171,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Scan(args) => run_scan(args),
         Commands::Doctor(args) => run_doctor(args),
+        Commands::Targets(args) => run_targets(args),
         Commands::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "cleanrs", &mut io::stdout());
             Ok(())
@@ -146,6 +181,96 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct TargetsOutput {
+    scope: PathBuf,
+    coverage_complete: bool,
+    total_detected: usize,
+    hidden: usize,
+    default_limit_applied: bool,
+    targets: Vec<DetectedTarget>,
+}
+
+fn run_targets(args: TargetArgs) -> Result<()> {
+    if args.top == Some(0) {
+        bail!("--top must be at least 1");
+    }
+    let definitions: Vec<_> = BUILTIN_TARGETS
+        .iter()
+        .copied()
+        .filter(|definition| args.only.is_empty() || args.only.iter().any(|id| id == definition.id))
+        .filter(|definition| !args.exclude.iter().any(|id| id == definition.id))
+        .collect();
+    validate_builtin_ids(&args.only, "--only")?;
+    validate_builtin_ids(&args.exclude, "--exclude")?;
+
+    let mut options = ScanOptions::default();
+    if let Some(workers) = args.workers {
+        if workers == 0 {
+            bail!("--workers must be at least 1");
+        }
+        options.workers = workers;
+    }
+    let scanner = Scanner::new(options);
+    let progress = ScanProgressIndicator::create(
+        &format!("targets in {}", args.path.display()),
+        !args.json && stderr_is_terminal(),
+    );
+    let scan = if let Some(indicator) = &progress {
+        scanner.scan_with_observer(&args.path, indicator.clone())
+    } else {
+        scanner.scan(&args.path)
+    };
+    if let Some(indicator) = &progress {
+        indicator.finish();
+    }
+    let scan =
+        scan.with_context(|| format!("failed to inspect targets in {}", args.path.display()))?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut targets = detect_workspace_targets(&scan, &definitions, home.as_deref());
+    targets.sort_by(|left, right| {
+        std::cmp::Reverse(target_sort_size(left))
+            .cmp(&std::cmp::Reverse(target_sort_size(right)))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let total_detected = targets.len();
+    targets.retain(|target| target_sort_size(target) >= args.min_size);
+    let default_limit = !args.json && args.top.is_none();
+    let default_limit_applied = default_limit && targets.len() > 25;
+    let limit = args.top.or(default_limit.then_some(25));
+    if let Some(limit) = limit {
+        targets.truncate(limit);
+    }
+    let output = TargetsOutput {
+        scope: scan.root.clone(),
+        coverage_complete: scan.coverage_complete(),
+        total_detected,
+        hidden: total_detected.saturating_sub(targets.len()),
+        default_limit_applied,
+        targets,
+    };
+    if args.json {
+        serde_json::to_writer_pretty(io::stdout().lock(), &output)?;
+        println!();
+    } else {
+        TerminalUi::detect().print_targets(&output);
+    }
+    Ok(())
+}
+
+fn target_sort_size(target: &DetectedTarget) -> u64 {
+    target.estimate.ceiling.unwrap_or(target.allocated)
+}
+
+fn validate_builtin_ids(ids: &[String], flag: &str) -> Result<()> {
+    for id in ids {
+        if !BUILTIN_TARGETS.iter().any(|definition| definition.id == id) {
+            bail!("unknown target ID {id:?} passed to {flag}");
+        }
+    }
+    Ok(())
 }
 
 fn run_scan(args: ScanArgs) -> Result<()> {
