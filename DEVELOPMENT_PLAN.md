@@ -378,3 +378,19 @@ Exit-criterion status:
       cleanrs/`du` numbers and the fixed-tree scheduled workflow are present.
 - [x] CI runs formatting, strict Clippy, tests, and release builds on macOS and
       Linux; scheduled CI records warm-cache scan performance.
+
+### Phase 1 terminal UX — 2026-08-12
+
+- [x] The core scanner publishes ordered, monotonic directory, entry, and
+      allocated-byte progress snapshots without depending on terminal code.
+- [x] Interactive `scan` and `doctor --scan` runs show an indeterminate progress
+      indicator with live counters; unknown total work is not presented as a
+      fake percentage.
+- [x] Human `scan` output uses metric-aware result tables, confidence colors,
+      compact relative paths, a scan summary, and dedicated safety/coverage
+      diagnostics.
+- [x] Human `doctor` output groups container capacity, volumes, Data attribution,
+      environment diagnostics, and explanatory notes into separate tables.
+- [x] TTY output uses Unicode and semantic colors; redirected output uses ASCII;
+      `NO_COLOR` is respected; JSON, completions, and man-page output remain
+      animation- and decoration-free.

@@ -1004,6 +1004,13 @@ Cross-cutting rules: dry-run default for anything destructive; `--json` on every
 command; meaningful exit codes for scripting; shell completions and a man page
 shipped; `NO_COLOR` respected; non-TTY degrades to plain output.
 
+Filesystem scans have no knowable total until traversal completes, so interactive
+`scan` and scan-backed diagnostics show an **indeterminate** progress indicator
+with monotonic directory, entry, and allocated-byte counters rather than a fake
+percentage. Progress is written only to an interactive stderr and is suppressed
+for JSON and redirected output. Human results use metric-aware tables and
+semantic colors; redirected results use colorless ASCII tables.
+
 `scan` ranks by **allocated** size by default. This is not only the honest
 default — it is also a safety property: dataless cloud files have enormous
 apparent size and near-zero allocation, so apparent-ranked output would float

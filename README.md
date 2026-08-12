@@ -158,6 +158,20 @@ path explanations, shell completions, and a generated man page are available in
 usage and labels the remainder as unattributed. Without `--scan`, it stays cheap
 and reports the path attribution as unknown rather than inventing a number.
 
+### Terminal output
+
+Interactive scans show live directory, entry, and allocated-byte counters while
+the filesystem walk is running. Human-readable `scan` and `doctor` results use
+compact tables with consistent colors for confidence, coverage, warnings, and
+unknown values. Output automatically adapts to its destination:
+
+- TTY: Unicode tables, color, and an animated progress indicator.
+- Pipe or redirected output: ASCII tables and no progress animation.
+- `NO_COLOR` set: no ANSI colors.
+- `--json`: stable JSON on stdout and no progress output on stderr.
+
+Completion scripts and man pages remain raw output suitable for redirection.
+
 ## License
 
 See [LICENSE](LICENSE).

@@ -8,4 +8,4 @@ mod scanner;
 pub use arena::{Arena, Node, NodeFlags, NodeIndex, NodeKind};
 pub use doctor::{DoctorReport, VolumeReport, doctor};
 pub use platform::{DirEntry, EntryMetadata, FileSystem, NativeFileSystem};
-pub use scanner::{CoverageError, ScanOptions, ScanResult, Scanner};
+pub use scanner::{CoverageError, ScanObserver, ScanOptions, ScanProgress, ScanResult, Scanner};

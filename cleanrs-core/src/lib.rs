@@ -11,4 +11,4 @@ pub mod providers;
 pub mod targets;
 
 pub use accounting::{Confidence, ReclaimEstimate};
-pub use fs::{DoctorReport, ScanOptions, ScanResult, Scanner};
+pub use fs::{DoctorReport, ScanObserver, ScanOptions, ScanProgress, ScanResult, Scanner};

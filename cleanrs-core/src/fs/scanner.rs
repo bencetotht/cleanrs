@@ -49,6 +49,27 @@ pub struct ScanResult {
     pub mount_boundaries: usize,
 }
 
+/// Monotonic scan counters emitted after each directory is processed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanProgress {
+    pub directories: u64,
+    pub entries: u64,
+    pub allocated_bytes: u64,
+}
+
+/// Receives coarse scan progress without coupling the core to a terminal UI.
+pub trait ScanObserver: Send + Sync {
+    /// Called from scanner worker threads. Implementations should return quickly.
+    fn on_progress(&self, progress: ScanProgress);
+}
+
+#[derive(Debug, Default)]
+struct NoopObserver;
+
+impl ScanObserver for NoopObserver {
+    fn on_progress(&self, _progress: ScanProgress) {}
+}
+
 impl ScanResult {
     /// True only when every scheduled directory was readable.
     #[must_use]
@@ -86,6 +107,15 @@ impl<F: FileSystem> Scanner<F> {
 
     /// Scan an explicit path. Content is never opened and symlinks are never followed.
     pub fn scan(&self, root: &Path) -> io::Result<ScanResult> {
+        self.scan_with_observer(root, Arc::new(NoopObserver))
+    }
+
+    /// Scan while publishing monotonic directory, entry, and byte counters.
+    pub fn scan_with_observer(
+        &self,
+        root: &Path,
+        observer: Arc<dyn ScanObserver>,
+    ) -> io::Result<ScanResult> {
         if std::fs::symlink_metadata(root)?.file_type().is_symlink() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -109,6 +139,7 @@ impl<F: FileSystem> Scanner<F> {
         let dataless_entries = Arc::new(AtomicUsize::new(0));
         let mount_boundaries = Arc::new(AtomicUsize::new(0));
         let outstanding = Arc::new(AtomicUsize::new(1));
+        let progress = Arc::new(ProgressCounters::default());
         let excludes = Arc::new(build_excludes(&self.options.excludes)?);
         let (sender, receiver) = crossbeam_channel::unbounded();
         sender
@@ -127,6 +158,8 @@ impl<F: FileSystem> Scanner<F> {
                     dataless_entries: Arc::clone(&dataless_entries),
                     mount_boundaries: Arc::clone(&mount_boundaries),
                     outstanding: Arc::clone(&outstanding),
+                    progress: Arc::clone(&progress),
+                    observer: Arc::clone(&observer),
                     excludes: Arc::clone(&excludes),
                     sender: sender.clone(),
                     receiver: receiver.clone(),
@@ -158,6 +191,23 @@ impl<F: FileSystem> Scanner<F> {
     }
 }
 
+#[derive(Debug, Default)]
+struct ProgressCounters {
+    snapshot: Mutex<ScanProgress>,
+}
+
+impl ProgressCounters {
+    fn record_directory(&self, entries: u64, allocated_bytes: u64, observer: &dyn ScanObserver) {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        snapshot.directories = snapshot.directories.saturating_add(1);
+        snapshot.entries = snapshot.entries.saturating_add(entries);
+        snapshot.allocated_bytes = snapshot.allocated_bytes.saturating_add(allocated_bytes);
+        // Keep notification order consistent with the counters. Observers are
+        // required to return quickly and must not call back into the scanner.
+        observer.on_progress(*snapshot);
+    }
+}
+
 #[derive(Debug)]
 struct Job {
     path: PathBuf,
@@ -171,6 +221,8 @@ struct WorkerContext<F> {
     dataless_entries: Arc<AtomicUsize>,
     mount_boundaries: Arc<AtomicUsize>,
     outstanding: Arc<AtomicUsize>,
+    progress: Arc<ProgressCounters>,
+    observer: Arc<dyn ScanObserver>,
     excludes: Arc<GlobSet>,
     sender: Sender<Job>,
     receiver: Receiver<Job>,
@@ -200,6 +252,9 @@ fn process_job<F: FileSystem>(context: &WorkerContext<F>, job: Job) {
     let entries = match context.filesystem.read_dir(&job.path) {
         Ok(entries) => entries,
         Err(error) => {
+            context
+                .progress
+                .record_directory(0, 0, context.observer.as_ref());
             context.errors.lock().unwrap().push(CoverageError {
                 path: job.path,
                 kind: io_error_kind(&error).into(),
@@ -208,6 +263,15 @@ fn process_job<F: FileSystem>(context: &WorkerContext<F>, job: Job) {
             return;
         }
     };
+
+    let entry_count = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+    let allocated_bytes = entries
+        .iter()
+        .map(|entry| entry.metadata.allocated_size)
+        .fold(0_u64, u64::saturating_add);
+    context
+        .progress
+        .record_directory(entry_count, allocated_bytes, context.observer.as_ref());
 
     let mut prepared = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -355,10 +419,20 @@ fn default_worker_count() -> usize {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::{Arc, Mutex};
 
     use tempfile::tempdir;
 
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingObserver(Mutex<Vec<ScanProgress>>);
+
+    impl ScanObserver for RecordingObserver {
+        fn on_progress(&self, progress: ScanProgress) {
+            self.0.lock().unwrap().push(progress);
+        }
+    }
 
     #[test]
     fn scans_fixture_without_following_symlinks() {
@@ -380,6 +454,28 @@ mod tests {
             .count();
         #[cfg(unix)]
         assert_eq!(symlinks, 1);
+    }
+
+    #[test]
+    fn progress_is_ordered_and_monotonic() {
+        let fixture = tempdir().unwrap();
+        for directory in ["a", "b", "c"] {
+            fs::create_dir(fixture.path().join(directory)).unwrap();
+            fs::write(fixture.path().join(directory).join("file"), b"payload").unwrap();
+        }
+        let observer = Arc::new(RecordingObserver::default());
+        Scanner::new(ScanOptions::default())
+            .scan_with_observer(fixture.path(), observer.clone())
+            .unwrap();
+        let progress = observer.0.lock().unwrap();
+        assert!(!progress.is_empty());
+        assert!(progress.windows(2).all(|window| {
+            window[0].directories < window[1].directories
+                && window[0].entries <= window[1].entries
+                && window[0].allocated_bytes <= window[1].allocated_bytes
+        }));
+        assert_eq!(progress.last().unwrap().directories, 4);
+        assert!(progress.last().unwrap().entries >= 6);
     }
 
     #[test]

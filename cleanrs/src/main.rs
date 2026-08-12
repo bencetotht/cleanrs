@@ -10,6 +10,10 @@ use cleanrs_core::{ReclaimEstimate, ScanOptions, Scanner};
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
+mod terminal;
+
+use terminal::{ScanProgressIndicator, TerminalUi, stderr_is_terminal};
+
 #[derive(Debug, Parser)]
 #[command(name = "cleanrs", version, about, propagate_version = true)]
 struct Cli {
@@ -99,7 +103,7 @@ struct ScanArgs {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum Metric {
+pub(crate) enum Metric {
     Apparent,
     Allocated,
     Private,
@@ -107,7 +111,7 @@ enum Metric {
 }
 
 #[derive(Debug, Serialize)]
-struct ScanOutput {
+pub(crate) struct ScanOutput {
     root: PathBuf,
     metric: &'static str,
     backend: String,
@@ -119,7 +123,7 @@ struct ScanOutput {
 }
 
 #[derive(Debug, Serialize)]
-struct OutputEntry {
+pub(crate) struct OutputEntry {
     path: PathBuf,
     depth: usize,
     apparent: u64,
@@ -157,9 +161,20 @@ fn run_scan(args: ScanArgs) -> Result<()> {
         }
         options.workers = workers;
     }
-    let result = Scanner::new(options)
-        .scan(&args.path)
-        .with_context(|| format!("failed to scan {}", args.path.display()))?;
+    let scanner = Scanner::new(options);
+    let progress = ScanProgressIndicator::create(
+        &args.path.display().to_string(),
+        !args.json && stderr_is_terminal(),
+    );
+    let result = if let Some(indicator) = &progress {
+        scanner.scan_with_observer(&args.path, indicator.clone())
+    } else {
+        scanner.scan(&args.path)
+    };
+    if let Some(indicator) = &progress {
+        indicator.finish();
+    }
+    let result = result.with_context(|| format!("failed to scan {}", args.path.display()))?;
     let output = build_output(
         &result,
         metric,
@@ -171,7 +186,7 @@ fn run_scan(args: ScanArgs) -> Result<()> {
         serde_json::to_writer_pretty(io::stdout().lock(), &output)?;
         println!();
     } else {
-        print_scan(&output, metric);
+        TerminalUi::detect().print_scan(&output, metric);
     }
     Ok(())
 }
@@ -244,70 +259,24 @@ fn build_output(
     })
 }
 
-fn print_scan(output: &ScanOutput, metric: Metric) {
-    println!("{} scan · {}", metric_name(metric), output.root.display());
-    for entry in &output.entries {
-        let indent = "  ".repeat(entry.depth);
-        match metric {
-            Metric::Apparent => println!(
-                "{}{:>10}  {}",
-                indent,
-                human_bytes(entry.apparent),
-                entry.path.display()
-            ),
-            Metric::Allocated => println!(
-                "{}{:>10}  {}",
-                indent,
-                human_bytes(entry.allocated),
-                entry.path.display()
-            ),
-            Metric::Private => println!(
-                "{}{:>10}  {}",
-                indent,
-                entry
-                    .estimate
-                    .floor
-                    .map_or_else(|| "unknown".into(), human_bytes),
-                entry.path.display()
-            ),
-            Metric::Reclaimable => println!(
-                "{}{:>21} · {:?}  {}",
-                indent,
-                format_interval(&entry.estimate),
-                entry.estimate.confidence,
-                entry.path.display()
-            ),
-        }
-        if matches!(metric, Metric::Private | Metric::Reclaimable) {
-            if let Some(explanation) = &entry.estimate.explanation {
-                println!("{}  {}", indent, explanation);
-            }
-        }
-    }
-    if output.dataless_entries > 0 {
-        println!(
-            "\nSafety: {} dataless entries observed; content was never opened.",
-            output.dataless_entries
-        );
-    }
-    if !output.coverage_complete {
-        println!(
-            "\nCoverage incomplete: {} inaccessible locations (size unknown).",
-            output.coverage_errors.len()
-        );
-        for error in output.coverage_errors.iter().take(10) {
-            println!("  {}: {}", error.path.display(), error.message);
-        }
-    }
-    println!("\nBackend: {}", output.backend);
-}
-
 fn run_doctor(args: DoctorArgs) -> Result<()> {
     let mut report = doctor().context("failed to inspect filesystem state")?;
-    if let Some(path) = args.scan {
-        let scan = Scanner::new(ScanOptions::default())
-            .scan(&path)
-            .with_context(|| format!("failed to scan {} for reconciliation", path.display()))?;
+    if let Some(path) = args.scan.as_ref() {
+        let scanner = Scanner::new(ScanOptions::default());
+        let progress = ScanProgressIndicator::create(
+            &path.display().to_string(),
+            !args.json && stderr_is_terminal(),
+        );
+        let scan = if let Some(indicator) = &progress {
+            scanner.scan_with_observer(path, indicator.clone())
+        } else {
+            scanner.scan(path)
+        };
+        if let Some(indicator) = &progress {
+            indicator.finish();
+        }
+        let scan =
+            scan.with_context(|| format!("failed to scan {} for reconciliation", path.display()))?;
         let estimate = estimate_subtree(&scan.arena, scan.arena.root(), scan.coverage_complete());
         report.attributed_allocated = estimate.ceiling;
         report.scan_coverage_complete = Some(scan.coverage_complete());
@@ -335,53 +304,7 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
         println!();
         return Ok(());
     }
-    println!(
-        "Container  {}",
-        report.container.as_deref().unwrap_or("unavailable")
-    );
-    println!("  Capacity       {:>12}", human_bytes(report.capacity));
-    println!("  Free (shared)  {:>12}", human_bytes(report.free_shared));
-    println!("  Used           {:>12}", human_bytes(report.used));
-    println!("\nVolumes");
-    for volume in &report.volumes {
-        println!(
-            "  {:<8} {:>12}  {:<20} {}",
-            volume.name,
-            human_bytes(volume.used),
-            volume.mount_point.display(),
-            volume.role
-        );
-    }
-    println!("\nData volume, attributed");
-    println!(
-        "  Files (clone-deduped allocated)  {}",
-        report
-            .attributed_allocated
-            .map_or_else(|| "not scanned".into(), human_bytes)
-    );
-    println!(
-        "  Unattributed remainder           {}",
-        report
-            .unattributed
-            .map_or_else(|| "unknown".into(), human_bytes)
-    );
-    println!("\nContainer-level, not attributable to paths");
-    println!(
-        "  Purgeable      {}",
-        report
-            .purgeable
-            .map_or_else(|| "unknown".into(), human_bytes)
-    );
-    println!(
-        "  Snapshots      {}",
-        report
-            .snapshot_count
-            .map_or_else(|| "unknown".into(), |value| value.to_string())
-    );
-    println!("\nFull Disk Access: {}", report.full_disk_access);
-    for note in report.notes {
-        println!("  Note: {note}");
-    }
+    TerminalUi::detect().print_doctor(&report);
     Ok(())
 }
 
@@ -444,7 +367,7 @@ const fn metric_name(metric: Metric) -> &'static str {
     }
 }
 
-fn format_interval(estimate: &ReclaimEstimate) -> String {
+pub(crate) fn format_interval(estimate: &ReclaimEstimate) -> String {
     match (estimate.floor, estimate.ceiling) {
         (Some(floor), Some(ceiling)) if floor == ceiling => human_bytes(floor),
         (Some(floor), Some(ceiling)) => format!("{}–{}", human_bytes(floor), human_bytes(ceiling)),
@@ -478,7 +401,7 @@ fn parse_size(value: &str) -> Result<u64, String> {
         .ok_or_else(|| "size is too large".into())
 }
 
-fn human_bytes(value: u64) -> String {
+pub(crate) fn human_bytes(value: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut scaled = value as f64;
     let mut unit = 0;

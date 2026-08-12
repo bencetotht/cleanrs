@@ -1,0 +1,420 @@
+//! TTY-aware human output. JSON, completions, and man pages bypass this module.
+
+use std::io::{self, IsTerminal};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use comfy_table::{
+    Attribute, Cell, CellAlignment, Color, ContentArrangement, Table,
+    modifiers::UTF8_ROUND_CORNERS,
+    presets::{ASCII_FULL_CONDENSED, UTF8_FULL_CONDENSED},
+};
+use console::Style;
+use indicatif::{ProgressBar, ProgressStyle};
+
+use cleanrs_core::{Confidence, DoctorReport, ScanObserver, ScanProgress};
+
+use crate::{Metric, ScanOutput, format_interval, human_bytes};
+
+/// Presentation policy derived from the actual output streams and `NO_COLOR`.
+pub(crate) struct TerminalUi {
+    stdout_is_terminal: bool,
+    colors: bool,
+}
+
+impl TerminalUi {
+    pub(crate) fn detect() -> Self {
+        let stdout_is_terminal = io::stdout().is_terminal();
+        Self {
+            stdout_is_terminal,
+            colors: stdout_is_terminal && std::env::var_os("NO_COLOR").is_none(),
+        }
+    }
+
+    pub(crate) fn print_scan(&self, output: &ScanOutput, metric: Metric) {
+        println!(
+            "{}  {}",
+            self.heading("cleanrs scan"),
+            self.muted(&output.root.display().to_string())
+        );
+        println!();
+
+        let mut results = self.table();
+        match metric {
+            Metric::Reclaimable => results.set_header(vec![
+                self.header("RECLAIMABLE"),
+                self.header("CONFIDENCE"),
+                self.header("PATH"),
+                self.header("DETAIL"),
+            ]),
+            Metric::Private => results.set_header(vec![
+                self.header("PRIVATE"),
+                self.header("CONFIDENCE"),
+                self.header("PATH"),
+                self.header("DETAIL"),
+            ]),
+            Metric::Apparent => {
+                results.set_header(vec![self.header("APPARENT"), self.header("PATH")])
+            }
+            Metric::Allocated => {
+                results.set_header(vec![self.header("ALLOCATED"), self.header("PATH")])
+            }
+        };
+
+        for entry in &output.entries {
+            let path = display_path(&output.root, &entry.path, entry.depth);
+            match metric {
+                Metric::Apparent => {
+                    results.add_row(vec![self.size(entry.apparent), Cell::new(path)]);
+                }
+                Metric::Allocated => {
+                    results.add_row(vec![self.size(entry.allocated), Cell::new(path)]);
+                }
+                Metric::Private => {
+                    let value = entry
+                        .estimate
+                        .floor
+                        .map_or_else(|| "unknown".into(), human_bytes);
+                    results.add_row(vec![
+                        self.value(value, value_color(entry.estimate.floor.is_some())),
+                        self.confidence(entry.estimate.confidence),
+                        Cell::new(path),
+                        Cell::new(entry.estimate.explanation.as_deref().unwrap_or("—")),
+                    ]);
+                }
+                Metric::Reclaimable => {
+                    results.add_row(vec![
+                        self.value(format_interval(&entry.estimate), Color::Cyan),
+                        self.confidence(entry.estimate.confidence),
+                        Cell::new(path),
+                        Cell::new(entry.estimate.explanation.as_deref().unwrap_or("—")),
+                    ]);
+                }
+            }
+        }
+        println!("{results}");
+
+        let mut summary = self.table();
+        summary.set_header(vec![self.header("SCAN SUMMARY"), self.header("VALUE")]);
+        summary.add_row(vec![Cell::new("Metric"), Cell::new(output.metric)]);
+        summary.add_row(vec![Cell::new("Backend"), Cell::new(&output.backend)]);
+        summary.add_row(vec![
+            Cell::new("Coverage"),
+            if output.coverage_complete {
+                self.value("complete", Color::Green)
+            } else {
+                self.value("incomplete", Color::Red)
+            },
+        ]);
+        summary.add_row(vec![
+            Cell::new("Displayed rows"),
+            Cell::new(output.entries.len()),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Dataless entries"),
+            self.value(
+                output.dataless_entries,
+                if output.dataless_entries == 0 {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                },
+            ),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Mount boundaries"),
+            Cell::new(output.mount_boundaries),
+        ]);
+        println!();
+        println!("{summary}");
+
+        if output.dataless_entries > 0 {
+            println!();
+            println!(
+                "{} {} dataless entries observed; file content was never opened.",
+                self.warning("SAFETY"),
+                output.dataless_entries
+            );
+        }
+        if !output.coverage_complete {
+            println!();
+            println!(
+                "{} {} inaccessible locations; their size is unknown.",
+                self.error("INCOMPLETE"),
+                output.coverage_errors.len()
+            );
+            let mut errors = self.table();
+            errors.set_header(vec![self.header("PATH"), self.header("ERROR")]);
+            for error in output.coverage_errors.iter().take(10) {
+                errors.add_row(vec![
+                    Cell::new(error.path.display()),
+                    Cell::new(&error.message),
+                ]);
+            }
+            println!("{errors}");
+        }
+    }
+
+    pub(crate) fn print_doctor(&self, report: &DoctorReport) {
+        println!(
+            "{}  {}",
+            self.heading("cleanrs doctor"),
+            self.muted(
+                report
+                    .container
+                    .as_deref()
+                    .unwrap_or("container unavailable")
+            )
+        );
+        println!();
+
+        let mut container = self.table();
+        container.set_header(vec![self.header("CONTAINER"), self.header("SIZE")]);
+        container.add_row(vec![Cell::new("Capacity"), self.size(report.capacity)]);
+        container.add_row(vec![
+            Cell::new("Free (shared)"),
+            self.value(human_bytes(report.free_shared), Color::Green),
+        ]);
+        container.add_row(vec![
+            Cell::new("Used"),
+            self.value(human_bytes(report.used), Color::Yellow),
+        ]);
+        println!("{container}");
+
+        println!();
+        println!("{}", self.section("Volumes"));
+        let mut volumes = self.table();
+        volumes.set_header(vec![
+            self.header("VOLUME"),
+            self.header("USED"),
+            self.header("MOUNT"),
+            self.header("ROLE"),
+        ]);
+        for volume in &report.volumes {
+            volumes.add_row(vec![
+                Cell::new(&volume.name),
+                self.size(volume.used),
+                Cell::new(volume.mount_point.display()),
+                Cell::new(&volume.role),
+            ]);
+        }
+        println!("{volumes}");
+
+        println!();
+        println!("{}", self.section("Data attribution"));
+        let mut attribution = self.table();
+        attribution.set_header(vec![self.header("MEASURE"), self.header("VALUE")]);
+        attribution.add_row(vec![
+            Cell::new("Clone-deduped allocated"),
+            optional_bytes(report.attributed_allocated, "not scanned", self),
+        ]);
+        attribution.add_row(vec![
+            Cell::new("Unattributed remainder"),
+            optional_bytes(report.unattributed, "unknown", self),
+        ]);
+        attribution.add_row(vec![
+            Cell::new("Scan coverage"),
+            match report.scan_coverage_complete {
+                Some(true) => self.value("complete", Color::Green),
+                Some(false) => self.value("incomplete", Color::Red),
+                None => self.value("not scanned", Color::DarkGrey),
+            },
+        ]);
+        println!("{attribution}");
+
+        println!();
+        println!("{}", self.section("Diagnostics"));
+        let mut diagnostics = self.table();
+        diagnostics.set_header(vec![self.header("CHECK"), self.header("STATUS")]);
+        diagnostics.add_row(vec![
+            Cell::new("Purgeable"),
+            optional_bytes(report.purgeable, "unknown", self),
+        ]);
+        diagnostics.add_row(vec![
+            Cell::new("Local snapshots"),
+            report.snapshot_count.map_or_else(
+                || self.value("unknown", Color::Yellow),
+                |count| {
+                    self.value(
+                        count,
+                        if count == 0 {
+                            Color::Green
+                        } else {
+                            Color::Yellow
+                        },
+                    )
+                },
+            ),
+        ]);
+        diagnostics.add_row(vec![
+            Cell::new("Full Disk Access"),
+            self.value(&report.full_disk_access, Color::Yellow),
+        ]);
+        println!("{diagnostics}");
+
+        if !report.notes.is_empty() {
+            println!();
+            println!("{}", self.section("Notes"));
+            for note in &report.notes {
+                println!("  {} {note}", self.muted("•"));
+            }
+        }
+    }
+
+    fn table(&self) -> Table {
+        let mut table = Table::new();
+        if self.stdout_is_terminal {
+            table.load_preset(UTF8_FULL_CONDENSED);
+            table.apply_modifier(UTF8_ROUND_CORNERS);
+        } else {
+            table.load_preset(ASCII_FULL_CONDENSED);
+        }
+        table.set_content_arrangement(ContentArrangement::Dynamic);
+        table
+    }
+
+    fn header(&self, text: &str) -> Cell {
+        let cell = Cell::new(text).add_attribute(Attribute::Bold);
+        self.maybe_color(cell, Color::Cyan)
+    }
+
+    fn size(&self, bytes: u64) -> Cell {
+        self.value(human_bytes(bytes), Color::Cyan)
+            .set_alignment(CellAlignment::Right)
+    }
+
+    fn confidence(&self, confidence: Confidence) -> Cell {
+        let (label, color) = match confidence {
+            Confidence::High => ("high", Color::Green),
+            Confidence::Medium => ("medium", Color::Yellow),
+            Confidence::Low => ("low", Color::Red),
+        };
+        self.value(label, color)
+    }
+
+    fn value(&self, value: impl ToString, color: Color) -> Cell {
+        self.maybe_color(Cell::new(value), color)
+    }
+
+    fn maybe_color(&self, cell: Cell, color: Color) -> Cell {
+        if self.colors { cell.fg(color) } else { cell }
+    }
+
+    fn heading(&self, text: &str) -> String {
+        self.paint(text, Style::new().bold().cyan())
+    }
+
+    fn section(&self, text: &str) -> String {
+        self.paint(text, Style::new().bold())
+    }
+
+    fn warning(&self, text: &str) -> String {
+        self.paint(text, Style::new().bold().yellow())
+    }
+
+    fn error(&self, text: &str) -> String {
+        self.paint(text, Style::new().bold().red())
+    }
+
+    fn muted(&self, text: &str) -> String {
+        self.paint(text, Style::new().dim())
+    }
+
+    fn paint(&self, text: &str, style: Style) -> String {
+        if self.colors {
+            style.apply_to(text).to_string()
+        } else {
+            text.to_owned()
+        }
+    }
+}
+
+fn optional_bytes(value: Option<u64>, absent: &str, ui: &TerminalUi) -> Cell {
+    value.map_or_else(|| ui.value(absent, Color::Yellow), |bytes| ui.size(bytes))
+}
+
+fn value_color(known: bool) -> Color {
+    if known { Color::Cyan } else { Color::Yellow }
+}
+
+fn display_path(root: &Path, path: &Path, depth: usize) -> String {
+    if path == root {
+        return ".".into();
+    }
+    let visible = path.strip_prefix(root).unwrap_or(path).display();
+    format!("{}{visible}", "  ".repeat(depth.saturating_sub(1)))
+}
+
+/// An indeterminate spinner backed by the scanner's monotonic counters.
+pub(crate) struct ScanProgressIndicator {
+    bar: ProgressBar,
+}
+
+impl ScanProgressIndicator {
+    pub(crate) fn create(label: &str, enabled: bool) -> Option<Arc<Self>> {
+        enabled.then(|| {
+            let bar = ProgressBar::new_spinner();
+            bar.set_style(
+                ProgressStyle::with_template("{spinner:.cyan} {msg}  [{elapsed_precise}]")
+                    .expect("static progress template is valid")
+                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+            );
+            bar.set_message(format!("Scanning {label}"));
+            bar.enable_steady_tick(Duration::from_millis(80));
+            bar.tick();
+            Arc::new(Self { bar })
+        })
+    }
+
+    pub(crate) fn finish(&self) {
+        self.bar.finish_and_clear();
+    }
+}
+
+impl ScanObserver for ScanProgressIndicator {
+    fn on_progress(&self, progress: ScanProgress) {
+        self.bar.set_message(format!(
+            "Scanning · {} dirs · {} entries · {} allocated",
+            grouped(progress.directories),
+            grouped(progress.entries),
+            human_bytes(progress.allocated_bytes)
+        ));
+    }
+}
+
+pub(crate) fn stderr_is_terminal() -> bool {
+    io::stderr().is_terminal()
+}
+
+fn grouped(value: u64) -> String {
+    let digits = value.to_string();
+    let mut output = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            output.push(',');
+        }
+        output.push(character);
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_are_relative_and_indented() {
+        let root = PathBuf::from("/tmp/root");
+        assert_eq!(display_path(&root, &root, 0), ".");
+        assert_eq!(display_path(&root, &root.join("a/b"), 2), "  a/b");
+    }
+
+    #[test]
+    fn counts_have_grouping() {
+        assert_eq!(grouped(12), "12");
+        assert_eq!(grouped(12_345_678), "12,345,678");
+    }
+}

@@ -16,7 +16,10 @@ anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 clap_mangen.workspace = true
+comfy-table.workspace = true
 cleanrs-core = { path = "../cleanrs-core" }
+console.workspace = true
+indicatif.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
