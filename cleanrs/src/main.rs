@@ -61,6 +61,14 @@ struct TargetArgs {
     #[arg(long, value_name = "ID")]
     exclude: Vec<String>,
 
+    /// Show at most N largest targets. Human output defaults to 25; JSON is unlimited.
+    #[arg(long, value_name = "N")]
+    top: Option<usize>,
+
+    /// Hide targets whose reclaimable ceiling is below this size (for example 10MiB).
+    #[arg(long, value_parser = parse_size, default_value = "0")]
+    min_size: u64,
+
     /// Directory worker count (blocking workers; no async runtime).
     #[arg(long)]
     workers: Option<usize>,
@@ -179,10 +187,16 @@ fn main() -> Result<()> {
 struct TargetsOutput {
     scope: PathBuf,
     coverage_complete: bool,
+    total_detected: usize,
+    hidden: usize,
+    default_limit_applied: bool,
     targets: Vec<DetectedTarget>,
 }
 
 fn run_targets(args: TargetArgs) -> Result<()> {
+    if args.top == Some(0) {
+        bail!("--top must be at least 1");
+    }
     let definitions: Vec<_> = BUILTIN_TARGETS
         .iter()
         .copied()
@@ -215,10 +229,27 @@ fn run_targets(args: TargetArgs) -> Result<()> {
     let scan =
         scan.with_context(|| format!("failed to inspect targets in {}", args.path.display()))?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut targets = detect_workspace_targets(&scan, &definitions, home.as_deref());
+    targets.sort_by(|left, right| {
+        std::cmp::Reverse(target_sort_size(left))
+            .cmp(&std::cmp::Reverse(target_sort_size(right)))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let total_detected = targets.len();
+    targets.retain(|target| target_sort_size(target) >= args.min_size);
+    let default_limit = !args.json && args.top.is_none();
+    let default_limit_applied = default_limit && targets.len() > 25;
+    let limit = args.top.or(default_limit.then_some(25));
+    if let Some(limit) = limit {
+        targets.truncate(limit);
+    }
     let output = TargetsOutput {
         scope: scan.root.clone(),
         coverage_complete: scan.coverage_complete(),
-        targets: detect_workspace_targets(&scan, &definitions, home.as_deref()),
+        total_detected,
+        hidden: total_detected.saturating_sub(targets.len()),
+        default_limit_applied,
+        targets,
     };
     if args.json {
         serde_json::to_writer_pretty(io::stdout().lock(), &output)?;
@@ -227,6 +258,10 @@ fn run_targets(args: TargetArgs) -> Result<()> {
         TerminalUi::detect().print_targets(&output);
     }
     Ok(())
+}
+
+fn target_sort_size(target: &DetectedTarget) -> u64 {
+    target.estimate.ceiling.unwrap_or(target.allocated)
 }
 
 fn validate_builtin_ids(ids: &[String], flag: &str) -> Result<()> {

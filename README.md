@@ -162,6 +162,11 @@ deduplicates candidates, applies staleness policy, and displays the same honest
 reclaimability intervals. Candidate-level cloud/dataless and mount-boundary
 checks can refuse a finding without hiding it. Configuration, provider targets,
 the full known-location catalog, and `clean` planning remain Phase 2 work.
+Targets nested beneath an already detected artifact root are collapsed, so
+package metadata inside `node_modules` does not flood or double-count the
+result. Human output is sorted by reclaimable ceiling and shows the largest 25
+targets by default; use `--top N` or `--min-size SIZE` to tune it. JSON remains
+complete unless one of those filters is supplied.
 
 `doctor --scan PATH` reconciles one explicit scan scope against Data-volume
 usage and labels the remainder as unattributed. Without `--scan`, it stays cheap

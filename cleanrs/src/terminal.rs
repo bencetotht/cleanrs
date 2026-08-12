@@ -281,6 +281,7 @@ impl TerminalUi {
             self.header("AGE"),
             self.header("STATUS"),
             self.header("TARGET"),
+            self.header("PATH"),
         ]);
         for target in &output.targets {
             let age = target.age_days.map_or_else(
@@ -307,7 +308,8 @@ impl TerminalUi {
                 Cell::new(class),
                 Cell::new(age),
                 status,
-                Cell::new(format!("{}\n{}", target.id, target.path.display())),
+                Cell::new(target.id),
+                Cell::new(target_display_path(&output.scope, &target.path)),
             ]);
         }
         println!("{targets}");
@@ -315,7 +317,18 @@ impl TerminalUi {
         println!();
         let mut summary = self.table();
         summary.set_header(vec![self.header("TARGET SUMMARY"), self.header("VALUE")]);
-        summary.add_row(vec![Cell::new("Detected"), Cell::new(output.targets.len())]);
+        summary.add_row(vec![
+            Cell::new("Showing"),
+            Cell::new(format!(
+                "{} of {}",
+                output.targets.len(),
+                output.total_detected
+            )),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Hidden by filters"),
+            Cell::new(output.hidden),
+        ]);
         summary.add_row(vec![
             Cell::new("Eligible and stale"),
             Cell::new(
@@ -342,6 +355,13 @@ impl TerminalUi {
             self.value("read-only; no action was run", Color::Green),
         ]);
         println!("{summary}");
+        if output.default_limit_applied && output.hidden > 0 {
+            println!();
+            println!(
+                "{} Showing the 25 largest targets. Use --top N or --min-size SIZE to adjust.",
+                self.muted("•")
+            );
+        }
     }
 
     fn table(&self) -> Table {
@@ -426,6 +446,16 @@ fn display_path(root: &Path, path: &Path, depth: usize) -> String {
     }
     let visible = path.strip_prefix(root).unwrap_or(path).display();
     format!("{}{visible}", "  ".repeat(depth.saturating_sub(1)))
+}
+
+fn target_display_path(scope: &Path, path: &Path) -> String {
+    path.strip_prefix(scope)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map_or_else(
+            || path.display().to_string(),
+            |relative| format!("./{}", relative.display()),
+        )
 }
 
 /// An indeterminate spinner backed by the scanner's monotonic counters.

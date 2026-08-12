@@ -177,3 +177,55 @@ fn targets_rejects_unknown_filter_ids() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown target ID"));
 }
+
+#[test]
+fn targets_collapses_package_artifacts_inside_node_modules() {
+    let fixture = tempdir().unwrap();
+    fs::write(fixture.path().join("package.json"), b"{}").unwrap();
+    let dependency = fixture.path().join("node_modules/dependency");
+    fs::create_dir_all(dependency.join("dist")).unwrap();
+    fs::write(dependency.join("package.json"), b"{}").unwrap();
+    fs::write(dependency.join("dist/bundle.js"), b"generated").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args(["targets", fixture.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let targets = json["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0]["id"], "node.modules");
+}
+
+#[test]
+fn targets_top_returns_the_largest_candidates_first() {
+    let fixture = tempdir().unwrap();
+    for (project, bytes) in [("small", 1_usize), ("large", 1024 * 1024)] {
+        let root = fixture.path().join(project);
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::write(root.join("package.json"), b"{}").unwrap();
+        fs::write(root.join("node_modules/payload"), vec![0_u8; bytes]).unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args([
+            "targets",
+            fixture.path().to_str().unwrap(),
+            "--json",
+            "--top",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["total_detected"], 2);
+    assert_eq!(json["hidden"], 1);
+    assert!(
+        json["targets"][0]["path"]
+            .as_str()
+            .unwrap()
+            .contains("large/node_modules")
+    );
+}

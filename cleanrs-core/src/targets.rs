@@ -270,8 +270,8 @@ pub fn detect_workspace_targets(
     }
 
     // A stable path key prevents duplicate actions when overlapping definitions
-    // or nested workspace discovery resolve to the same artifact directory.
-    let mut detected = BTreeMap::<(PathBuf, &'static str), DetectedTarget>::new();
+    // resolve to the same artifact directory.
+    let mut detected = BTreeMap::<PathBuf, DetectedTarget>::new();
     for definition in definitions {
         for (&project, children) in &children_by_name {
             if !children.contains_key(definition.detector.marker) {
@@ -289,9 +289,9 @@ pub fn detect_workspace_targets(
             let age_days = modified_age_days(&scan.arena, candidate, now);
             let safety = validate_candidate(&scan.arena, candidate, &project_root, home);
             let (apparent, allocated) = subtree_sizes(&scan.arena, candidate);
-            detected.insert(
-                (path.clone(), definition.id),
-                DetectedTarget {
+            detected
+                .entry(path.clone())
+                .or_insert_with(|| DetectedTarget {
                     id: definition.id,
                     description: definition.description,
                     project_root,
@@ -306,11 +306,33 @@ pub fn detect_workspace_targets(
                     stale_after_days: definition.stale_after_days,
                     stale: age_days.map(|age| age >= u64::from(definition.stale_after_days)),
                     safety,
-                },
-            );
+                });
         }
     }
-    detected.into_values().collect()
+
+    // Package trees commonly contain their own markers (`node_modules/foo` has
+    // a package.json). Once an outer artifact directory is a candidate, every
+    // candidate below it is part of the same prospective action and must not be
+    // printed or counted again.
+    let mut candidates: Vec<_> = detected.into_values().collect();
+    candidates.sort_by(|left, right| {
+        left.path
+            .components()
+            .count()
+            .cmp(&right.path.components().count())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut roots: Vec<DetectedTarget> = Vec::new();
+    for candidate in candidates {
+        if roots
+            .iter()
+            .any(|parent| candidate.path.starts_with(&parent.path))
+        {
+            continue;
+        }
+        roots.push(candidate);
+    }
+    roots
 }
 
 fn modified_age_days(arena: &Arena, index: NodeIndex, now: u64) -> Option<u64> {
@@ -513,5 +535,43 @@ mod tests {
             &detected[0].safety,
             CandidateSafety::Refused(reason) if reason.contains("synced cloud")
         ));
+    }
+
+    #[test]
+    fn targets_nested_below_an_existing_candidate_are_collapsed() {
+        let mut scan = fixture_scan("/fixture", false);
+        let modules = (0..scan.arena.nodes.len())
+            .map(NodeIndex::from_usize)
+            .find(|index| scan.arena.name(*index) == "node_modules")
+            .unwrap();
+        let dependency = scan.arena.push_child(
+            modules,
+            "dependency",
+            Node {
+                kind: NodeKind::Directory,
+                ..Node::default()
+            },
+        );
+        scan.arena.push_child(
+            dependency,
+            "package.json",
+            Node {
+                kind: NodeKind::File,
+                ..Node::default()
+            },
+        );
+        scan.arena.push_child(
+            dependency,
+            "dist",
+            Node {
+                kind: NodeKind::Directory,
+                ..Node::default()
+            },
+        );
+
+        let detected = detect_workspace_targets(&scan, BUILTIN_TARGETS, None);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].id, "node.modules");
+        assert_eq!(detected[0].path, Path::new("/fixture/project/node_modules"));
     }
 }

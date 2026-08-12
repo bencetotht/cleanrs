@@ -431,6 +431,12 @@ that Phase 2 or v0.2 is complete.
       marker detection/sizing, dataless refusal independent of location,
       machine-readable and human CLI output, unknown filters, and proof that a
       working-directory `cleanrs.toml` is ignored.
+- [x] Target presentation collapses candidates nested beneath an already
+      detected artifact root (notably package markers and `dist` directories
+      inside `node_modules`), preventing redundant actions and double-counted
+      output. Results sort by reclaimable ceiling; human output shows the top
+      25 by default, while `--top N` and `--min-size SIZE` provide explicit
+      control and JSON remains unlimited unless filtered.
 - [ ] Remaining target-model work: TOML/CLI definitions and overrides, explicit
       config trust decisions keyed by canonical path and content hash, export,
       path/command detectors, and the complete §8.2 invariant pipeline.
