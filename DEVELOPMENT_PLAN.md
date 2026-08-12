@@ -327,3 +327,80 @@ These apply in every phase:
 - macOS claims are verified against the installed SDK, not secondary sources.
 - When a phase invalidates something in VISION.md, update VISION.md in the same
   change — state the correction rather than silently deleting the old claim.
+
+---
+
+## Implementation progress — 2026-08-11
+
+Phase 0 remains open because the repository does not have an explicitly
+prepared evicted-cloud fixture and automated snapshot mutation would change the
+developer machine. The exact measured/pending boundary is recorded in
+`docs/findings-phase0.md`; no missing experiment is presented as a result.
+
+Implemented Phase 0/1 foundations:
+
+- Two-crate Rust workspace (`cleanrs-core` and `cleanrs`) with the prescribed
+  `fs`, `accounting`, `targets`, `providers`, `index`, and `journal` modules.
+  Later-phase modules are deliberately inert so this build has no write path.
+- SDK-verified `getattrlistbulk` FFI and packed-record parser, including returned
+  masks, entry errors, hardlink counts, private size, clone metadata,
+  `SF_FIRMLINK`, and `SF_DATALESS`; safe per-directory `lstat` fallback.
+- Parallel directory traversal with bounded active workers, a `u32`-indexed
+  arena, flat interned names, no symlink following, mount-boundary refusal,
+  firmlink refusal, excludes, and counted coverage errors with unknown size.
+- Apparent and allocated totals, hardlink deduplication, clone-family ceiling,
+  private-size floor, derived confidence, and a real macOS clone fixture.
+- `scan` with JSON, all four metric views, allocated default, depth, minimum
+  size, excludes, explanations, mount opt-in, and worker control.
+- Container-oriented `doctor` with distinct System/Data/VM/Nix rows, APFS shared
+  capacity/free space, optional explicit-scope reconciliation via `--scan`,
+  snapshot presence, explicit unknown purgeable/FDA state, and diagnostic-only
+  swap messaging.
+- Shell completions, man-page generation, CI on macOS and Linux, release builds,
+  dependency updates, a fixed synthetic-tree generator, and scheduled
+  warm-cache comparisons against `du`, `diskus`, `dust`, and `gdu`.
+
+Exit-criterion status:
+
+- [x] `docs/findings-phase0.md` records the environment, results, non-results,
+      and current promise.
+- [ ] Dataless materialization and eviction test (hard gate; fixture required).
+- [ ] Snapshot/private-size churn and snapshot-generation-token experiment.
+- [x] One-tier attribute request decision recorded, provisional on benchmarks.
+- [x] `scan` agrees byte-for-byte with macOS `du -sk` on a no-clone fixture and
+      on the repository at the recorded measurement.
+- [x] Mutual-clone unit and real-`clonefile` fixtures retain a non-zero ceiling.
+- [ ] Quiesced container-delta harness across every APFS fixture.
+- [ ] Root/firmlink acceptance test on a disposable macOS installation.
+- [x] `doctor` explicitly inventories VM swap and an existing `/nix` volume.
+- [ ] Live cloud materialization acceptance test.
+- [ ] Complete the four-tool `hyperfine` benchmark. Preliminary warm-cache
+      cleanrs/`du` numbers and the fixed-tree scheduled workflow are present.
+- [x] CI runs formatting, strict Clippy, tests, and release builds on macOS and
+      Linux; scheduled CI records warm-cache scan performance.
+
+### Phase 1 terminal UX — 2026-08-12
+
+- [x] The core scanner publishes ordered, monotonic directory, entry, and
+      allocated-byte progress snapshots without depending on terminal code.
+- [x] Interactive `scan` and `doctor --scan` runs show an indeterminate progress
+      indicator with live counters; unknown total work is not presented as a
+      fake percentage.
+- [x] Human `scan` output uses metric-aware result tables, confidence colors,
+      compact relative paths, a scan summary, and dedicated safety/coverage
+      diagnostics.
+- [x] Human `doctor` output groups container capacity, volumes, Data attribution,
+      environment diagnostics, and explanatory notes into separate tables.
+- [x] TTY output uses Unicode and semantic colors; redirected output uses ASCII;
+      `NO_COLOR` is respected; JSON, completions, and man-page output remain
+      animation- and decoration-free.
+
+### MSRV compatibility — 2026-08-12
+
+- [x] Pinned `globset` to 0.4.19 because 0.4.20 requires Rust 1.88 while the
+      workspace promises Rust 1.85 support.
+- [x] Verified `cargo check --workspace --all-targets` with rustc 1.85.0 rather
+      than relying only on Cargo's dependency metadata.
+- [x] Pinned `comfy-table` to 7.1.4; 7.2 uses let-chains unavailable on Rust
+      1.85. Added platform-specific compilation guards so Linux builds do not
+      emit warnings for macOS-only `diskutil` and filesystem-flag helpers.

@@ -1,0 +1,35 @@
+name: Warm-cache scan benchmark
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install comparison tools
+        run: brew install hyperfine diskus dust gdu
+      - name: Build and generate fixed fixture
+        run: |
+          cargo build --release --workspace
+          cargo run --release -p cleanrs-core --example synthetic_tree -- "$RUNNER_TEMP/cleanrs-fixture" 50000
+      - name: Benchmark warm-cache scans
+        run: |
+          hyperfine --warmup 3 --runs 10 --export-json benchmark.json \
+            './target/release/cleanrs scan "$RUNNER_TEMP/cleanrs-fixture" --json --depth 0' \
+            'du -sk "$RUNNER_TEMP/cleanrs-fixture"' \
+            'diskus "$RUNNER_TEMP/cleanrs-fixture"' \
+            'dust -d 0 "$RUNNER_TEMP/cleanrs-fixture"' \
+            'gdu -n -d 0 "$RUNNER_TEMP/cleanrs-fixture"'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: warm-cache-benchmark-${{ github.sha }}
+          path: benchmark.json
