@@ -90,3 +90,90 @@ fn symlink_scan_root_is_rejected() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("symbolic link"));
     }
 }
+
+#[test]
+fn targets_detects_and_sizes_workspace_artifacts_as_json() {
+    let fixture = tempdir().unwrap();
+    fs::write(fixture.path().join("package.json"), b"{}").unwrap();
+    fs::create_dir(fixture.path().join("node_modules")).unwrap();
+    fs::write(
+        fixture.path().join("node_modules").join("package.js"),
+        b"module.exports = {};",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args([
+            "targets",
+            fixture.path().to_str().unwrap(),
+            "--json",
+            "--only",
+            "node.modules",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["targets"][0]["id"], "node.modules");
+    assert_eq!(json["targets"][0]["safety"]["status"], "eligible");
+    assert!(json["targets"][0]["allocated"].as_u64().unwrap() > 0);
+    assert!(json["targets"][0]["estimate"]["ceiling"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn targets_human_output_is_explicitly_read_only() {
+    let fixture = tempdir().unwrap();
+    fs::write(fixture.path().join("Cargo.toml"), b"[package]").unwrap();
+    fs::create_dir(fixture.path().join("target")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args(["targets", fixture.path().to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("RECLAIMABLE"));
+    assert!(stdout.contains("cargo.target"));
+    assert!(stdout.contains("read-only; no action was run"));
+    assert!(!stdout.contains("\u{1b}["));
+}
+
+#[test]
+fn targets_never_loads_working_directory_configuration() {
+    let fixture = tempdir().unwrap();
+    fs::write(
+        fixture.path().join("cleanrs.toml"),
+        r#"[[target]]
+id = "hostile"
+detect = { command = "sh" }
+reclaim = { method = "run", argv = ["sh", "-c", "touch owned"] }
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .current_dir(fixture.path())
+        .args(["targets", ".", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["targets"].as_array().unwrap().len(), 0);
+    assert!(!fixture.path().join("owned").exists());
+}
+
+#[test]
+fn targets_rejects_unknown_filter_ids() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args(["targets", ".", "--only", "does.not.exist"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown target ID"));
+}

@@ -15,9 +15,10 @@ use comfy_table::{
 use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
 
+use cleanrs_core::targets::{CandidateSafety, Recoverability};
 use cleanrs_core::{Confidence, DoctorReport, ScanObserver, ScanProgress};
 
-use crate::{Metric, ScanOutput, format_interval, human_bytes};
+use crate::{Metric, ScanOutput, TargetsOutput, format_interval, human_bytes};
 
 /// Presentation policy derived from the actual output streams and `NO_COLOR`.
 pub(crate) struct TerminalUi {
@@ -262,6 +263,85 @@ impl TerminalUi {
                 println!("  {} {note}", self.muted("•"));
             }
         }
+    }
+
+    pub(crate) fn print_targets(&self, output: &TargetsOutput) {
+        println!(
+            "{}  {}",
+            self.heading("cleanrs targets"),
+            self.muted(&output.scope.display().to_string())
+        );
+        println!();
+
+        let mut targets = self.table();
+        targets.set_header(vec![
+            self.header("RECLAIMABLE"),
+            self.header("CONFIDENCE"),
+            self.header("CLASS"),
+            self.header("AGE"),
+            self.header("STATUS"),
+            self.header("TARGET"),
+        ]);
+        for target in &output.targets {
+            let age = target.age_days.map_or_else(
+                || "unknown".into(),
+                |days| format!("{days}d / {}d", target.stale_after_days),
+            );
+            let status = match &target.safety {
+                CandidateSafety::Eligible if target.stale == Some(true) => {
+                    self.value("eligible", Color::Green)
+                }
+                CandidateSafety::Eligible => self.value("not stale", Color::Yellow),
+                CandidateSafety::Refused(reason) => {
+                    self.value(format!("refused: {reason}"), Color::Red)
+                }
+            };
+            let class = match target.properties.recoverability {
+                Recoverability::Generated => format!("{:?}", target.class).to_lowercase(),
+                Recoverability::Downloadable => format!("{:?}", target.class).to_lowercase(),
+                Recoverability::UserData => "user data".into(),
+            };
+            targets.add_row(vec![
+                self.value(format_interval(&target.estimate), Color::Cyan),
+                self.confidence(target.estimate.confidence),
+                Cell::new(class),
+                Cell::new(age),
+                status,
+                Cell::new(format!("{}\n{}", target.id, target.path.display())),
+            ]);
+        }
+        println!("{targets}");
+
+        println!();
+        let mut summary = self.table();
+        summary.set_header(vec![self.header("TARGET SUMMARY"), self.header("VALUE")]);
+        summary.add_row(vec![Cell::new("Detected"), Cell::new(output.targets.len())]);
+        summary.add_row(vec![
+            Cell::new("Eligible and stale"),
+            Cell::new(
+                output
+                    .targets
+                    .iter()
+                    .filter(|target| {
+                        matches!(target.safety, CandidateSafety::Eligible)
+                            && target.stale == Some(true)
+                    })
+                    .count(),
+            ),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Coverage"),
+            if output.coverage_complete {
+                self.value("complete", Color::Green)
+            } else {
+                self.value("incomplete", Color::Red)
+            },
+        ]);
+        summary.add_row(vec![
+            Cell::new("Execution"),
+            self.value("read-only; no action was run", Color::Green),
+        ]);
+        println!("{summary}");
     }
 
     fn table(&self) -> Table {

@@ -404,3 +404,38 @@ Exit-criterion status:
 - [x] Pinned `comfy-table` to 7.1.4; 7.2 uses let-chains unavailable on Rust
       1.85. Added platform-specific compilation guards so Linux builds do not
       emit warnings for macOS-only `diskutil` and filesystem-flag helpers.
+
+### Phase 2 targets groundwork — 2026-08-12
+
+This is an intentionally read-only vertical slice started at the user's
+request. It does **not** close the open Phase 0/1 gates above and does not claim
+that Phase 2 or v0.2 is complete.
+
+- [x] Replaced the inert `targets` module with the §6 property model: class
+      expansion, independent recoverability/rebuild/network/automation fields,
+      and cleanup-level selection that keeps `user_data` unreachable unless a
+      stable target is explicitly named.
+- [x] Added an embedded initial workspace catalog for Cargo `target`,
+      `node_modules`, `.next`, and `dist`, using marker-scoped detection and
+      deduplicated candidate paths.
+- [x] Added `cleanrs targets [PATH]` with an explicit scope (working directory
+      by default, never the home directory), `--json`, `--only`, `--exclude`,
+      worker control, TTY-aware progress, and human tables.
+- [x] Each detected target is APFS-aware sized from the existing scan and shows
+      apparent/allocated bytes, a reclaimability interval, derived confidence,
+      artifact age, staleness policy, and safety status.
+- [x] Candidate validation proves marker artifacts remain strictly below their
+      project root and refuses synced-cloud locations, dataless descendants,
+      and mount-boundary crossings. Refused targets stay visible in output.
+- [x] Tests cover class expansion, level-independent `user_data` protection,
+      marker detection/sizing, dataless refusal independent of location,
+      machine-readable and human CLI output, unknown filters, and proof that a
+      working-directory `cleanrs.toml` is ignored.
+- [ ] Remaining target-model work: TOML/CLI definitions and overrides, explicit
+      config trust decisions keyed by canonical path and content hash, export,
+      path/command detectors, and the complete §8.2 invariant pipeline.
+- [ ] Remaining detection work: Cargo workspace/shared-target resolution,
+      configured `CARGO_TARGET_DIR`, provider inspection/planning, and every
+      §7.3 known-location acceptance row.
+- [ ] `clean` planning and the verifiably inert Phase 2 `--apply` refusal have
+      not been added yet. No execution API exists.

@@ -2,10 +2,11 @@
 
 Storage usage analyzer and cleaner for developers, written in Rust. Fully transparent.
 
-> **Status: Phase 0/1 MVP in progress.** The read-only `scan` and `doctor`
-> commands are implemented. Phase 0's live cloud/snapshot safety experiments
-> remain open; see [the findings](docs/findings-phase0.md) and
-> [VISION.md](VISION.md).
+> **Status: Phase 0/1 MVP plus Phase 2 groundwork.** The read-only `scan`,
+> `doctor`, and initial workspace-scoped `targets` commands are implemented.
+> Phase 0's live cloud/snapshot safety experiments remain open; see
+> [the findings](docs/findings-phase0.md), [VISION.md](VISION.md), and the
+> explicit progress boundary in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
 
 ## Why
 
@@ -116,7 +117,7 @@ establish, before anything is built on top of it.
 cleanrs scan [PATH]      One-shot analysis (--json, --reclaimable, --explain)
 cleanrs tui  [PATH]      Interactive browser
 cleanrs doctor           Reconcile container state; report the unexplained gap
-cleanrs targets          List detected cleanup targets with sizes and confidence
+cleanrs targets [PATH]   List workspace targets with sizes and confidence (initial slice)
 cleanrs clean            Reclaim space — dry-run by default
 cleanrs history          Estimated vs. observed results of past runs
 cleanrs schedule         launchd agent for unattended weekly runs
@@ -146,13 +147,21 @@ cargo build --release
 ./target/release/cleanrs scan . --reclaimable --depth 2
 ./target/release/cleanrs doctor
 ./target/release/cleanrs doctor --scan .
+./target/release/cleanrs targets .
 ```
 
 `scan` defaults to the current directory and allocated-size ranking. It never
 defaults to the home directory, never follows symlinks, and never reads file
 contents. JSON output, metric selection, depth/minimum-size filters, exclusions,
 path explanations, shell completions, and a generated man page are available in
-`cleanrs --help`. No cleanup or deletion command exists in this phase.
+`cleanrs --help`. No cleanup or deletion command exists yet.
+
+`targets` also defaults to the current directory rather than the home directory.
+The initial slice detects marker-scoped Cargo and Node.js build artifacts,
+deduplicates candidates, applies staleness policy, and displays the same honest
+reclaimability intervals. Candidate-level cloud/dataless and mount-boundary
+checks can refuse a finding without hiding it. Configuration, provider targets,
+the full known-location catalog, and `clean` planning remain Phase 2 work.
 
 `doctor --scan PATH` reconciles one explicit scan scope against Data-volume
 usage and labels the remainder as unattributed. Without `--scan`, it stays cheap
