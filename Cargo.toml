@@ -14,7 +14,7 @@ anyhow = "1.0"
 bitflags = { version = "2.9", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 # 7.2 uses let-chains, which are unavailable on the workspace's Rust 1.85 MSRV.
 comfy-table = "=7.1.4"
 console = "0.15"
