@@ -330,129 +330,304 @@ These apply in every phase:
 
 ---
 
-## Implementation progress — 2026-08-11
+## Implementation progress audit — 2026-08-12
 
-Phase 0 remains open because the repository does not have an explicitly
-prepared evicted-cloud fixture and automated snapshot mutation would change the
-developer machine. The exact measured/pending boundary is recorded in
-`docs/findings-phase0.md`; no missing experiment is presented as a result.
+This section is the source of truth for implementation status. It was rebuilt
+from the current source, tests, manifests, and workflows rather than inferred
+from module names or earlier progress notes.
 
-Implemented Phase 0/1 foundations:
+Legend: `[x]` fulfilled by the current repository; `[~]` partially implemented
+or covered only by a narrower test than the criterion requires; `[ ]` missing.
 
-- Two-crate Rust workspace (`cleanrs-core` and `cleanrs`) with the prescribed
-  `fs`, `accounting`, `targets`, `providers`, `index`, and `journal` modules.
-  Later-phase modules are deliberately inert so this build has no write path.
-- SDK-verified `getattrlistbulk` FFI and packed-record parser, including returned
-  masks, entry errors, hardlink counts, private size, clone metadata,
-  `SF_FIRMLINK`, and `SF_DATALESS`; safe per-directory `lstat` fallback.
-- Parallel directory traversal with bounded active workers, a `u32`-indexed
-  arena, flat interned names, no symlink following, mount-boundary refusal,
-  firmlink refusal, excludes, and counted coverage errors with unknown size.
-- Apparent and allocated totals, hardlink deduplication, clone-family ceiling,
-  private-size floor, derived confidence, and a real macOS clone fixture.
-- `scan` with JSON, all four metric views, allocated default, depth, minimum
-  size, excludes, explanations, mount opt-in, and worker control.
-- Container-oriented `doctor` with distinct System/Data/VM/Nix rows, APFS shared
-  capacity/free space, optional explicit-scope reconciliation via `--scan`,
-  snapshot presence, explicit unknown purgeable/FDA state, and diagnostic-only
-  swap messaging.
-- Shell completions, man-page generation, CI on macOS and Linux, release builds,
-  dependency updates, a fixed synthetic-tree generator, and scheduled
-  warm-cache comparisons against `du`, `diskus`, `dust`, and `gdu`.
+| Phase | Status | Summary |
+|---|---|---|
+| 0 | **In progress — hard gate open** | Findings and a provisional attribute-request decision exist; live dataless and snapshot experiments remain unrun. |
+| 1 | **In progress — read-only MVP implemented** | `scan` and a useful `doctor` exist, but ground-truth reclamation, live cloud, root-topology, benchmark, and regression gates remain open. |
+| 2 | **In progress — workspace-target slice implemented** | Built-in marker targets and dry-run planning work; configuration, complete safety invariants, providers, and acceptance-baseline coverage are missing. |
+| 3 | **Not started** | `--apply` refuses before scanning; providers and journal are inert modules. |
+| 4 | **Not started** | Terminal presentation exists, but there is no TUI command, index implementation, or scheduler. |
+| 5 | **Not started** | Portable metadata fallback permits development/tests on Linux, but Linux product support is not implemented. |
 
-Exit-criterion status:
+The phase-ordering rule at the top of this document has not been followed
+strictly: Phase 1 product code and Phase 2 groundwork were added while the Phase
+0 hard gate remained open, and Phase 2 began before Phase 1 exit criteria were
+met. This work is useful, but **no phase is complete and no v0.1/v0.2 exit may
+be claimed yet**.
 
-- [x] `docs/findings-phase0.md` records the environment, results, non-results,
-      and current promise.
-- [ ] Dataless materialization and eviction test (hard gate; fixture required).
-- [ ] Snapshot/private-size churn and snapshot-generation-token experiment.
-- [x] One-tier attribute request decision recorded, provisional on benchmarks.
-- [x] `scan` agrees byte-for-byte with macOS `du -sk` on a no-clone fixture and
-      on the repository at the recorded measurement.
-- [x] Mutual-clone unit and real-`clonefile` fixtures retain a non-zero ceiling.
-- [ ] Quiesced container-delta harness across every APFS fixture.
-- [ ] Root/firmlink acceptance test on a disposable macOS installation.
-- [x] `doctor` explicitly inventories VM swap and an existing `/nix` volume.
-- [ ] Live cloud materialization acceptance test.
-- [ ] Complete the four-tool `hyperfine` benchmark. Preliminary warm-cache
-      cleanrs/`du` numbers and the fixed-tree scheduled workflow are present.
-- [x] CI runs formatting, strict Clippy, tests, and release builds on macOS and
-      Linux; scheduled CI records warm-cache scan performance.
+### Verification snapshot
 
-### Phase 1 terminal UX — 2026-08-12
+Run locally on 2026-08-12:
 
-- [x] The core scanner publishes ordered, monotonic directory, entry, and
-      allocated-byte progress snapshots without depending on terminal code.
-- [x] Interactive `scan` and `doctor --scan` runs show an indeterminate progress
-      indicator with live counters; unknown total work is not presented as a
-      fake percentage.
-- [x] Human `scan` output uses metric-aware result tables, confidence colors,
-      compact relative paths, a scan summary, and dedicated safety/coverage
-      diagnostics.
-- [x] Human `doctor` output groups container capacity, volumes, Data attribution,
-      environment diagnostics, and explanatory notes into separate tables.
-- [x] TTY output uses Unicode and semantic colors; redirected output uses ASCII;
-      `NO_COLOR` is respected; JSON, completions, and man-page output remain
-      animation- and decoration-free.
+- [x] `cargo fmt --all -- --check`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace --all-targets` — 35 passed, 0 failed (17 core,
+      4 binary-unit, 14 CLI integration tests).
+- [x] The workspace declares Rust 1.85 and pins `globset` 0.4.19 and
+      `comfy-table` 7.1.4 for that MSRV. CI contains an explicit Rust 1.85
+      `cargo check` job.
+- [~] CI currently runs its test matrix on Ubuntu only; the `macos-15` matrix
+      entry is commented out. macOS-only `getattrlistbulk`, clone, `du`, and
+      topology behavior therefore are not continuously tested.
+- [~] `.github/workflows/benchmark.yml` defines the requested five-command
+      warm-cache `hyperfine` run (`cleanrs`, `du`, `diskus`, `dust`, `gdu`), but
+      it is manual-dispatch only, has no checked-in result, and does not compare
+      against a regression threshold. Its schedule is commented out.
 
-### MSRV compatibility — 2026-08-12
+### Phase 0 audit — Feasibility research
 
-- [x] Pinned `globset` to 0.4.19 because 0.4.20 requires Rust 1.88 while the
-      workspace promises Rust 1.85 support.
-- [x] Verified `cargo check --workspace --all-targets` with rustc 1.85.0 rather
-      than relying only on Cargo's dependency metadata.
-- [x] Pinned `comfy-table` to 7.1.4; 7.2 uses let-chains unavailable on Rust
-      1.85. Added platform-specific compilation guards so Linux builds do not
-      emit warnings for macOS-only `diskutil` and filesystem-flag helpers.
+Implemented or recorded:
 
-### Phase 2 targets groundwork — 2026-08-12
+- `docs/findings-phase0.md` records the Apple Silicon/macOS/APFS environment,
+  installed-SDK constants, completed measurements, unrun experiments, the
+  current promise, and a provisional one-tier request decision.
+- The native backend requests returned masks, entry errors, name, device, type,
+  mtime, flags, inode/link data, apparent/allocated/private sizes, clone ID, and
+  clone refcount in one `getattrlistbulk` call. `SF_FIRMLINK` and `SF_DATALESS`
+  match the installed SDK values.
+- Unit fixtures cover hardlink set accounting and the mutual-clone interval
+  algorithm. A macOS test creates a real 1 MiB clone and verifies that clone
+  metadata is observed.
+- A fixed synthetic-tree generator and preliminary `cleanrs`/`du` timings
+  exist. Those measurements show that the current implementation does not beat
+  `du`; they are not the required full benchmark.
+- Container/Data/VM topology was observed on the development machine.
 
-This is an intentionally read-only vertical slice started at the user's
-request. It does **not** close the open Phase 0/1 gates above and does not claim
-that Phase 2 or v0.2 is complete.
+Missing research:
 
-- [x] Replaced the inert `targets` module with the §6 property model: class
-      expansion, independent recoverability/rebuild/network/automation fields,
-      and cleanup-level selection that keeps `user_data` unreachable unless a
-      stable target is explicitly named.
-- [x] Added an embedded initial workspace catalog for Cargo `target`,
-      `node_modules`, `.next`, and `dist`, using marker-scoped detection and
-      deduplicated candidate paths.
-- [x] Added `cleanrs targets [PATH]` with an explicit scope (working directory
-      by default, never the home directory), `--json`, `--only`, `--exclude`,
-      worker control, TTY-aware progress, and human tables.
-- [x] Each detected target is APFS-aware sized from the existing scan and shows
-      apparent/allocated bytes, a reclaimability interval, derived confidence,
-      artifact age, staleness policy, and safety status.
-- [x] Candidate validation proves marker artifacts remain strictly below their
-      project root and refuses synced-cloud locations, dataless descendants,
-      and mount-boundary crossings. Refused targets stay visible in output.
-- [x] Tests cover class expansion, level-independent `user_data` protection,
-      marker detection/sizing, dataless refusal independent of location,
-      machine-readable and human CLI output, unknown filters, and proof that a
-      working-directory `cleanrs.toml` is ignored.
-- [x] Target presentation collapses candidates nested beneath an already
-      detected artifact root (notably package markers and `dist` directories
-      inside `node_modules`), preventing redundant actions and double-counted
-      output. Results sort by reclaimable ceiling; human output shows the top
-      25 by default, while `--top N` and `--min-size SIZE` provide explicit
-      control and JSON remains unlimited unless filtered.
-- [ ] Remaining target-model work: TOML/CLI definitions and overrides, explicit
-      config trust decisions keyed by canonical path and content hash, export,
-      path/command detectors, and the complete §8.2 invariant pipeline.
-- [ ] Remaining detection work: Cargo workspace/shared-target resolution,
-      configured `CARGO_TARGET_DIR`, provider inspection/planning, and every
-      §7.3 known-location acceptance row.
-- [x] Added `clean [PATH]` planning with `safe`/`standard`/`aggressive` level
-      selection, staleness enforcement and override, `--only`/`--exclude`,
-      JSON and human review output, clone/hardlink-deduplicated reclaimability
-      bounds over the complete selection, and an explicit dry-run result. Each
-      planned candidate captures device, inode, and type for later Phase 3
-      revalidation.
-- [x] `clean --apply` is accepted but refuses before scanning or reaching any
-      write API. CLI fixture tests prove both ordinary dry-runs and refused
-      apply requests leave candidate trees untouched.
-- [ ] Phase 3 execution remains gated: no deletion, Trash, provider execution,
-      verification, or journal write API exists until the remaining Phase 2
-      safety/configuration/provider exit criteria and earlier hard gates are
-      closed.
+- No controlled evicted iCloud/File Provider fixture has been scanned, so zero
+  materialization and zero allocation change are unproven. Eviction semantics
+  are also untested. This remains the hard gate on scanning a real home tree.
+- Snapshot creation/expiry, untouched-file `PRIVATESIZE` changes, absence of
+  FSEvents, and snapshot-generation-token cost are unmeasured.
+- There is no repeated, quiesced before/after APFS container-delta harness for
+  clones, divergence, partial divergence, hardlinks, sparse files, and
+  snapshots. The interval is therefore not ground-truth validated.
+- Interval tightness on a real developer home directory has not been measured.
+- Minimal-versus-extended attribute-mask cost has not been A/B benchmarked, so
+  the one-tier decision is explicitly provisional.
+- Open-descriptor sweep cost and privilege requirements are unmeasured.
+- Topology observations do not yet cover all required firmlink and volume-group
+  cases on a disposable system.
+
+Exit criteria:
+
+- [x] `docs/findings-phase0.md` states what was measured, the environment,
+      non-results, and the resulting limits on the current promise.
+- [ ] The live dataless materialization test passes.
+- [~] VISION.md reflects the conservative current promise, but §3 has not
+      promoted the tested portions from hypotheses to `[exp]`, and the central
+      interval guarantee remains unvalidated.
+- [x] A provisional one-tier decision is recorded, with an explicit trigger for
+      reopening it after the missing A/B benchmark.
+
+**Phase 0 is not complete.** The dataless hard gate alone prevents completion.
+
+### Phase 1 audit — Read-only truth
+
+Implemented:
+
+- Two-crate workspace with filesystem code behind the `FileSystem` trait.
+- Native macOS `getattrlistbulk` parser plus per-directory `readdir`/`lstat`
+  fallback; non-macOS portable backend.
+- Parallel blocking directory workers, capped worker count, monotonic progress
+  counters, no symlink following, mount-boundary refusal by default, a root/Data
+  firmlink rule, built-in pseudo-filesystem excludes, and counted coverage
+  errors with unknown size.
+- A `u32`-indexed arena with parent/child/sibling links and a flat name buffer.
+- Apparent/allocated/private metadata, hardlink deduplication, clone-family
+  ceiling, private-size floor, selected-subtree union accounting, and confidence
+  derived from interval width and coverage.
+- `scan` supports JSON, metric selection, allocated default ranking, depth,
+  minimum size, excludes, one-path explanation, mount opt-in, worker control,
+  and TTY-aware progress/output.
+- `doctor` reports shared container capacity/free space, System/Data/VM and an
+  existing `/nix` mount, snapshot count, swap as diagnostic-only, optional
+  explicit-scope attribution, unexplained space, and explicit unknowns for
+  purgeable space and Full Disk Access.
+- Shell completions, man-page output, semantic terminal colors, colorless
+  redirected output, and `NO_COLOR` handling.
+
+Partial or missing implementation:
+
+- The packed-record parser has bounds checks but no dedicated constructed-record
+  fixture tests for masks, offsets, truncation, and malformed records.
+- Fallback occurs after a bulk call fails for a directory; capabilities are not
+  detected/cached per mount.
+- `doctor` probes a hard-coded root/Data/VM/Nix set rather than enumerating every
+  volume in an APFS container. It has no `--container`/`--all-containers`,
+  purgeable measurement, effective Full Disk Access probe, provider diagnostics,
+  or index freshness diagnostics.
+- Active worker count is bounded, but the directory channel and outstanding job
+  count are not. Worker defaults are CPU-count based, not storage aware.
+- There are no sharded inode/clone sets. Accounting uses ordinary local
+  `HashMap`/`HashSet` collections after traversal.
+- Firmlink logic is a fixed path list plus flags, not discovered volume-group
+  topology. Its test exercises the predicate only; it does not scan `/` and
+  prove absence of a duplicated home subtree.
+- `--explain` selects one scanned path and reports the interval's generic reason;
+  it does not identify the files/families that widened the interval.
+- Dataless flags are collected and shown, but non-materialization is not proven.
+- Snapshot coverage does not yet alter intervals or confidence beyond a
+  separately reported snapshot count.
+
+Exit criteria:
+
+- [x] A macOS fixture test compares no-clone allocated bytes byte-for-byte with
+      `du -sk`; the Phase 0 findings also record agreement on this repository.
+- [~] Mutual-clone unit and real-`clonefile` tests retain a non-zero,
+      clone-deduplicated ceiling, but they do **not** delete the fixture or prove
+      that the ceiling equals real reclamation.
+- [ ] The ground-truth container-delta harness brackets every fixture.
+- [~] Root/Data topology has predicate coverage, but no acceptance scan of `/`
+      proves that the home directory is not duplicated.
+- [x] `doctor` inventories `/System/Volumes/VM` as OS-managed swap and includes
+      `/nix` when that mount exists.
+- [ ] The live cloud materialization test passes.
+- [~] The complete warm-cache benchmark command exists in a workflow, but no
+      complete recorded result is present.
+- [ ] CI tracks scan-time regression. The benchmark workflow records a manual
+      sample only and enforces no baseline or threshold.
+
+**Phase 1 is not complete.** Its read-only command surface is a useful MVP, but
+six acceptance gates are missing or only partially covered.
+
+### Phase 2 audit — Targets and planning
+
+Implemented:
+
+- The class/property model and `safe`/`standard`/`aggressive` selection logic,
+  including level-independent protection for `user_data` unless an ID is named.
+- Four embedded marker targets: Cargo `target`, `node_modules`, `.next`, and
+  `dist`, with class defaults/overrides and staleness thresholds.
+- One explicit workspace scan detects, deduplicates, sizes, and ranks candidates;
+  nested candidates inside an outer artifact are collapsed.
+- `targets [PATH]` supports JSON, `--only`, `--exclude`, `--top`, `--min-size`,
+  worker control, progress, and human tables. Refused candidates remain visible.
+- Candidate checks require a marker artifact to be a direct, strict descendant
+  of its detected project, reject the root/home, reject known synced-cloud
+  prefixes, and inspect descendants for dataless and mount-boundary flags.
+- `clean [PATH]` plans by level and staleness, computes one deduplicated interval
+  over the complete selection, captures device/inode/type, and prints an
+  explicit dry-run result.
+- `clean --apply` refuses before scanning. There is no reachable filesystem or
+  provider write API.
+
+Missing target/configuration work:
+
+- No TOML loader, embedded manifest format, user config, explicit `--config`,
+  trust store, canonical-path/content-hash trust decision, or override merge.
+- No compact `--target`, long-form target flags, `--target-argv`,
+  `--targets-only-cli`, `--no-builtin-targets`, or `--export`.
+- Only marker detectors exist. Path/command detectors and configurable scopes
+  are absent.
+- Staleness uses only the artifact directory mtime, not both marker and artifact
+  signals or ecosystem-specific evidence.
+- Cargo workspace roots, shared/custom `CARGO_TARGET_DIR`, and duplicate
+  workspace clean prevention are absent.
+
+Missing safety work:
+
+- The §8.2 pipeline is incomplete: no `~` expansion/nearest-existing-ancestor
+  canonicalization, general empty/root/home/mount-root rejection for arbitrary
+  definitions, `children_only` widening proof, plan-time replacement detection,
+  openat-relative traversal model, or bounded unattended deletion limit.
+- Device/inode/type are captured but cannot yet be revalidated because there is
+  no apply path. There are no adversarial tests for `..`, symlinked ancestors,
+  replacement races, or `children_only` widening.
+- Dataless refusal has a deterministic unit fixture, not the required live cloud
+  safety evidence. Ubiquitous status beyond `SF_DATALESS` is not implemented.
+- The user-data test is deterministic rather than property-based, and it tests
+  level selection directly rather than arbitrary resolved target definitions.
+
+Missing provider/acceptance work:
+
+- `providers.rs` is an inert `AVAILABLE = false` placeholder. There is no
+  inspect/plan interface, identity/context capture, or provider implementation.
+- Homebrew, Docker Desktop, OrbStack, Cargo, pnpm, npm/npx, Bun, Xcode, VMware,
+  Claude Cowork, and wallpaper-cache acceptance rows are absent. Swap is the
+  only §7.3 special area represented, through `doctor`.
+- The broader home, Library, Developer, cloud-eviction, VM, runtime, and cache
+  classification baseline is not covered by `targets`/`doctor` acceptance tests.
+
+Exit criteria:
+
+- [~] A deterministic test proves no cleanup level selects a
+      `TargetClass::Irreplaceable` target unless explicitly named; the required
+      property test over resolved target definitions is absent.
+- [x] An ordinary `node_modules` marker match with a dataless descendant is
+      refused without relying on its location. This is an in-memory fixture,
+      not the still-open Phase 0 live-materialization test.
+- [~] A CLI test proves an unrequested working-directory `cleanrs.toml` is
+      ignored and cannot execute. Explicit config loading and command targets do
+      not exist yet, so the complete trust-boundary behavior is not testable.
+- [ ] The full adversarial path suite passes.
+- [ ] An OrbStack-inspected Docker plan stays pinned and aborts on context or
+      daemon identity change.
+- [ ] Every VISION.md §7.3 row appears in `targets` or `doctor` output.
+- [x] `clean --apply` is verifiably inert; a CLI fixture asserts the candidate
+      survives the refusal.
+
+**Phase 2 is not complete.** The current slice is a sound read-only workspace
+planner, not the complete v0.2 target/configuration/provider system.
+
+### Phase 3 audit — Execution and verification
+
+Status: **not started**.
+
+- [x] The current command is safe by absence of execution: `--apply` exits with
+      an error before scanning, and dry-run fixture tests preserve all files.
+- [ ] No permanent deletion or openat-relative descent.
+- [ ] No apply-time device/inode/type revalidation or replacement-race abort.
+- [ ] No Trash mode, cloud eviction, root refusal, provider execution, provider
+      verification, exact-argv display, or unattended confirmation behavior.
+- [ ] `journal.rs` is an inert `AVAILABLE = false` placeholder. None of the
+      seven journal fields, discrepancy classes, rotation, or redaction exist.
+- [ ] There is no `history` command and no estimate-versus-observed calibration
+      loop.
+- [ ] None of the Phase 3 exit criteria are met. The existing inert-apply test
+      is a Phase 2 gate, not evidence of destructive execution correctness.
+
+### Phase 4 audit — Daily driver
+
+Status: **not started**, with reusable terminal groundwork.
+
+- [~] `scan`, `doctor`, `targets`, and `clean` have polished terminal tables,
+      progress indicators, redirected-output behavior, semantic colors, and
+      `NO_COLOR` support. This is CLI presentation, not the ratatui TUI required
+      by Phase 4.
+- [ ] No `tui` command, ratatui browser implementation, or interactive
+      navigation, sorting, filtering, and plan review.
+- [ ] `index.rs` is an inert `AVAILABLE = false` placeholder. There is no index
+      format, validation, snapshot token, FSEvents integration, invalidation,
+      permissions enforcement, or `index` command.
+- [ ] No launchd integration, notifications, pinned scheduled configuration, or
+      `schedule` command.
+- [~] Non-TTY and `NO_COLOR` behavior is tested for ordinary CLI tables, but not
+      for a TUI because none exists.
+- [ ] None of the Phase 4 exit criteria are fully met.
+
+### Phase 5 audit — Linux
+
+Status: **not started**.
+
+- [~] The filesystem trait and portable `readdir`/`lstat` fallback compile on
+      non-macOS targets, and CI is configured to check/test them on Ubuntu.
+      Platform-specific helpers are compilation-guarded.
+- [ ] No `getdents64`/`statx`, reflink/FIEMAP accounting, Linux mount topology,
+      inotify/fanotify, systemd scheduling, Trash semantics, Linux provider
+      policy, or Linux-specific accounting model.
+- [ ] The current portable fallback is development portability, not supported
+      Linux product behavior.
+
+### Next valid completion path
+
+1. Close Phase 0 with explicitly prepared live dataless and snapshot fixtures,
+   the container-delta accounting harness, interval-tightness measurement,
+   attribute-mask A/B benchmark, and descriptor-sweep measurement; then update
+   `docs/findings-phase0.md` and VISION.md labels.
+2. Close Phase 1 with parser fixtures, discovered container topology, live
+   root/cloud acceptance tests, a complete recorded benchmark, and an enforced
+   CI regression check.
+3. Finish Phase 2 configuration/trust, all ten path invariants, workspace-aware
+   detection, provider inspect/plan, and the full §7.3 acceptance matrix before
+   enabling any Phase 3 write path.
