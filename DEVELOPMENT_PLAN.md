@@ -394,3 +394,10 @@ Exit-criterion status:
 - [x] TTY output uses Unicode and semantic colors; redirected output uses ASCII;
       `NO_COLOR` is respected; JSON, completions, and man-page output remain
       animation- and decoration-free.
+
+### MSRV compatibility — 2026-08-12
+
+- [x] Pinned `globset` to 0.4.19 because 0.4.20 requires Rust 1.88 while the
+      workspace promises Rust 1.85 support.
+- [x] Verified `cargo check --workspace --all-targets` with rustc 1.85.0 rather
+      than relying only on Cargo's dependency metadata.
