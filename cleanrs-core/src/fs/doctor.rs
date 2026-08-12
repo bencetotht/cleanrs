@@ -1,5 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 use serde::Serialize;
@@ -154,6 +155,7 @@ fn macos_container_info() -> (Option<String>, Option<u64>, Option<u64>) {
     (None, None, None)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     text.lines().find_map(|line| {
         let (candidate, value) = line.split_once(':')?;
@@ -161,6 +163,7 @@ fn field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn byte_field(text: &str, key: &str) -> Option<u64> {
     let value = field(text, key)?;
     let start = value.find('(')? + 1;

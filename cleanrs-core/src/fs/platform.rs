@@ -153,19 +153,16 @@ fn portable_metadata(path: &Path) -> io::Result<EntryMetadata> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn flags_from_raw(raw: u32) -> NodeFlags {
     let mut flags = NodeFlags::empty();
-    #[cfg(target_os = "macos")]
-    {
-        const SF_FIRMLINK: u32 = 0x0080_0000;
-        const SF_DATALESS: u32 = 0x4000_0000;
-        if raw & SF_FIRMLINK != 0 {
-            flags.insert(NodeFlags::FIRMLINK);
-        }
-        if raw & SF_DATALESS != 0 {
-            flags.insert(NodeFlags::DATALESS);
-        }
+    const SF_FIRMLINK: u32 = 0x0080_0000;
+    const SF_DATALESS: u32 = 0x4000_0000;
+    if raw & SF_FIRMLINK != 0 {
+        flags.insert(NodeFlags::FIRMLINK);
+    }
+    if raw & SF_DATALESS != 0 {
+        flags.insert(NodeFlags::DATALESS);
     }
     flags
 }

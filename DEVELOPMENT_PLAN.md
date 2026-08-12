@@ -401,3 +401,6 @@ Exit-criterion status:
       workspace promises Rust 1.85 support.
 - [x] Verified `cargo check --workspace --all-targets` with rustc 1.85.0 rather
       than relying only on Cargo's dependency metadata.
+- [x] Pinned `comfy-table` to 7.1.4; 7.2 uses let-chains unavailable on Rust
+      1.85. Added platform-specific compilation guards so Linux builds do not
+      emit warnings for macOS-only `diskutil` and filesystem-flag helpers.
