@@ -99,8 +99,9 @@ impl TargetClass {
     }
 }
 
-/// Cleanup intensity used by the future `clean` planner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Cleanup intensity used by the `clean` planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CleanupLevel {
     Safe,
     Standard,
@@ -243,6 +244,67 @@ pub struct DetectedTarget {
     pub stale_after_days: u32,
     pub stale: Option<bool>,
     pub safety: CandidateSafety,
+    /// Filesystem identity captured during planning for Phase 3 revalidation.
+    pub identity: CandidateIdentity,
+}
+
+/// Stable filesystem facts that must still match immediately before deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CandidateIdentity {
+    pub device: u64,
+    pub inode: u64,
+    pub kind: NodeKind,
+}
+
+/// Why a detected target is or is not part of a cleanup plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", content = "reason", rename_all = "snake_case")]
+pub enum PlanSelection {
+    Selected,
+    Skipped(String),
+}
+
+/// One fully explained row in a dry-run cleanup plan.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlannedTarget {
+    #[serde(flatten)]
+    pub target: DetectedTarget,
+    pub selection: PlanSelection,
+}
+
+/// Select detected targets without executing any filesystem operation.
+#[must_use]
+pub fn plan_cleanup(
+    targets: Vec<DetectedTarget>,
+    level: CleanupLevel,
+    explicitly_named_ids: &[String],
+    ignore_staleness: bool,
+) -> Vec<PlannedTarget> {
+    targets
+        .into_iter()
+        .map(|target| {
+            let explicitly_named = explicitly_named_ids.iter().any(|id| id == target.id);
+            let selection = match &target.safety {
+                CandidateSafety::Refused(reason) => {
+                    PlanSelection::Skipped(format!("safety refusal: {reason}"))
+                }
+                CandidateSafety::Eligible
+                    if !level.selects(target.properties, explicitly_named) =>
+                {
+                    PlanSelection::Skipped("not selected by cleanup level".into())
+                }
+                CandidateSafety::Eligible if !ignore_staleness && target.stale != Some(true) => {
+                    PlanSelection::Skipped(match target.stale {
+                        Some(false) => "target is not stale".into(),
+                        None => "target age is unknown".into(),
+                        Some(true) => unreachable!("guard excludes stale targets"),
+                    })
+                }
+                CandidateSafety::Eligible => PlanSelection::Selected,
+            };
+            PlannedTarget { target, selection }
+        })
+        .collect()
 }
 
 /// Detect all selected built-in workspace targets from one explicit scan.
@@ -306,6 +368,11 @@ pub fn detect_workspace_targets(
                     stale_after_days: definition.stale_after_days,
                     stale: age_days.map(|age| age >= u64::from(definition.stale_after_days)),
                     safety,
+                    identity: CandidateIdentity {
+                        device: scan.arena.nodes[candidate.as_usize()].device,
+                        inode: scan.arena.nodes[candidate.as_usize()].inode,
+                        kind: scan.arena.nodes[candidate.as_usize()].kind,
+                    },
                 });
         }
     }
@@ -495,6 +562,23 @@ mod tests {
             assert!(!level.selects(protected, false));
             assert!(level.selects(protected, true));
         }
+    }
+
+    #[test]
+    fn planner_explains_level_and_staleness_selection() {
+        let targets = detect_workspace_targets(
+            &fixture_scan("/fixture", false),
+            BUILTIN_TARGETS,
+            Some(Path::new("/Users/test")),
+        );
+        let safe = plan_cleanup(targets.clone(), CleanupLevel::Safe, &[], true);
+        assert!(matches!(
+            &safe[0].selection,
+            PlanSelection::Skipped(reason) if reason.contains("cleanup level")
+        ));
+
+        let standard = plan_cleanup(targets, CleanupLevel::Standard, &[], true);
+        assert_eq!(standard[0].selection, PlanSelection::Selected);
     }
 
     #[test]

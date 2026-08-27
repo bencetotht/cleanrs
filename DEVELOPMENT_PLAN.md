@@ -1,447 +1,513 @@
 # cleanrs — Development Plan
 
-Five phases, plus an optional sixth. Each is a shippable increment with testable
-exit criteria. **Do not start a phase until the previous one's exit criteria are
-met** — the ordering encodes real dependencies, not preference.
+This plan is organized around the reason cleanrs exists: make routine developer
+storage maintenance on the author's Macs fast, understandable, and safe enough
+to automate.
 
-The phase boundaries were chosen sparingly. Phases 0→1 split because everything
-downstream depends on an unanswered research question. Phases 2→3 split because
-that is the boundary between a tool that only reads and a tool that destroys
-data. Nothing else splits.
+cleanrs is not trying to replace `gdu`, become a general consumer cleaner, or
+prove every detail of APFS allocation. It combines a high-performance scanner
+with knowledge of developer tools: where they store data, how to inspect it,
+which native cleanup commands they expose, and how risky each cleanup action is.
 
-Section references (§) point into [VISION.md](VISION.md).
+Performance engineering remains a first-class goal. The project is also a place
+to learn and apply low-level filesystem techniques: batched metadata access,
+bounded parallel traversal, compact memory layouts, incremental indexing, and
+careful measurement. Performance work must preserve safety and truthful output.
 
-| Phase | Delivers | Destructive? |
+## Utility loop
+
+The daily workflow is:
+
+1. `scan` explains large files and directories quickly.
+2. `doctor` explains storage that an ordinary walk cannot attribute.
+3. `targets` inventories known developer storage and available cleanup actions.
+4. `clean` plans or executes those actions at a chosen severity.
+5. `schedule` handles routine safe maintenance.
+6. `tui` provides one overview for scanning, targets, project findings, and
+   cleanup review.
+
+## Cleanup severity
+
+Severity selects individual actions, not merely applications or directories.
+One provider may expose actions at several levels.
+
+| Level | Intended meaning | Examples |
 |---|---|---|
-| 0 | A written statement of what can be promised | No |
-| 1 | `scan`, `doctor` — read-only analysis | No |
-| 2 | `targets`, `clean --dry-run` — plans, never executed | No |
-| 3 | `clean --apply`, `history` — execution and verification | **Yes** |
-| 4 | `tui`, index, `schedule` — daily-driver quality | Yes |
-| 5 | Linux support | Yes |
+| `safe` | Downloadable caches and cheap generated output with low surprise | Homebrew downloads, package-manager caches, stale build output |
+| `standard` | Broader generated state with noticeable rebuild cost | old toolchains, stopped runtime/build state, older project artifacts |
+| `aggressive` | Large unused state whose removal may disrupt a workflow | unused images, dormant environments, extensive Xcode state |
+| explicit-only | User data or unusually consequential state | Docker volumes, VM disks, repositories, unsynced project data |
+
+No severity level reaches explicit-only actions. They require a named target or
+action. Scheduled application is restricted to `safe`; a scheduled broader run
+may produce a plan but must not apply it.
+
+## Phase overview
+
+| Phase | Delivers | Current state |
+|---|---|---|
+| 0 | Honest safety and accounting foundation | **Practical baseline complete; deeper research deferred** |
+| 1 | Fast read-only scanner and diagnostics | **Useful MVP implemented; performance and UX work remains** |
+| 2 | Developer-storage inventory and cleanup plans | **Next priority; workspace slice implemented** |
+| 3 | Cleanup execution and lightweight history | **Not started; inert apply path exists** |
+| 4 | Project hygiene and stale-project intelligence | **Not started** |
+| 5 | Index, scheduling, and ratatui daily-driver UI | **Terminal groundwork only** |
+| 6 | Extensibility and optional portability | **Deferred** |
+
+Phases define dependency order, but small supporting improvements may land when
+they directly unblock the active phase. A phase does not need laboratory-grade
+proof; it needs reproducible fixtures, truthful limitations, and confidence
+that the commands are useful on the development machines.
 
 ---
 
-## Phase 0 — Feasibility research
+## Phase 0 — Practical filesystem foundation
 
-**Goal:** determine what cleanrs can honestly promise, before any architecture
-is built on assumptions. Output is a document, not a product.
+**Goal:** establish enough macOS behavior to scan and plan safely without
+turning the project into an APFS research program.
 
-Everything in VISION.md §3 is currently a hypothesis. If the floor/ceiling
-interval does not bracket reality, or if the attribute set is too expensive to
-collect, the design changes — and it is far cheaper to learn that now.
+### Already completed
 
-Code written in this phase is **throwaway probe code**. Do not attempt to build
-reusable abstractions here; the point is to answer questions fast.
+- Installed-SDK constants and semantics were checked for
+  `getattrlistbulk`, `ATTR_CMNEXT_PRIVATESIZE`, clone metadata,
+  `SF_FIRMLINK`, and `SF_DATALESS`.
+- The accounting model distinguishes apparent, allocated, private, and
+  estimated-reclaimable values. Estimates are intervals with confidence.
+- Hardlink and mutual-clone fixtures cover the important set-accounting cases.
+- A real clone fixture verifies that macOS clone metadata reaches the scanner.
+- An explicitly prepared 32 MiB iCloud Drive placeholder remained dataless with
+  zero allocated blocks across the initial traversal and five repeated scans.
+- The findings and limits are recorded in `docs/findings-phase0.md`.
+- A one-tier extended attribute request is the current implementation choice.
+
+### Reworked from the original plan
+
+- Exact container-free-space reclamation is no longer a release gate. APFS
+  container deltas are noisy, and cleanrs will not claim exact recovery where
+  it only knows removed allocation or a provider-reported value.
+- Snapshot mutation experiments are deferred. Snapshot presence lowers
+  certainty and is surfaced by `doctor` instead of blocking the utility.
+- Validation of every third-party File Provider is not required. Unverified
+  synced locations remain conservatively refused.
+- Descriptor sweeps and interval-tightness studies are optional enhancements,
+  not prerequisites for inventory and cleanup orchestration.
+
+### Practical completion criteria
+
+- [x] Metadata-only traversal is demonstrated not to materialize the prepared
+      iCloud fixture.
+- [x] Ordinary no-clone fixture allocation agrees with macOS `du`.
+- [x] Clone and hardlink uncertainty is represented honestly rather than as an
+      exact byte promise.
+- [x] Unmeasured behavior is documented as a limitation.
+
+**Status: complete for current utility needs.** Reopen individual research
+questions only when they enable a concrete capability or explain a real bug.
+
+---
+
+## Phase 1 — Fast read-only understanding
+
+**Goal:** quickly answer “what is taking space?” while providing the filesystem
+facts needed by targets and cleanup planning.
+
+### Already completed
+
+- `cleanrs-core::fs::FileSystem` platform seam.
+- Native macOS `getattrlistbulk` traversal with per-directory
+  `readdir`/`lstat` fallback.
+- Parallel blocking workers without an async runtime.
+- No symlink following, no mount crossing by default, firmlink/Data-volume
+  duplicate protection, pseudo-filesystem skips, and counted coverage errors.
+- Compact `u32`-indexed arena and flat name storage.
+- Apparent, allocated, private, and interval accounting with hardlink and clone
+  deduplication.
+- `scan` JSON and human output, metric selection, depth/minimum-size/exclusion
+  filters, path explanation, worker controls, and progress reporting.
+- `doctor` container/Data/VM diagnostics, snapshot count, `/nix` recognition,
+  explicit scan attribution, and honest unknowns.
+- TTY-aware tables, semantic color, `NO_COLOR`, shell completions, and man-page
+  generation.
+
+### Needs reworking or completion
+
+- Add a first-class largest-files view alongside the directory tree.
+- Make `--explain` identify the concrete coverage, clone, hardlink, snapshot, or
+  fallback reason affecting a result.
+- Bound the directory queue as well as active workers.
+- Choose worker defaults using storage characteristics and measured results,
+  not CPU count alone.
+- Add constructed packed-record parser fixtures for returned masks, offsets,
+  truncation, and malformed records.
+- Cache per-mount backend capabilities instead of retrying failed bulk requests.
+- Improve APFS container/volume discovery in `doctor`; retain explicit unknowns
+  where the OS does not expose an inexpensive answer.
+- Keep scanner output useful for large real trees without trying to reproduce
+  every interaction pattern of `gdu`.
+
+### Performance work
+
+- Maintain a deterministic synthetic-tree generator with mixed depths, file
+  counts, hardlinks, sparse files, and representative developer layouts.
+- Track wall time, peak resident memory, entries/second, and metadata fallbacks.
+- Benchmark warm-cache and cold-ish-cache runs separately and label them.
+- Compare against earlier cleanrs commits for regression detection. `du`, `gdu`,
+  `diskus`, and `dust` are useful reference points, not pass/fail competitors.
+- Profile before changing concurrency, allocation, or syscall strategies.
+- Add a macOS benchmark lane when CI cost and availability are reasonable;
+  retain a locally runnable benchmark command regardless of CI.
+
+### Practical completion criteria
+
+- [x] Plain fixture allocation agrees with `du`.
+- [x] Symlinks are not followed and mount boundaries are explicit.
+- [x] Permission failures lower coverage rather than inventing byte counts.
+- [ ] Largest-file output is available in both human and JSON modes.
+- [ ] Packed-record parser adversarial fixtures pass.
+- [ ] The scanner has a checked-in local performance baseline and a simple
+      regression comparison procedure.
+- [ ] A representative large local directory can be scanned with bounded memory
+      and no correctness regression.
+
+This phase may continue receiving performance improvements throughout the
+project; its remaining items do not block read-only Phase 2 inventory work.
+
+---
+
+## Phase 2 — Developer-storage inventory and cleanup planning
+
+**Goal:** automatically map known developer storage, show why it exists, and
+produce exact cleanup plans without executing them.
+
+This is the next development priority and the main differentiator from ordinary
+disk analyzers.
+
+### Already completed
+
+- Target classes and `safe`/`standard`/`aggressive` selection.
+- Level-independent protection for `user_data`/explicit-only targets.
+- Workspace marker detection for Cargo `target`, `node_modules`, `.next`, and
+  `dist`.
+- Candidate sizing, ranking, staleness, deduplication, and nested-target
+  collapsing.
+- Candidate-level cloud/dataless and mount-boundary refusal.
+- `targets` human/JSON output with filters.
+- `clean` dry-run planning, selection explanations, a deduplicated interval,
+  and captured device/inode/type.
+- `clean --apply` refuses before scanning and cannot currently mutate data.
+
+### Provider inventory to implement
+
+Start with tools actually present on the development Macs, then widen coverage:
+
+- Homebrew: downloads, old formula/cask versions, autoremove candidates, and
+  cleanup preview where supported.
+- Nix: store usage, roots/generations, and garbage-collection opportunities.
+- pnpm, npm/npx, Yarn, and Bun: shared caches/stores and native prune commands.
+- uv, pip, Poetry, and Conda: download caches, environments, and native cleanup
+  actions with environments separated from disposable caches.
+- Cargo/rustup: project targets, registry/git caches, and old toolchains.
+- Docker Desktop and OrbStack: build cache, stopped objects, images, and volumes
+  as separate actions and contexts.
+- Xcode: DerivedData, archives, device support, simulator caches, and simulator
+  user data as different risk classes.
+- Gradle, Maven, CocoaPods, and other tools added when encountered locally.
+- VMware/other VM disks and Claude Cowork storage as informational or
+  explicit-only targets, not generic caches.
+
+Each provider implements a read-only `detect`/`inspect`/`plan` path before any
+execution exists. A planned command is stored as an executable plus argv array;
+there is no shell.
+
+### Target output contract
+
+Every detected item or action should expose, where available:
+
+- provider and target/action ID;
+- path or provider context;
+- measured allocated size or provider-reported usage;
+- age/activity evidence;
+- cleanup severity and recoverability;
+- exact native command or direct-delete operation;
+- expected rebuild/download/workflow consequence;
+- confidence or an explicit unknown;
+- refusal reason when it cannot safely enter a plan.
+
+### Configuration, kept deliberately small
+
+- Embedded built-in target registry.
+- `~/.config/cleanrs/targets.toml` and explicit `--config PATH`.
+- Never load configuration from the working directory.
+- Enable/disable and include/exclude built-ins.
+- Explicit CLI path targets and argv-array command targets.
+- Export the resolved registry for inspection.
+- Defer plugin standards, marketplaces, and complex trust stores until the
+  author's use cases require them.
+
+### Safety work before execution
+
+- Canonicalize through the nearest existing ancestor.
+- Reject empty paths, `/`, the home directory, and mount roots.
+- Refuse symlinked ancestors and normalization that widens a target.
+- Refuse synced-cloud and dataless candidates.
+- Keep explicit-only/user data unreachable from severity selection.
+- Capture filesystem identity for direct-delete candidates.
+- Pin provider identity/context and exact argv in the plan.
+- Put conservative count/byte limits on unattended plans.
+
+### Practical completion criteria
+
+- [x] Existing marker targets are detected, deduplicated, and sized.
+- [x] A dataless descendant refuses an otherwise valid `node_modules` target.
+- [x] Working-directory configuration is ignored.
+- [x] `clean --apply` is inert in this phase.
+- [ ] Homebrew, Nix, JS package managers, Python environment managers,
+      Cargo/rustup, Docker/OrbStack, and Xcode appear in inventory when present.
+- [ ] Each provider has fixture or command-output parser tests that do not
+      require deleting real data.
+- [ ] Severity is assigned per action; Docker build cache, images, and volumes
+      cannot collapse into one generic Docker target.
+- [ ] Explicit-only actions never enter a level-selected plan.
+- [ ] Adversarial path tests cover traversal, symlink ancestors, target
+      replacement metadata, mount roots, and cloud refusal.
+- [ ] Human and JSON plans show the exact operation and consequence.
+
+---
+
+## Phase 3 — Cleanup execution and lightweight history
+
+**Goal:** safely execute reviewed plans and leave enough evidence to understand
+what happened.
+
+### Already completed
+
+- Dry-run is the default.
+- `--apply` is accepted but refuses before scanning.
+- Plans already capture device, inode, and file type for future revalidation.
+- Fixture tests prove current dry runs do not delete candidates.
+
+### Direct deletion
+
+- Begin only with known regenerable directories that lack a suitable native
+  cleanup command.
+- Use descriptor-relative traversal that never follows symlinks.
+- Revalidate device, inode, and type immediately before mutation.
+- Abort an individual target on replacement or validation mismatch.
+- Refuse root execution unless explicitly overridden for a justified action.
+- Require `--apply`; require confirmation unless `--yes` is present.
+- Keep all destructive tests inside unique temporary fixture directories.
+
+### Provider execution
+
+- Execute the exact executable and argv captured by the reviewed plan.
+- Revalidate provider binary, identity, and context immediately before running.
+- Stream provider output and record exit status.
+- Use provider-native dry-run/preview modes where reliable.
+- Never infer that provider-reported freed space equals host APFS recovery.
+- Keep explicit-only actions named and interactive by default.
+
+### Lightweight history
+
+Record:
+
+- timestamp and cleanrs version;
+- selected level and explicitly named actions;
+- target/provider identity, path/context, and exact argv;
+- planned size or provider estimate;
+- success, failure, skip, or validation abort;
+- removed tree allocation or provider-reported result;
+- concise stdout/stderr summary and error reason.
+
+Call values what they are: “removed allocation,” “provider reported,” or
+“estimated reclaimable.” Do not claim exact container recovery without a direct
+measurement. Journal rotation and path redaction are useful but need not become
+a database project.
+
+### Practical completion criteria
+
+- [ ] Dry-run and apply derive from the same immutable plan representation.
+- [ ] Every destructive test is confined to a temporary sandbox.
+- [ ] Symlink and replacement-race fixtures abort without touching the resolved
+      target or anything outside it.
+- [ ] Provider context changes abort instead of redirecting a command.
+- [ ] Partial provider and filesystem failures are visible and journalled.
+- [ ] `history` can explain what ran, what was skipped, and what failed.
+- [ ] Explicit-only actions cannot run through a severity level or scheduled
+      safe cleanup.
+
+---
+
+## Phase 4 — Project hygiene and stale-project intelligence
+
+**Goal:** find storage that generic cache commands cannot understand because its
+risk depends on project state.
+
+### Current state
+
+- Marker-based workspace detection exists for several common artifact names.
+- Cargo workspace roots, shared target directories, Git state, Python
+  environments, and project activity evidence are not implemented.
 
 ### Work
 
-**Accounting semantics**
-- Bind `getattrlistbulk` well enough to request the full attribute set:
-  `ATTR_CMN_*` basics, `ATTR_CMNEXT_PRIVATESIZE`, `ATTR_CMNEXT_CLONEID`,
-  `ATTR_CMNEXT_CLONE_REFCNT`, flags including `SF_FIRMLINK`.
-- Build fixtures with `clonefile`: pure clones, diverged clones, partially
-  diverged clones, hardlinks, sparse files, and the **mutual-clone case** (files
-  that clone only each other).
-- For each fixture, record every attribute, then delete and measure the real
-  container free-space delta.
-- **Answer:** does `[Σ PRIVATESIZE, clone-deduplicated allocated]` actually
-  bracket the observed reclamation in every case? Where does it fail?
-- **Answer:** how tight is the interval on a real developer home directory? A
-  correct but perpetually wide interval is honest and useless.
+- Discover Git repositories and worktrees under explicit search roots.
+- Record remote presence, upstream synchronization, dirty/untracked state,
+  recent commits, and filesystem activity signals without reading arbitrary
+  project contents.
+- Detect project-local `node_modules`, `.venv`, Cargo `target`, Gradle output,
+  Xcode build output, and other regenerated artifacts.
+- Recognize shared/custom `CARGO_TARGET_DIR` and avoid duplicate accounting.
+- Distinguish package-manager caches from project-local dependency copies.
+- Identify large inactive projects and worktrees as recommendations.
+- Never equate “old,” “clean,” or “pushed” with permission to delete a
+  repository. Repository/worktree deletion remains explicit-only.
+- Allow safe artifact cleanup within a protected repository without proposing
+  deletion of source or unsynced data.
 
-**Snapshot behaviour**
-- Take a snapshot; observe `PRIVATESIZE` for untouched files. Delete it; observe
-  the values return. Confirm no filesystem events fire throughout (§10.3).
-- Measure the cost of obtaining a snapshot generation token.
+### Practical completion criteria
 
-**Cloud / dataless safety — this gates everything**
-- Identify the reliable attribute or flag for dataless / ubiquitous items.
-- Scan a directory of evicted iCloud and `~/Library/CloudStorage` content and
-  **assert zero bytes downloaded and zero change in local allocation.**
-- Confirm eviction (`brctl evict` or File Provider APIs) frees local space and
-  leaves the remote copy intact.
-
-**Cost and topology**
-- Marginal cost of the extended attribute set versus a minimal request. Decide
-  whether a two-tier request is needed (§14.2).
-- Container topology: enumerate volumes, confirm shared free-space behaviour,
-  and check how `SF_FIRMLINK` and `st_dev` actually relate across `/`, `/Users`,
-  `/System/Volumes/Data`, and `/System/Volumes/VM`.
-- Cost and privilege requirements of a `proc_listpids` descriptor sweep against
-  a known path set (§8.3).
-
-### Exit criteria
-
-- [ ] `docs/findings-phase0.md` exists, stating for each question: what was
-      measured, on what hardware and macOS version, and what cleanrs can and
-      cannot promise as a result.
-- [ ] The dataless materialization test passes. **This is a hard gate** — no
-      traversal of a real home directory before it does.
-- [ ] VISION.md §3 has been updated to match reality, with `[hyp]` labels
-      promoted to `[exp]` or the design revised.
-- [ ] A decision is recorded on one-tier versus two-tier attribute requests.
-
-### Out of scope
-
-CLI structure, error handling, performance tuning, any reusable code.
+- [ ] Dirty, untracked, unpushed, remote-less, and synchronized repository
+      fixtures are classified distinctly.
+- [ ] Large project-local artifacts are attributed to their project and native
+      ecosystem.
+- [ ] Shared cache/build directories are counted once.
+- [ ] No severity level selects repository or environment user data.
+- [ ] Recommendations explain the evidence and exact proposed action.
+- [ ] Scanning many repositories has a recorded performance baseline and avoids
+      spawning an unbounded number of subprocesses.
 
 ---
 
-## Phase 1 — Read-only truth
+## Phase 5 — Index, scheduling, and ratatui daily driver
 
-**Goal:** a tool that tells you where your disk went, accurately, and reconciles
-against what storage actually reports. Ships as v0.1 and is genuinely useful on
-its own.
+**Goal:** remove the monthly maintenance burden and provide one fast overview of
+the machine.
 
-Scanner and accounting are one phase because they are not separable: the
-accounting is the reason the scanner exists, and a scanner without it cannot be
-meaningfully validated. `doctor` joins them because it is the same capability —
-understanding the disk — reached through a different data source.
+These are core personal-utility features, not commercial polish. They follow a
+stable inventory/execution pipeline because they reuse its facts and safety
+rules.
 
-### Work
+### Current state
 
-**Platform layer (`cleanrs-core::fs`)**
-- `getattrlistbulk` bindings with fixture-tested buffer walking of the
-  variable-length packed records.
-- Per-mount capability detection; graceful fallback to `readdir` + `lstat` where
-  bulk attributes are unavailable.
-- Container and volume topology enumeration.
-- Everything behind a trait, so Phase 5 is mechanical.
+- CLI tables, progress indicators, semantic colors, redirected output, and
+  `NO_COLOR` behavior provide reusable presentation groundwork.
+- `index.rs` is an inert placeholder.
+- No `tui`, `index`, or `schedule` command exists.
 
-**Traversal**
-- Work-stealing pool over a directory queue; bounded in-flight count; no async
-  runtime (§4.2).
-- Storage-aware worker defaults via `statfs`.
-- Traversal rules (§4.3): no mount crossing by default, no symlink following,
-  firmlink handling by flag *and* topology, pseudo-filesystem skips.
-- Permission errors recorded as counted locations, never as bytes.
-- Arena tree: `Vec<Node>` with `u32` indices, per-directory name interning.
-- Sharded inode and clone-ID sets.
+### Incremental index
 
-**Accounting**
-- Apparent, allocated, immediately private per file.
-- Clone-family and hardlink grouping; floor/ceiling interval per §3.1.
-- Confidence derived from interval tightness per §3.2.
-- Dataless detection wired in at scan level — flagged and reported, never
-  materialized.
+- Cache durable filesystem facts and the arena tree, not cleanup verdicts.
+- Recompute target selection, severity, safety, and commands from current facts.
+- Version and validate the index before access.
+- Write atomically with owner-only permissions.
+- Use FSEvents as a conservative dirty-root signal; fall back to a rescan when
+  completeness is uncertain.
+- Account for event loss, renamed roots, mount changes, and snapshot-driven
+  uncertainty.
+- Benchmark format choices for load time, update cost, file size, and memory
+  mapping before committing to complexity.
 
-**Commands**
-- `scan [PATH]` with `--json`, `--apparent`, `--allocated`, `--private`,
-  `--reclaimable`, `--depth`, `--min-size`, `--exclude`, `--explain`.
-  **Allocated ranking by default** (§13).
-- `doctor`, container-scoped from the first line of code — retrofitting
-  volume-scoped output means rewriting it. Volume enumeration, snapshot
-  presence, purgeable space with containment shown, unexplained gap, coverage
-  reporting, Full Disk Access status and remediation.
+### Scheduling
 
-### Exit criteria
+- Install and manage a macOS `launchd` agent; cron may be documented as a
+  manual alternative but is not the primary integration.
+- Pin the cleanrs executable, configuration path, search roots, and action set.
+- Scheduled application is `safe` only and never uses Trash or explicit-only
+  actions.
+- A broader monthly job may refresh inventory and write a proposed plan without
+  applying it.
+- Keep logs and surface a concise reclaimed/failed/skipped summary.
 
-- [ ] `scan` agrees with `du` on allocated size for trees containing no clones.
-- [ ] The mutual-clone fixture reports a ceiling equal to real reclamation, not
-      a floor of zero.
-- [ ] Ground-truth harness: for every fixture, measured container delta falls
-      within `[floor, ceiling]`. **Below floor is a hard failure.**
-- [ ] Scanning `/` produces no phantom duplicate of the home directory.
-- [ ] `doctor` accounts for swap on `/System/Volumes/VM` and any `/nix` volume.
-- [ ] Materialization test passes against a live cloud folder.
-- [ ] Benchmarked against `du`, `diskus`, `gdu`, `dust` with `hyperfine` on a
-      fixed synthetic tree; numbers recorded, warm-cache stated.
-- [ ] CI tracks scan-time regression on that tree.
+### Ratatui interface
 
-### Out of scope
+- Overview of container/volume state, recognized developer storage, large
+  unknown paths, and recent cleanup history.
+- Tree navigation with allocated/reclaimable metrics and coverage warnings.
+- Provider/action inventory grouped by severity.
+- Project-hygiene findings and explanations.
+- Plan review and explicit execution through the same Phase 2/3 pipeline; no
+  TUI-only deletion shortcuts.
+- Fast startup from the index with visible freshness state and background
+  refresh.
 
-Anything that writes. No targets, no providers, no deletion planning.
+### Practical completion criteria
 
----
-
-## Phase 2 — Targets and planning
-
-**Goal:** cleanrs tells you exactly what it *would* clean, how much that would
-return, and why — while remaining incapable of deleting anything. Ships as v0.2.
-
-This phase is deliberately read-only despite implementing the entire deletion
-pipeline. Every safety mechanism is built and tested here, against a tool that
-cannot yet act on them. That inverts the usual order and it is intentional: the
-invariants get their test suite before there is any pressure to ship a working
-`--apply`.
-
-### Work
-
-**Target model**
-- The property model (§6.1) and `class` shorthand with defaults (§6.2).
-- Embedded default manifest; `~/.config/cleanrs/targets.toml`; explicit
-  `--config` with the trust rules (§9.1). **No implicit working-directory
-  config, ever.**
-- Trust store keyed to canonical path plus content hash.
-- CLI target specs: compact `PATH:CLASS[:METHOD]`, the long form, and
-  `--target-argv` as a JSON array. No shell anywhere.
-- `--only`, `--exclude`, `--targets-only-cli`, `--no-builtin-targets`,
-  `--export`.
-
-**Detection**
-- Path, marker, and command detectors, scoped.
-- Staleness via marker and directory mtime, never `atime` (§8.5).
-- Workspace awareness: Cargo workspace roots, shared `CARGO_TARGET_DIR`, no
-  duplicate cleans of the same directory.
-
-**Safety pipeline — implemented and tested, nothing executed**
-- All ten path invariants (§8.2) as a checked pipeline every candidate passes.
-- Cloud and dataless refusal at candidate level, not just target roots.
-- `user_data` unreachable from any level.
-- Bounded unattended deletion limits.
-
-**Providers — inspect and plan only**
-- The four-operation interface (§7.1), with `execute` and `verify` unimplemented.
-- Provider identity and context pinning captured in every plan.
-- Coverage for the §7.3 baseline: Homebrew, Docker Desktop and OrbStack as
-  distinct contexts, Cargo, pnpm, npm/npx, Bun, Xcode, VMware, Claude Cowork,
-  wallpaper cache. Swap stays a `doctor` diagnostic.
-
-**Commands**
-- `targets` — detected targets with sizes, intervals, and confidence.
-- `clean` — plans and prints. `--apply` is accepted and **refuses with a clear
-  message** that execution lands in Phase 3.
-
-### Exit criteria
-
-- [ ] Property tests: no target resolution at any level yields an action against
-      `recoverability = user_data` without explicit naming.
-- [ ] A `node_modules` planted inside a synced cloud folder, matched by an
-      ordinary correctly-scoped detector, is refused on dataless status alone.
-- [ ] A repository containing `cleanrs.toml` with a `run` target does not
-      execute it under any invocation lacking `--config`.
-- [ ] Adversarial path tests pass: symlinked ancestors, `..` traversal, targets
-      replaced between scan and plan, `children_only` normalization widening.
-- [ ] A Docker plan inspected against OrbStack stays pinned to that context and
-      aborts if the default changes.
-- [ ] Every §7.3 row appears in `targets` or `doctor` output.
-- [ ] `clean --apply` is verifiably inert.
+- [ ] Index corruption, truncation, version mismatch, and event-loss fixtures
+      fall back safely.
+- [ ] Indexed startup and incremental refresh have recorded latency and memory
+      baselines and materially improve repeat use.
+- [ ] Scheduled jobs cannot load working-directory configuration or select
+      non-safe/explicit-only actions.
+- [ ] The TUI exposes freshness, uncertainty, refusals, and exact planned
+      operations.
+- [ ] TUI actions produce the same plans and history records as CLI actions.
+- [ ] Non-TTY invocation fails clearly, while ordinary CLI output continues to
+      respect `NO_COLOR`.
 
 ---
 
-## Phase 3 — Execution and verification
+## Phase 6 — Extensibility and optional portability
 
-**Goal:** cleanrs reclaims space and proves what it reclaimed. Ships as v0.3.
-This is the first release that can destroy data.
+**Goal:** make cleanrs easier for other developers to adapt after the author's
+workflow is solid.
 
-### Work
+### Deferred work
 
-**Execution**
-- Permanent deletion for regenerable targets; `openat`-relative descent that
-  never follows symlinks.
-- Revalidation of device, inode, and type immediately before each unlink (§8.2
-  items 5–6), aborting the target on mismatch.
-- `--trash` as opt-in recovery mode, accounted as *moved, not reclaimed*.
-- Cloud eviction as a distinct operation from deletion, if Phase 0 supported it.
-- Provider `execute` and `verify`; exact argv printed; `--yes` for unattended.
-- Refuse to run as root without explicit override.
+- Document a stable target/provider extension format.
+- Support additional user-defined detectors and command planners without a
+  shell.
+- Consider modular provider packaging only when the built-in registry becomes
+  difficult to maintain.
+- Add import/export and compatibility guarantees when real external configs
+  exist.
+- Consider Linux support only in response to actual use. It requires different
+  filesystem accounting, mount topology, event monitoring, scheduling, Trash,
+  and provider policy—not merely compilation fixes.
 
-**Verification and the journal**
-- All seven journal fields (§11), including `container_free_delta` and
-  `bytes_evicted`.
-- The five named discrepancy classes (§11.1), with the open-descriptor
-  pre-flight check if Phase 0 showed it to be cheap.
-- `history` reads it back, explains shortfalls, rotates, and supports path
-  redaction.
-- Estimate-versus-observed recorded per run as the §3.3 calibration loop.
-
-### Exit criteria
-
-- [ ] Every destructive test runs against sandboxed fixture trees. No test ever
-      touches a real home directory.
-- [ ] Deleting a file held open by a live process reports the shortfall and
-      names the discrepancy class rather than claiming success.
-- [ ] `--trash` never reports reclaimed bytes.
-- [ ] Across the fixture suite, observed deltas fall within predicted intervals;
-      any below-floor result is investigated before release.
-- [ ] Journal rotation and redaction verified.
-- [ ] A dry run and its subsequent `--apply` are proven to plan identically, or
-      the divergence is surfaced.
+The existing filesystem trait and portable fallback are useful development
+seams but do not constitute supported Linux behavior.
 
 ---
 
-## Phase 4 — Daily driver
+## Standing engineering rules
 
-**Goal:** the tool you actually keep installed. Ships as v1.0.
+- Dry-run is the default; mutation always requires `--apply`.
+- Never delete synced cloud content. Inspect each candidate, not only roots.
+- No severity level reaches user data or explicit-only actions.
+- Never load configuration from the working directory.
+- Commands are executable-plus-argv arrays; there is no shell.
+- Prefer a provider's native cleanup interface over deleting its internal files.
+- Show exact planned actions and important consequences.
+- Trash means moved, not reclaimed, if Trash support is added.
+- Reclaimable estimates remain intervals where uncertainty exists; provider and
+  removed-allocation figures are labelled precisely.
+- Direct-deletion invariants are enforced in code immediately before mutation.
+- Filesystem and destructive tests use temporary fixture trees, never the real
+  home directory.
+- Do not run `--apply` during development without a specific sandbox path.
+- Keep important safety and low-level parsing code commented for maintenance.
+- Use structured logging, consistent terminal semantics, and progress reporting
+  for operations long enough to need it.
+- Optimize from profiles and repeatable measurements. Keep performance changes
+  only when they preserve correctness and improve a recorded workload.
+- Update this plan after each implemented feature, including verification and
+  performance observations where relevant.
 
-Three independent tracks, merged into one phase because none is safety-critical
-and all three depend only on a stable Phase 3 core. Order them by preference;
-the TUI is the most enjoyable and the least load-bearing.
+## Immediate continuation
 
-**TUI** — ratatui browser over the arena tree. Interval and confidence displayed
-inline, not hidden. Navigation, sorting, filtering, and a path to `targets` and
-plan review. Read-only first; any deletion path goes through the same Phase 2
-pipeline with no shortcuts.
+Work should continue in this order:
 
-**Index** — the §10 invariant holds: the index caches the tree, not the verdict.
-Durable per-file facts only; private size tagged with a snapshot generation
-token; plan-time estimates always re-derived. FSEvents as a conservative
-dirty-root set, per volume, with whole-index invalidation whenever completeness
-cannot be proven. Format chosen by benchmark (§10.4), with versioning,
-validation before access, atomic replacement, and restrictive permissions.
+1. Define the provider/action data model and severity mapping used by
+   `targets` and `clean`.
+2. Implement read-only Homebrew and Nix detection/inspection/planning.
+3. Add pnpm/npm/Yarn/Bun and uv/pip/Poetry/Conda inventory.
+4. Add Cargo/rustup, Docker/OrbStack, and Xcode actions with risk separated per
+   action.
+5. Finish the Phase 2 path-safety and provider-context test suite.
+6. Implement Phase 3 execution for a deliberately small safe-action subset.
+7. In parallel with normal feature work, land the Phase 1 largest-file view,
+   packed-record parser fixtures, and a checked-in performance baseline.
 
-**Scheduling** — launchd agent. Weekly `safe --apply --yes`; monthly `standard`
-that **proposes without applying**. Pinned config path, never the working
-directory, never Trash. Notifications summarising reclaimed space.
-
-### Exit criteria
-
-- [ ] The FSEvents fallback-to-full-scan path is exercised by tests, not just
-      documented.
-- [ ] Snapshot-churn test: cached figures degrade correctly with zero events
-      fired.
-- [ ] A corrupted or truncated index file is rejected before any access.
-- [ ] Index file permissions restrict access to the owner.
-- [ ] A scheduled run cannot load working-directory config or use Trash, by
-      test.
-- [ ] TUI degrades cleanly on non-TTY and respects `NO_COLOR`.
-
----
-
-## Phase 5 — Linux (optional)
-
-Only worth starting once macOS is stable and someone actually wants it.
-
-`getdents64` + `statx`; `st_blocks`; reflink detection via FIEMAP; optionally
-`io_uring` for the same syscall-batching win. But note that the platform seams
-are not confined to the filesystem module: scheduling (systemd timers), events
-(inotify/fanotify), Trash semantics, default paths, permission models, mount
-topology, and provider availability all differ.
-
-Expect the accounting model to need genuine rework, not a port — btrfs and XFS
-share blocks by different mechanisms with different metadata, and the
-floor/ceiling formulation may not carry over.
-
----
-
-## Standing rules
-
-These apply in every phase:
-
-- Accounting logic gets tests before implementation. It is the product.
-- No filesystem test touches a real home directory.
-- Benchmarks are warm-cache only and say so.
-- Every number published anywhere carries its `[ref]` / `[exp]` / `[target]` /
-  `[hyp]` label until it has been measured by this project.
-- macOS claims are verified against the installed SDK, not secondary sources.
-- When a phase invalidates something in VISION.md, update VISION.md in the same
-  change — state the correction rather than silently deleting the old claim.
-
----
-
-## Implementation progress — 2026-08-11
-
-Phase 0 remains open because the repository does not have an explicitly
-prepared evicted-cloud fixture and automated snapshot mutation would change the
-developer machine. The exact measured/pending boundary is recorded in
-`docs/findings-phase0.md`; no missing experiment is presented as a result.
-
-Implemented Phase 0/1 foundations:
-
-- Two-crate Rust workspace (`cleanrs-core` and `cleanrs`) with the prescribed
-  `fs`, `accounting`, `targets`, `providers`, `index`, and `journal` modules.
-  Later-phase modules are deliberately inert so this build has no write path.
-- SDK-verified `getattrlistbulk` FFI and packed-record parser, including returned
-  masks, entry errors, hardlink counts, private size, clone metadata,
-  `SF_FIRMLINK`, and `SF_DATALESS`; safe per-directory `lstat` fallback.
-- Parallel directory traversal with bounded active workers, a `u32`-indexed
-  arena, flat interned names, no symlink following, mount-boundary refusal,
-  firmlink refusal, excludes, and counted coverage errors with unknown size.
-- Apparent and allocated totals, hardlink deduplication, clone-family ceiling,
-  private-size floor, derived confidence, and a real macOS clone fixture.
-- `scan` with JSON, all four metric views, allocated default, depth, minimum
-  size, excludes, explanations, mount opt-in, and worker control.
-- Container-oriented `doctor` with distinct System/Data/VM/Nix rows, APFS shared
-  capacity/free space, optional explicit-scope reconciliation via `--scan`,
-  snapshot presence, explicit unknown purgeable/FDA state, and diagnostic-only
-  swap messaging.
-- Shell completions, man-page generation, CI on macOS and Linux, release builds,
-  dependency updates, a fixed synthetic-tree generator, and scheduled
-  warm-cache comparisons against `du`, `diskus`, `dust`, and `gdu`.
-
-Exit-criterion status:
-
-- [x] `docs/findings-phase0.md` records the environment, results, non-results,
-      and current promise.
-- [ ] Dataless materialization and eviction test (hard gate; fixture required).
-- [ ] Snapshot/private-size churn and snapshot-generation-token experiment.
-- [x] One-tier attribute request decision recorded, provisional on benchmarks.
-- [x] `scan` agrees byte-for-byte with macOS `du -sk` on a no-clone fixture and
-      on the repository at the recorded measurement.
-- [x] Mutual-clone unit and real-`clonefile` fixtures retain a non-zero ceiling.
-- [ ] Quiesced container-delta harness across every APFS fixture.
-- [ ] Root/firmlink acceptance test on a disposable macOS installation.
-- [x] `doctor` explicitly inventories VM swap and an existing `/nix` volume.
-- [ ] Live cloud materialization acceptance test.
-- [ ] Complete the four-tool `hyperfine` benchmark. Preliminary warm-cache
-      cleanrs/`du` numbers and the fixed-tree scheduled workflow are present.
-- [x] CI runs formatting, strict Clippy, tests, and release builds on macOS and
-      Linux; scheduled CI records warm-cache scan performance.
-
-### Phase 1 terminal UX — 2026-08-12
-
-- [x] The core scanner publishes ordered, monotonic directory, entry, and
-      allocated-byte progress snapshots without depending on terminal code.
-- [x] Interactive `scan` and `doctor --scan` runs show an indeterminate progress
-      indicator with live counters; unknown total work is not presented as a
-      fake percentage.
-- [x] Human `scan` output uses metric-aware result tables, confidence colors,
-      compact relative paths, a scan summary, and dedicated safety/coverage
-      diagnostics.
-- [x] Human `doctor` output groups container capacity, volumes, Data attribution,
-      environment diagnostics, and explanatory notes into separate tables.
-- [x] TTY output uses Unicode and semantic colors; redirected output uses ASCII;
-      `NO_COLOR` is respected; JSON, completions, and man-page output remain
-      animation- and decoration-free.
-
-### MSRV compatibility — 2026-08-12
-
-- [x] Pinned `globset` to 0.4.19 because 0.4.20 requires Rust 1.88 while the
-      workspace promises Rust 1.85 support.
-- [x] Verified `cargo check --workspace --all-targets` with rustc 1.85.0 rather
-      than relying only on Cargo's dependency metadata.
-- [x] Pinned `comfy-table` to 7.1.4; 7.2 uses let-chains unavailable on Rust
-      1.85. Added platform-specific compilation guards so Linux builds do not
-      emit warnings for macOS-only `diskutil` and filesystem-flag helpers.
-
-### Phase 2 targets groundwork — 2026-08-12
-
-This is an intentionally read-only vertical slice started at the user's
-request. It does **not** close the open Phase 0/1 gates above and does not claim
-that Phase 2 or v0.2 is complete.
-
-- [x] Replaced the inert `targets` module with the §6 property model: class
-      expansion, independent recoverability/rebuild/network/automation fields,
-      and cleanup-level selection that keeps `user_data` unreachable unless a
-      stable target is explicitly named.
-- [x] Added an embedded initial workspace catalog for Cargo `target`,
-      `node_modules`, `.next`, and `dist`, using marker-scoped detection and
-      deduplicated candidate paths.
-- [x] Added `cleanrs targets [PATH]` with an explicit scope (working directory
-      by default, never the home directory), `--json`, `--only`, `--exclude`,
-      worker control, TTY-aware progress, and human tables.
-- [x] Each detected target is APFS-aware sized from the existing scan and shows
-      apparent/allocated bytes, a reclaimability interval, derived confidence,
-      artifact age, staleness policy, and safety status.
-- [x] Candidate validation proves marker artifacts remain strictly below their
-      project root and refuses synced-cloud locations, dataless descendants,
-      and mount-boundary crossings. Refused targets stay visible in output.
-- [x] Tests cover class expansion, level-independent `user_data` protection,
-      marker detection/sizing, dataless refusal independent of location,
-      machine-readable and human CLI output, unknown filters, and proof that a
-      working-directory `cleanrs.toml` is ignored.
-- [x] Target presentation collapses candidates nested beneath an already
-      detected artifact root (notably package markers and `dist` directories
-      inside `node_modules`), preventing redundant actions and double-counted
-      output. Results sort by reclaimable ceiling; human output shows the top
-      25 by default, while `--top N` and `--min-size SIZE` provide explicit
-      control and JSON remains unlimited unless filtered.
-- [ ] Remaining target-model work: TOML/CLI definitions and overrides, explicit
-      config trust decisions keyed by canonical path and content hash, export,
-      path/command detectors, and the complete §8.2 invariant pipeline.
-- [ ] Remaining detection work: Cargo workspace/shared-target resolution,
-      configured `CARGO_TARGET_DIR`, provider inspection/planning, and every
-      §7.3 known-location acceptance row.
-- [ ] `clean` planning and the verifiably inert Phase 2 `--apply` refusal have
-      not been added yet. No execution API exists.
+The first concrete implementation task is the provider/action model plus
+Homebrew inspection and dry-run planning. It exercises the architecture with a
+real native cleanup tool while remaining read-only.

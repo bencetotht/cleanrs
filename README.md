@@ -2,9 +2,12 @@
 
 Storage usage analyzer and cleaner for developers, written in Rust. Fully transparent.
 
-> **Status: Phase 0/1 MVP plus Phase 2 groundwork.** The read-only `scan`,
-> `doctor`, and initial workspace-scoped `targets` commands are implemented.
-> Phase 0's live cloud/snapshot safety experiments remain open; see
+> **Status: practical filesystem baseline, read-only MVP, and Phase 2 groundwork.** The read-only `scan`,
+> `doctor`, initial workspace-scoped `targets`, and dry-run `clean` planning
+> commands are implemented.
+> The next priority is developer-tool inventory and native cleanup planning;
+> deeper snapshot and File Provider research is deferred unless it enables a
+> concrete capability. See
 > [the findings](docs/findings-phase0.md), [VISION.md](VISION.md), and the
 > explicit progress boundary in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
 
@@ -21,6 +24,13 @@ blocks and hardlinks right; none of the rest is visible to any walker.
 cleanrs answers the second question:
 
 > **Where did my disk go, and how much do I actually get back if I delete this?**
+
+Its practical focus is recurring developer storage: discover caches, build
+artifacts, runtimes, environments, and other known storage across tools such as
+Homebrew, Nix, package managers, Docker/OrbStack, Cargo, and Xcode; then show or
+run the correct native cleanup action at an explicit severity. Fast low-level
+scanning supports that workflow rather than trying to replace a general-purpose
+disk browser.
 
 ## What it does
 
@@ -118,7 +128,7 @@ cleanrs scan [PATH]      One-shot analysis (--json, --reclaimable, --explain)
 cleanrs tui  [PATH]      Interactive browser
 cleanrs doctor           Reconcile container state; report the unexplained gap
 cleanrs targets [PATH]   List workspace targets with sizes and confidence (initial slice)
-cleanrs clean            Reclaim space — dry-run by default
+cleanrs clean [PATH]     Plan workspace cleanup — dry-run only in the current slice
 cleanrs history          Estimated vs. observed results of past runs
 cleanrs schedule         launchd agent for unattended weekly runs
 cleanrs index            Cache control
@@ -148,25 +158,34 @@ cargo build --release
 ./target/release/cleanrs doctor
 ./target/release/cleanrs doctor --scan .
 ./target/release/cleanrs targets .
+./target/release/cleanrs clean . --level standard
 ```
 
 `scan` defaults to the current directory and allocated-size ranking. It never
 defaults to the home directory, never follows symlinks, and never reads file
 contents. JSON output, metric selection, depth/minimum-size filters, exclusions,
 path explanations, shell completions, and a generated man page are available in
-`cleanrs --help`. No cleanup or deletion command exists yet.
+`cleanrs --help`. No deletion or provider-execution path exists yet.
 
 `targets` also defaults to the current directory rather than the home directory.
 The initial slice detects marker-scoped Cargo and Node.js build artifacts,
 deduplicates candidates, applies staleness policy, and displays the same honest
 reclaimability intervals. Candidate-level cloud/dataless and mount-boundary
 checks can refuse a finding without hiding it. Configuration, provider targets,
-the full known-location catalog, and `clean` planning remain Phase 2 work.
+and the full known-location catalog remain Phase 2 work.
 Targets nested beneath an already detected artifact root are collapsed, so
 package metadata inside `node_modules` does not flood or double-count the
 result. Human output is sorted by reclaimable ceiling and shows the largest 25
 targets by default; use `--top N` or `--min-size SIZE` to tune it. JSON remains
 complete unless one of those filters is supplied.
+
+`clean` uses the same explicit workspace scan and candidate safety checks, then
+explains which targets the selected cleanup level and staleness policy would
+include. It records each candidate's device, inode, and type in preparation for
+the Phase 3 replacement check. Dry-run is the only available mode: `--apply`
+refuses before scanning, and tests verify that neither form alters fixture data.
+Use `--ignore-staleness` only when intentionally reviewing currently active
+artifacts.
 
 `doctor --scan PATH` reconciles one explicit scan scope against Data-volume
 usage and labels the remainder as unattributed. Without `--scan`, it stays cheap

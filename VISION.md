@@ -1,10 +1,14 @@
 # cleanrs — Vision & Design
 
 > **Status:** design reference with Phase 0/1 implementation and a read-only
-> Phase 2 `targets` groundwork slice in progress.
+> Phase 2 `targets` plus `clean` planning groundwork slice in progress.
 > Empirical results and unresolved gates are tracked in
 > [docs/findings-phase0.md](docs/findings-phase0.md). This file remains the
 > reference for what cleanrs is, why it exists, and how it should be built.
+> The implementation roadmap now prioritizes fast developer-storage inventory,
+> native cleanup orchestration, project hygiene, scheduling, indexing, and the
+> TUI. Deeper APFS research is pursued when it enables those workflows rather
+> than acting as a release gate.
 >
 > **Claim discipline:** every quantitative statement in this document carries a
 > label — `[ref]` external reference, `[exp]` preliminary experiment, `[target]`
@@ -134,8 +138,10 @@ allocated. Three distinct hazards:
    could pull hundreds of gigabytes while claiming to save space — a
    catastrophic and particularly ironic failure. Reading attributes via
    `getattrlistbulk` should not materialize content, but "should not" is
-   insufficient assurance here. [hyp: verified by an explicit Phase 0 test
-   asserting zero downloaded bytes when scanning a folder of evicted files.]
+   insufficient assurance here. [exp: on 2026-08-28, a manually evicted 32 MiB
+   iCloud Drive fixture retained `SF_DATALESS`, zero allocated blocks, logical
+   size, and mtime across an initial traversal and five repeated scans. This
+   verifies the tested iCloud case, not every third-party File Provider.]
 
 Usefully, the metrics behave in the safe direction: dataless files have huge
 apparent size and near-zero allocated, so anything ranked by allocated size

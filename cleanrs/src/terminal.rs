@@ -15,10 +15,10 @@ use comfy_table::{
 use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use cleanrs_core::targets::{CandidateSafety, Recoverability};
+use cleanrs_core::targets::{CandidateSafety, PlanSelection, Recoverability};
 use cleanrs_core::{Confidence, DoctorReport, ScanObserver, ScanProgress};
 
-use crate::{Metric, ScanOutput, TargetsOutput, format_interval, human_bytes};
+use crate::{CleanOutput, Metric, ScanOutput, TargetsOutput, format_interval, human_bytes};
 
 /// Presentation policy derived from the actual output streams and `NO_COLOR`.
 pub(crate) struct TerminalUi {
@@ -362,6 +362,75 @@ impl TerminalUi {
                 self.muted("•")
             );
         }
+    }
+
+    pub(crate) fn print_clean(&self, output: &CleanOutput) {
+        println!(
+            "{}  {}",
+            self.heading("cleanrs clean — dry run"),
+            self.muted(&output.scope.display().to_string())
+        );
+        println!();
+
+        let mut plan = self.table();
+        plan.set_header(vec![
+            self.header("ACTION"),
+            self.header("RECLAIMABLE"),
+            self.header("CONFIDENCE"),
+            self.header("TARGET"),
+            self.header("PATH"),
+            self.header("REASON"),
+        ]);
+        for planned in &output.targets {
+            let (action, reason, color) = match &planned.selection {
+                PlanSelection::Selected => ("delete", "selected", Color::Yellow),
+                PlanSelection::Skipped(reason) => ("skip", reason.as_str(), Color::DarkGrey),
+            };
+            plan.add_row(vec![
+                self.value(action, color),
+                self.value(format_interval(&planned.target.estimate), Color::Cyan),
+                self.confidence(planned.target.estimate.confidence),
+                Cell::new(planned.target.id),
+                Cell::new(target_display_path(&output.scope, &planned.target.path)),
+                Cell::new(reason),
+            ]);
+        }
+        println!("{plan}");
+
+        let planned_interval = format_interval(&output.selected_estimate);
+        let mut summary = self.table();
+        summary.set_header(vec![self.header("PLAN SUMMARY"), self.header("VALUE")]);
+        summary.add_row(vec![
+            Cell::new("Level"),
+            Cell::new(format!("{:?}", output.level).to_lowercase()),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Selected targets"),
+            Cell::new(output.selected_targets),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Estimated reclaimable"),
+            self.value(planned_interval, Color::Cyan),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Coverage"),
+            if output.coverage_complete {
+                self.value("complete", Color::Green)
+            } else {
+                self.value("incomplete", Color::Red)
+            },
+        ]);
+        summary.add_row(vec![
+            Cell::new("Execution"),
+            self.value(output.execution, Color::Green),
+        ]);
+        println!();
+        println!("{summary}");
+        println!();
+        println!(
+            "{} Permanent execution remains disabled until the documented Phase 2 safety gates pass.",
+            self.warning("NOTICE")
+        );
     }
 
     fn table(&self) -> Table {

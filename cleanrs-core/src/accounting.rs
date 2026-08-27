@@ -1,6 +1,6 @@
 //! Reclaimability interval calculation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
@@ -38,10 +38,27 @@ pub fn estimate_subtree(
     root: NodeIndex,
     coverage_complete: bool,
 ) -> ReclaimEstimate {
-    let mut stack = vec![root];
+    estimate_subtrees(arena, &[root], coverage_complete)
+}
+
+/// Compute one interval over the union of several selected subtrees.
+///
+/// Computing the union in one pass is essential: adding independently derived
+/// ceilings would double-count clone families or hardlinks spanning targets.
+#[must_use]
+pub fn estimate_subtrees(
+    arena: &Arena,
+    roots: &[NodeIndex],
+    coverage_complete: bool,
+) -> ReclaimEstimate {
+    let mut stack = roots.to_vec();
+    let mut visited = HashSet::new();
     let mut inodes: HashMap<(u64, u64), InodeFacts> = HashMap::new();
 
     while let Some(index) = stack.pop() {
+        if !visited.insert(index) {
+            continue;
+        }
         let node = &arena.nodes[index.as_usize()];
         stack.extend(arena.children(index));
 
@@ -167,6 +184,48 @@ mod tests {
         assert_eq!(estimate.floor, Some(0));
         assert_eq!(estimate.ceiling, Some(8192));
         assert_eq!(estimate.confidence, Confidence::Medium);
+    }
+
+    #[test]
+    fn selected_subtrees_deduplicate_clone_families_across_targets() {
+        let mut arena = Arena::new("fixture");
+        let root = arena.root();
+        let first = arena.push_child(
+            root,
+            "first",
+            Node {
+                kind: NodeKind::Directory,
+                ..Node::default()
+            },
+        );
+        let second = arena.push_child(
+            root,
+            "second",
+            Node {
+                kind: NodeKind::Directory,
+                ..Node::default()
+            },
+        );
+        for (parent, inode) in [(first, 2), (second, 3)] {
+            arena.push_child(
+                parent,
+                "clone",
+                Node {
+                    kind: NodeKind::File,
+                    device: 1,
+                    inode,
+                    allocated_size: 8192,
+                    private_size: Some(0),
+                    clone_id: Some(42),
+                    clone_refcount: Some(2),
+                    ..Node::default()
+                },
+            );
+        }
+
+        let estimate = estimate_subtrees(&arena, &[first, second], true);
+        assert_eq!(estimate.floor, Some(0));
+        assert_eq!(estimate.ceiling, Some(8192));
     }
 
     #[test]
