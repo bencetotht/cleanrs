@@ -2,11 +2,12 @@
 
 Storage usage analyzer and cleaner for developers, written in Rust. Fully transparent.
 
-> **Status: Phase 0/1 MVP plus Phase 2 groundwork.** The read-only `scan`,
+> **Status: practical filesystem baseline, read-only MVP, and Phase 2 groundwork.** The read-only `scan`,
 > `doctor`, initial workspace-scoped `targets`, and dry-run `clean` planning
 > commands are implemented.
-> Phase 0's disposable iCloud materialization experiment has passed, while
-> snapshot and broader File Provider research remain open; see
+> The next priority is developer-tool inventory and native cleanup planning;
+> deeper snapshot and File Provider research is deferred unless it enables a
+> concrete capability. See
 > [the findings](docs/findings-phase0.md), [VISION.md](VISION.md), and the
 > explicit progress boundary in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
 
@@ -23,6 +24,13 @@ blocks and hardlinks right; none of the rest is visible to any walker.
 cleanrs answers the second question:
 
 > **Where did my disk go, and how much do I actually get back if I delete this?**
+
+Its practical focus is recurring developer storage: discover caches, build
+artifacts, runtimes, environments, and other known storage across tools such as
+Homebrew, Nix, package managers, Docker/OrbStack, Cargo, and Xcode; then show or
+run the correct native cleanup action at an explicit severity. Fast low-level
+scanning supports that workflow rather than trying to replace a general-purpose
+disk browser.
 
 ## What it does
 
