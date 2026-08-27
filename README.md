@@ -5,7 +5,8 @@ Storage usage analyzer and cleaner for developers, written in Rust. Fully transp
 > **Status: Phase 0/1 MVP plus Phase 2 groundwork.** The read-only `scan`,
 > `doctor`, initial workspace-scoped `targets`, and dry-run `clean` planning
 > commands are implemented.
-> Phase 0's live cloud/snapshot safety experiments remain open; see
+> Phase 0's disposable iCloud materialization experiment has passed, while
+> snapshot and broader File Provider research remain open; see
 > [the findings](docs/findings-phase0.md), [VISION.md](VISION.md), and the
 > explicit progress boundary in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
 

@@ -1,6 +1,6 @@
 # Phase 0 feasibility findings
 
-> Status: **in progress**, updated 2026-08-11. Results marked `[exp]` were
+> Status: **in progress**, updated 2026-08-28. Results marked `[exp]` were
 > measured on this machine. Unrun safety experiments remain `[hyp]`; they are
 > not silently promoted to product guarantees.
 
@@ -72,11 +72,21 @@ reported by `doctor`; estimates are not claimed snapshot-exact.
 same metadata-only bulk request. Scanner code never opens file content and
 reports the count of dataless entries it observed.
 
-`[hyp — hard gate still open]` No controlled directory of evicted iCloud or
-File Provider files was supplied. Therefore zero materialization and eviction
-semantics have **not** been demonstrated. The test suite will not manufacture
-or evict the user's cloud data. Do not treat scanning a real home directory as
-validated until this experiment is run against an explicitly prepared fixture.
+`[exp]` A deliberately disposable 32 MiB random file was created in iCloud
+Drive, allowed to upload, and manually evicted with Finder's **Remove
+Download** action. Before traversal it had `SF_DATALESS`, zero allocated blocks,
+and its original logical size. A JSON scan of only the fixture directory found
+one dataless entry and reported zero allocated and reclaimable bytes. The same
+metadata was unchanged immediately after traversal and after five additional
+scans: the file retained `SF_DATALESS`, zero allocated blocks, the same logical
+size, and the same modification time. The scanner therefore did not materialize
+this prepared iCloud placeholder on this machine and macOS version.
+
+This establishes the Phase 0 materialization gate for iCloud Drive; it does not
+prove identical behavior for every third-party File Provider. Those locations
+remain conservatively refused. Eviction was initiated manually through Finder,
+so programmatic cloud-eviction semantics remain untested and no product
+eviction operation is enabled.
 
 ## Cost, topology, and open descriptors
 
@@ -108,10 +118,11 @@ material, this decision must be reopened; no performance claim is made yet.
 
 ## Current promise
 
-cleanrs can promise a read-only, content-free traversal; allocated/apparent
+cleanrs can promise a read-only, content-free traversal, including the tested
+iCloud Drive placeholder case on this macOS version; allocated/apparent
 accounting; hardlink deduplication; clone-family interval construction; explicit
 unknowns for missing private metadata or denied coverage; dataless/firmlink
 detection; and container-aware diagnostics. It cannot yet promise that every
 interval brackets observed APFS reclamation, that snapshot effects are fully
-modeled, or that metadata traversal never materializes every supported File
+modeled, or that metadata traversal never materializes every third-party File
 Provider's placeholders.

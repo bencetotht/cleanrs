@@ -341,7 +341,7 @@ or covered only by a narrower test than the criterion requires; `[ ]` missing.
 
 | Phase | Status | Summary |
 |---|---|---|
-| 0 | **In progress — hard gate open** | Findings and a provisional attribute-request decision exist; live dataless and snapshot experiments remain unrun. |
+| 0 | **In progress — cloud gate closed** | A disposable evicted iCloud fixture remained dataless across repeated scans; snapshot and accounting experiments remain open. |
 | 1 | **In progress — read-only MVP implemented** | `scan` and a useful `doctor` exist, but ground-truth reclamation, live cloud, root-topology, benchmark, and regression gates remain open. |
 | 2 | **In progress — workspace-target slice implemented** | Built-in marker targets and dry-run planning work; configuration, complete safety invariants, providers, and acceptance-baseline coverage are missing. |
 | 3 | **Not started** | `--apply` refuses before scanning; providers and journal are inert modules. |
@@ -394,9 +394,12 @@ Implemented or recorded:
 
 Missing research:
 
-- No controlled evicted iCloud/File Provider fixture has been scanned, so zero
-  materialization and zero allocation change are unproven. Eviction semantics
-  are also untested. This remains the hard gate on scanning a real home tree.
+- A disposable 32 MiB iCloud Drive fixture was uploaded and manually evicted;
+  it retained `SF_DATALESS`, zero allocated blocks, logical size, and mtime
+  across the initial metadata-only traversal and five repeated scans. This
+  closes the materialization gate for iCloud Drive on the measured machine and
+  macOS version. Third-party File Providers and programmatic eviction semantics
+  remain untested and conservatively unsupported.
 - Snapshot creation/expiry, untouched-file `PRIVATESIZE` changes, absence of
   FSEvents, and snapshot-generation-token cost are unmeasured.
 - There is no repeated, quiesced before/after APFS container-delta harness for
@@ -413,14 +416,17 @@ Exit criteria:
 
 - [x] `docs/findings-phase0.md` states what was measured, the environment,
       non-results, and the resulting limits on the current promise.
-- [ ] The live dataless materialization test passes.
+- [x] The live dataless materialization test passes for an explicitly prepared,
+      manually evicted iCloud Drive fixture; scope limits are recorded.
 - [~] VISION.md reflects the conservative current promise, but §3 has not
       promoted the tested portions from hypotheses to `[exp]`, and the central
       interval guarantee remains unvalidated.
 - [x] A provisional one-tier decision is recorded, with an explicit trigger for
       reopening it after the missing A/B benchmark.
 
-**Phase 0 is not complete.** The dataless hard gate alone prevents completion.
+**Phase 0 is not complete.** Snapshot behavior, container-delta ground truth,
+interval tightness, attribute-mask cost, and descriptor-sweep measurements
+remain open.
 
 ### Phase 1 audit — Read-only truth
 
@@ -482,7 +488,8 @@ Exit criteria:
       proves that the home directory is not duplicated.
 - [x] `doctor` inventories `/System/Volumes/VM` as OS-managed swap and includes
       `/nix` when that mount exists.
-- [ ] The live cloud materialization test passes.
+- [x] The live cloud materialization test passes for the scoped iCloud Drive
+      fixture recorded in `docs/findings-phase0.md`.
 - [~] The complete warm-cache benchmark command exists in a workflow, but no
       complete recorded result is present.
 - [ ] CI tracks scan-time regression. The benchmark workflow records a manual
@@ -621,8 +628,8 @@ Status: **not started**.
 
 ### Next valid completion path
 
-1. Close Phase 0 with explicitly prepared live dataless and snapshot fixtures,
-   the container-delta accounting harness, interval-tightness measurement,
+1. Close Phase 0 with snapshot evidence (or an explicitly documented deferred
+   limitation), the container-delta accounting harness, interval-tightness measurement,
    attribute-mask A/B benchmark, and descriptor-sweep measurement; then update
    `docs/findings-phase0.md` and VISION.md labels.
 2. Close Phase 1 with parser fixtures, discovered container topology, live

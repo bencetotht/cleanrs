@@ -134,8 +134,10 @@ allocated. Three distinct hazards:
    could pull hundreds of gigabytes while claiming to save space — a
    catastrophic and particularly ironic failure. Reading attributes via
    `getattrlistbulk` should not materialize content, but "should not" is
-   insufficient assurance here. [hyp: verified by an explicit Phase 0 test
-   asserting zero downloaded bytes when scanning a folder of evicted files.]
+   insufficient assurance here. [exp: on 2026-08-28, a manually evicted 32 MiB
+   iCloud Drive fixture retained `SF_DATALESS`, zero allocated blocks, logical
+   size, and mtime across an initial traversal and five repeated scans. This
+   verifies the tested iCloud case, not every third-party File Provider.]
 
 Usefully, the metrics behave in the safe direction: dataless files have huge
 apparent size and near-zero allocated, so anything ranked by allocated size
