@@ -238,6 +238,44 @@ Each provider implements a read-only `detect`/`inspect`/`plan` path before any
 execution exists. A planned command is stored as an executable plus argv array;
 there is no shell.
 
+### Cargo build inventory — Phase 2 scope
+
+Cargo build storage is useful before the broader project-intelligence phase and
+therefore remains a Phase 2 deliverable:
+
+- Scan only explicit or configured project roots such as `~/Developer` and
+  `~/Projects`; never make the home directory an implicit search root.
+- Detect Cargo packages and workspaces, resolve the workspace root, and collapse
+  member crates that share one build directory into one candidate.
+- Resolve the effective build directory, including `CARGO_TARGET_DIR` and
+  supported Cargo configuration, rather than assuming every project uses a
+  sibling `target/`.
+- A shared target directory is eligible for a directory-wide action only when
+  every discovered owning workspace is inside inspection scope and satisfies
+  the policy. Incomplete ownership or an active owner refuses the broad action
+  instead of deleting artifacts needed by another project.
+- Record the newest meaningful build-artifact timestamp together with
+  `Cargo.toml`/workspace-marker activity. A target becomes a stale-build
+  candidate after approximately 14 days by default, configurable per target.
+  Unknown or contradictory activity evidence must be shown, not treated as
+  stale.
+- The current marker-only `cargo.target` implementation uses a 30-day
+  directory-mtime policy. Replacing that approximation with the 14-day
+  Cargo-aware evidence above is part of this work.
+- Plan one exact cleanup operation per resolved build directory. Prefer a
+  workspace-pinned `cargo clean` argv when it addresses exactly the inspected
+  directory; otherwise use the guarded direct-delete operation reserved for
+  proven workspace-local generated artifacts.
+- Treat Cargo build output as generated but potentially expensive to rebuild.
+  Staleness makes it eligible for review; it does not silently lower rebuild
+  cost or authorize deletion of the repository.
+- Report binaries, incremental state, dependencies, examples, and other
+  build-output categories when they can be attributed without double counting,
+  while keeping the cleanup action at the resolved build-directory boundary.
+- Phase 2 plans cleanup only. Actual removal remains behind Phase 3's
+  `--apply`, identity revalidation, path invariants, and sandboxed execution
+  tests.
+
 ### Target output contract
 
 Every detected item or action should expose, where available:
@@ -284,6 +322,16 @@ Every detected item or action should expose, where available:
       Cargo/rustup, Docker/OrbStack, and Xcode appear in inventory when present.
 - [x] Homebrew appears as separate cleanup, scrub, and autoremove actions with
       provider-reported/unknown estimates and pinned command plans.
+- [ ] Explicit-root Cargo inventory resolves packages, workspace members, and
+      custom/shared target directories without duplicate candidates.
+- [ ] Cargo build candidates use configurable approximately 14-day artifact and
+      marker activity evidence, with unknown evidence reported conservatively.
+- [ ] Human and JSON Cargo plans show the resolved workspace/build directory,
+      measured interval, evidence, rebuild consequence, and exact cleanup
+      operation.
+- [ ] Cargo parser/resolution fixtures cover a standalone crate, a multi-member
+      workspace, custom `CARGO_TARGET_DIR`, a shared target directory, fresh
+      output, stale output, and cloud/mount refusal.
 - [ ] Each provider has fixture or command-output parser tests that do not
       require deleting real data.
 - [ ] Severity is assigned per action; Docker build cache, images, and volumes
@@ -366,6 +414,8 @@ risk depends on project state.
 ### Current state
 
 - Marker-based workspace detection exists for several common artifact names.
+- The Phase 2 Cargo target can identify ordinary marker-adjacent `target/`
+  directories, but currently uses a 30-day directory-mtime approximation.
 - Cargo workspace roots, shared target directories, Git state, Python
   environments, and project activity evidence are not implemented.
 
@@ -377,7 +427,19 @@ risk depends on project state.
   project contents.
 - Detect project-local `node_modules`, `.venv`, Cargo `target`, Gradle output,
   Xcode build output, and other regenerated artifacts.
-- Recognize shared/custom `CARGO_TARGET_DIR` and avoid duplicate accounting.
+- Consume and revalidate Phase 2's shared/custom `CARGO_TARGET_DIR` ownership
+  map instead of rediscovering or double-counting the same build directory.
+- Build on Phase 2's approximately 14-day Cargo build candidates with stronger
+  repository-level activity evidence: recent commits, dirty/untracked work,
+  marker changes, newest build output, worktree activity, and optional
+  ecosystem-specific signals.
+- Distinguish “stale build output” from “dormant project.” Fourteen days is an
+  artifact-cleanup threshold, not proof that a repository was abandoned.
+- Rank sleeper-project build cleanup by reclaimable size and inactivity
+  evidence, while showing which evidence caused the recommendation and which
+  evidence weakened it.
+- Allow per-root and per-project retention overrides for long-lived or
+  expensive-to-rebuild Rust projects.
 - Distinguish package-manager caches from project-local dependency copies.
 - Identify large inactive projects and worktrees as recommendations.
 - Never equate “old,” “clean,” or “pushed” with permission to delete a
@@ -391,6 +453,13 @@ risk depends on project state.
       fixtures are classified distinctly.
 - [ ] Large project-local artifacts are attributed to their project and native
       ecosystem.
+- [ ] Cargo sleeper-project recommendations combine Phase 2 build age with
+      repository activity and never label a project abandoned from mtime alone.
+- [ ] Shared Cargo build directories retain owner evidence; one dormant project
+      cannot authorize cleanup that disrupts an active or out-of-scope owner.
+- [ ] A stale Cargo build can be proposed for cleanup without proposing
+      repository deletion, including for dirty, untracked, remote-less, and
+      unpushed repository fixtures.
 - [ ] Shared cache/build directories are counted once.
 - [ ] No severity level selects repository or environment user data.
 - [ ] Recommendations explain the evidence and exact proposed action.
@@ -522,8 +591,9 @@ Work should continue in this order:
    absent-provider status on machines without Nix.
 2. Add the small resolved target registry and trusted configuration loading.
 3. Add pnpm/npm/Yarn/Bun and uv/pip/Poetry/Conda inventory.
-4. Add Cargo/rustup, Docker/OrbStack, and Xcode actions with risk separated per
-   action.
+4. Add Cargo/rustup—including the explicit-root, approximately 14-day stale
+   build inventory above—then Docker/OrbStack and Xcode actions with risk
+   separated per action.
 5. Finish the Phase 2 path-safety and provider-context test suite.
 6. Implement Phase 3 execution for a deliberately small safe-action subset.
 7. In parallel with normal feature work, land the Phase 1 largest-file view,
