@@ -33,7 +33,7 @@ One provider may expose actions at several levels.
 
 | Level | Intended meaning | Examples |
 |---|---|---|
-| `safe` | Downloadable caches and cheap generated output with low surprise | Homebrew downloads, package-manager caches, stale build output |
+| `safe` | Downloadable caches and cheap generated output with low surprise | narrowly scoped package-manager caches, stale build output |
 | `standard` | Broader generated state with noticeable rebuild cost | old toolchains, stopped runtime/build state, older project artifacts |
 | `aggressive` | Large unused state whose removal may disrupt a workflow | unused images, dormant environments, extensive Xcode state |
 | explicit-only | User data or unusually consequential state | Docker volumes, VM disks, repositories, unsynced project data |
@@ -42,13 +42,18 @@ No severity level reaches explicit-only actions. They require a named target or
 action. Scheduled application is restricted to `safe`; a scheduled broader run
 may produce a plan but must not apply it.
 
+**Correction:** an earlier version listed Homebrew downloads as a `safe`
+example. The supported native `brew cleanup` operation also removes old
+installed versions, so cleanrs initially classifies that mixed action as
+`standard`. It must not be scheduled as a `safe` download-cache-only action.
+
 ## Phase overview
 
 | Phase | Delivers | Current state |
 |---|---|---|
 | 0 | Honest safety and accounting foundation | **Practical baseline complete; deeper research deferred** |
 | 1 | Fast read-only scanner and diagnostics | **Useful MVP implemented; performance and UX work remains** |
-| 2 | Developer-storage inventory and cleanup plans | **Next priority; workspace slice implemented** |
+| 2 | Developer-storage inventory and cleanup plans | **In progress; workspace and Homebrew planning slices implemented** |
 | 3 | Cleanup execution and lightweight history | **Not started; inert apply path exists** |
 | 4 | Project hygiene and stale-project intelligence | **Not started** |
 | 5 | Index, scheduling, and ratatui daily-driver UI | **Terminal groundwork only** |
@@ -195,13 +200,27 @@ disk analyzers.
 - `clean` dry-run planning, selection explanations, a deduplicated interval,
   and captured device/inode/type.
 - `clean --apply` refuses before scanning and cannot currently mutate data.
+- Unified workspace/provider inventory items with owned IDs, provider identity,
+  typed usage sources, exact direct-delete or argv-array operations,
+  consequences, evidence, and action-level minimum severity.
+- A bounded read-only provider host with canonical executable discovery,
+  subprocess timeout/output limits, and injectable command fixtures.
+- Homebrew capability detection pinned to the resolved executable, version, and
+  prefix, with routine cleanup, scrub, and autoremove represented separately.
+- Homebrew cleanup uses the native dry-run estimate instead of treating the
+  whole cache as reclaimable. Routine and scrub plans are mutually exclusive,
+  and cleanup explicitly disables implicit autoremove so plans do not widen or
+  double count.
+- `targets` and `clean` combine workspace findings with machine-wide provider
+  actions; `--workspace-only` suppresses provider inspection.
 
-### Provider inventory to implement
+### Provider inventory
 
 Start with tools actually present on the development Macs, then widen coverage:
 
-- Homebrew: downloads, old formula/cask versions, autoremove candidates, and
-  cleanup preview where supported.
+- Homebrew (**initial slice implemented**): routine cleanup, scrub, and
+  autoremove are distinct read-only plans. More granular formula/cask reporting
+  may be added when it improves decisions without duplicating native output.
 - Nix: store usage, roots/generations, and garbage-collection opportunities.
 - pnpm, npm/npx, Yarn, and Bun: shared caches/stores and native prune commands.
 - uv, pip, Poetry, and Conda: download caches, environments, and native cleanup
@@ -263,6 +282,8 @@ Every detected item or action should expose, where available:
 - [x] `clean --apply` is inert in this phase.
 - [ ] Homebrew, Nix, JS package managers, Python environment managers,
       Cargo/rustup, Docker/OrbStack, and Xcode appear in inventory when present.
+- [x] Homebrew appears as separate cleanup, scrub, and autoremove actions with
+      provider-reported/unknown estimates and pinned command plans.
 - [ ] Each provider has fixture or command-output parser tests that do not
       require deleting real data.
 - [ ] Severity is assigned per action; Docker build cache, images, and volumes
@@ -497,9 +518,9 @@ seams but do not constitute supported Linux behavior.
 
 Work should continue in this order:
 
-1. Define the provider/action data model and severity mapping used by
-   `targets` and `clean`.
-2. Implement read-only Homebrew and Nix detection/inspection/planning.
+1. Implement read-only Nix detection/inspection/planning; retain an explicit
+   absent-provider status on machines without Nix.
+2. Add the small resolved target registry and trusted configuration loading.
 3. Add pnpm/npm/Yarn/Bun and uv/pip/Poetry/Conda inventory.
 4. Add Cargo/rustup, Docker/OrbStack, and Xcode actions with risk separated per
    action.
@@ -508,6 +529,6 @@ Work should continue in this order:
 7. In parallel with normal feature work, land the Phase 1 largest-file view,
    packed-record parser fixtures, and a checked-in performance baseline.
 
-The first concrete implementation task is the provider/action model plus
-Homebrew inspection and dry-run planning. It exercises the architecture with a
-real native cleanup tool while remaining read-only.
+The provider/action model and Homebrew inspection/planning slice is complete.
+The next concrete task is Nix inspection plus the resolved registry needed by
+later provider and user-defined targets.

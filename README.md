@@ -2,10 +2,11 @@
 
 Storage usage analyzer and cleaner for developers, written in Rust. Fully transparent.
 
-> **Status: practical filesystem baseline, read-only MVP, and Phase 2 groundwork.** The read-only `scan`,
-> `doctor`, initial workspace-scoped `targets`, and dry-run `clean` planning
-> commands are implemented.
-> The next priority is developer-tool inventory and native cleanup planning;
+> **Status: practical filesystem baseline, read-only MVP, and Phase 2 provider work.** The read-only `scan`,
+> `doctor`, workspace/provider `targets`, and dry-run `clean` planning
+> commands are implemented. Homebrew cleanup, scrub, and autoremove are the
+> first native provider actions.
+> The next priority is widening developer-tool inventory and native cleanup planning;
 > deeper snapshot and File Provider research is deferred unless it enables a
 > concrete capability. See
 > [the findings](docs/findings-phase0.md), [VISION.md](VISION.md), and the
@@ -127,8 +128,8 @@ establish, before anything is built on top of it.
 cleanrs scan [PATH]      One-shot analysis (--json, --reclaimable, --explain)
 cleanrs tui  [PATH]      Interactive browser
 cleanrs doctor           Reconcile container state; report the unexplained gap
-cleanrs targets [PATH]   List workspace targets with sizes and confidence (initial slice)
-cleanrs clean [PATH]     Plan workspace cleanup — dry-run only in the current slice
+cleanrs targets [PATH]   List workspace targets and machine-wide provider actions
+cleanrs clean [PATH]     Plan workspace/provider cleanup — still dry-run only
 cleanrs history          Estimated vs. observed results of past runs
 cleanrs schedule         launchd agent for unattended weekly runs
 cleanrs index            Cache control
@@ -167,22 +168,34 @@ contents. JSON output, metric selection, depth/minimum-size filters, exclusions,
 path explanations, shell completions, and a generated man page are available in
 `cleanrs --help`. No deletion or provider-execution path exists yet.
 
-`targets` also defaults to the current directory rather than the home directory.
-The initial slice detects marker-scoped Cargo and Node.js build artifacts,
+`targets` also defaults its workspace scan to the current directory rather than
+the home directory. It combines marker-scoped Cargo and Node.js build artifacts
+with machine-wide provider inventory,
 deduplicates candidates, applies staleness policy, and displays the same honest
-reclaimability intervals. Candidate-level cloud/dataless and mount-boundary
-checks can refuse a finding without hiding it. Configuration, provider targets,
-and the full known-location catalog remain Phase 2 work.
+reclaimability intervals. `--workspace-only` skips provider inspection.
+Candidate-level cloud/dataless and mount-boundary
+checks can refuse a finding without hiding it. Configuration, the remaining
+providers, and the full known-location catalog remain Phase 2 work.
 Targets nested beneath an already detected artifact root are collapsed, so
 package metadata inside `node_modules` does not flood or double-count the
 result. Human output is sorted by reclaimable ceiling and shows the largest 25
 targets by default; use `--top N` or `--min-size SIZE` to tune it. JSON remains
 complete unless one of those filters is supplied.
 
-`clean` uses the same explicit workspace scan and candidate safety checks, then
-explains which targets the selected cleanup level and staleness policy would
-include. It records each candidate's device, inode, and type in preparation for
-the Phase 3 replacement check. Dry-run is the only available mode: `--apply`
+Homebrew is detected through its resolved executable, version, and prefix.
+Routine cleanup, scrub, and autoremove are separate actions with exact argv
+plans and explicit consequences. Native dry-run estimates remain labelled
+provider-reported rather than being mixed with APFS intervals; overlapping
+routine and scrub estimates are never added together. Ordinary Homebrew cleanup
+starts at `standard` because the native operation mixes stale downloads with old
+installed versions, while scrub starts at `aggressive`.
+
+`clean` uses the same explicit workspace scan, candidate safety checks, and
+provider inspection, then explains which actions the selected cleanup level and
+staleness policy would include. It records direct-delete candidates' device,
+inode, and type in preparation for the Phase 3 replacement check and pins
+provider plans to an executable/version/context. Dry-run is the only available
+mode: `--apply`
 refuses before scanning, and tests verify that neither form alters fixture data.
 Use `--ignore-staleness` only when intentionally reviewing currently active
 artifacts.

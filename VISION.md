@@ -1,7 +1,7 @@
 # cleanrs — Vision & Design
 
-> **Status:** design reference with Phase 0/1 implementation and a read-only
-> Phase 2 `targets` plus `clean` planning groundwork slice in progress.
+> **Status:** design reference with Phase 0/1 implementation and read-only
+> Phase 2 workspace plus Homebrew inventory/planning slices in progress.
 > Empirical results and unresolved gates are tracked in
 > [docs/findings-phase0.md](docs/findings-phase0.md). This file remains the
 > reference for what cleanrs is, why it exists, and how it should be built.
@@ -478,16 +478,24 @@ true` for Docker build cache.
 | `aggressive` | `+ rebuild_cost = high` | Manual only |
 | — | `user_data` | **Never.** Explicit target naming only. |
 
+**Correction:** an earlier roadmap example treated Homebrew downloads as a
+standalone `safe` action. Homebrew's supported native `cleanup` command mixes
+stale downloads with old installed versions. Until a supported narrower native
+operation is available and validated, cleanrs assigns ordinary Homebrew cleanup
+to `standard`, scrub to `aggressive`, and never schedules either as a
+download-cache-only `safe` action.
+
 ---
 
 ## 7. Providers
 
-The commands below are an **initial provider backlog**, not a set of verified
-invocations. Each entry needs real investigation before implementation.
+The commands below are an initial provider backlog. Homebrew inspection and
+planning were verified against the installed Homebrew 6.0.18 command surface on
+2026-08-28; the remaining entries still require provider-specific validation.
 
 | Provider | Starting point | Known complications |
 |---|---|---|
-| Homebrew | `brew cleanup -s` | Scope of `-s`; pinned formulae. |
+| Homebrew | `brew cleanup --dry-run`; `brew autoremove --dry-run` | Implemented as distinct routine cleanup, scrub, and autoremove actions. Cleanup is run with implicit autoremove disabled; routine and scrub are mutually exclusive. |
 | Docker build cache | `docker builder prune` | Addresses the *selected* builder; Buildx supports multiple builders, each with its own cache. Age and max-space filters (`--filter until=`, `--keep-storage`) are far better for routine cleanup than unfiltered prune. |
 | Docker images | `docker image prune` | `-a` can trigger very large future downloads; must not be presented as a generic safe action. |
 | Docker volumes | — | **`user_data`.** Never automated. |

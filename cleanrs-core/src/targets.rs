@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::accounting::{ReclaimEstimate, estimate_subtree};
+use crate::accounting::{Confidence, ReclaimEstimate, estimate_subtree};
 use crate::fs::{Arena, NodeFlags, NodeIndex, NodeKind, ScanResult};
 
 /// User-facing shorthand for a target's independent safety properties.
@@ -109,6 +109,22 @@ pub enum CleanupLevel {
 }
 
 impl CleanupLevel {
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Safe => 0,
+            Self::Standard => 1,
+            Self::Aggressive => 2,
+        }
+    }
+
+    /// Return whether this level reaches an action's minimum severity.
+    #[must_use]
+    pub const fn reaches(self, minimum: Self) -> bool {
+        self.rank() >= minimum.rank()
+    }
+}
+
+impl CleanupLevel {
     /// Return whether a level may select these properties.
     ///
     /// User data is deliberately unreachable unless its stable target ID was
@@ -150,6 +166,87 @@ pub struct TargetDefinition {
     pub rebuild_cost_override: Option<RebuildCost>,
     pub stale_after_days: u32,
     pub children_only: bool,
+}
+
+/// Identity captured while inspecting a provider. Future execution must prove
+/// that it is still talking to this same executable and provider context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderIdentity {
+    pub id: String,
+    pub executable: Option<PathBuf>,
+    pub version: Option<String>,
+    pub context: Option<String>,
+}
+
+impl ProviderIdentity {
+    #[must_use]
+    pub fn workspace() -> Self {
+        Self {
+            id: "workspace".into(),
+            executable: None,
+            version: None,
+            context: None,
+        }
+    }
+}
+
+/// An external command represented without a shell or argument re-parsing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommandSpec {
+    pub executable: PathBuf,
+    pub args: Vec<String>,
+    /// Only non-secret, provider-controlled environment overrides belong here.
+    pub environment: BTreeMap<String, String>,
+}
+
+/// Exact operation described by a Phase 2 plan. Nothing in this enum executes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum PlannedOperation {
+    DirectDelete {
+        path: PathBuf,
+        children_only: bool,
+        identity: CandidateIdentity,
+    },
+    Command {
+        command: CommandSpec,
+    },
+    Informational,
+}
+
+/// Origin and semantics of a displayed usage estimate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum UsageEstimate {
+    Filesystem {
+        apparent: u64,
+        allocated: u64,
+        reclaimable: ReclaimEstimate,
+    },
+    ProviderReported {
+        bytes: Option<u64>,
+        confidence: Confidence,
+        explanation: String,
+    },
+    Unknown {
+        explanation: String,
+    },
+}
+
+impl UsageEstimate {
+    /// Best sortable upper value. Unknown provider usage intentionally sorts last.
+    #[must_use]
+    pub fn sortable_bytes(&self) -> u64 {
+        match self {
+            Self::Filesystem {
+                allocated,
+                reclaimable,
+                ..
+            } => reclaimable.ceiling.unwrap_or(*allocated),
+            Self::ProviderReported { bytes, .. } => bytes.unwrap_or_default(),
+            Self::Unknown { .. } => 0,
+        }
+    }
 }
 
 impl TargetDefinition {
@@ -230,22 +327,27 @@ pub enum CandidateSafety {
 /// A detected, sized, but never executed target candidate.
 #[derive(Debug, Clone, Serialize)]
 pub struct DetectedTarget {
-    pub id: &'static str,
-    pub description: &'static str,
-    pub project_root: PathBuf,
-    pub path: PathBuf,
+    pub id: String,
+    pub provider: ProviderIdentity,
+    pub description: String,
+    pub project_root: Option<PathBuf>,
+    pub path: Option<PathBuf>,
     pub class: TargetClass,
     pub properties: TargetProperties,
-    pub children_only: bool,
-    pub apparent: u64,
-    pub allocated: u64,
-    pub estimate: ReclaimEstimate,
+    pub minimum_level: CleanupLevel,
+    pub usage: UsageEstimate,
     pub age_days: Option<u64>,
     pub stale_after_days: u32,
     pub stale: Option<bool>,
     pub safety: CandidateSafety,
     /// Filesystem identity captured during planning for Phase 3 revalidation.
-    pub identity: CandidateIdentity,
+    pub operation: PlannedOperation,
+    /// Actions in the same group overlap. The planner selects only the highest
+    /// priority applicable member, so totals never double count alternatives.
+    pub exclusive_group: Option<String>,
+    pub exclusive_priority: u8,
+    pub consequence: String,
+    pub evidence: Vec<String>,
 }
 
 /// Stable filesystem facts that must still match immediately before deletion.
@@ -280,13 +382,18 @@ pub fn plan_cleanup(
     explicitly_named_ids: &[String],
     ignore_staleness: bool,
 ) -> Vec<PlannedTarget> {
-    targets
+    let mut planned: Vec<_> = targets
         .into_iter()
         .map(|target| {
-            let explicitly_named = explicitly_named_ids.iter().any(|id| id == target.id);
+            let explicitly_named = explicitly_named_ids.iter().any(|id| id == &target.id);
             let selection = match &target.safety {
                 CandidateSafety::Refused(reason) => {
                     PlanSelection::Skipped(format!("safety refusal: {reason}"))
+                }
+                CandidateSafety::Eligible if !level.reaches(target.minimum_level) => {
+                    PlanSelection::Skipped(
+                        format!("requires {:?} cleanup level", target.minimum_level).to_lowercase(),
+                    )
                 }
                 CandidateSafety::Eligible
                     if !level.selects(target.properties, explicitly_named) =>
@@ -304,7 +411,42 @@ pub fn plan_cleanup(
             };
             PlannedTarget { target, selection }
         })
-        .collect()
+        .collect();
+
+    // Resolve overlapping alternatives after ordinary policy selection. A
+    // scrub action, for example, supersedes routine cleanup at aggressive level.
+    let mut winners = HashMap::<String, (u8, String)>::new();
+    for item in &planned {
+        if !matches!(item.selection, PlanSelection::Selected) {
+            continue;
+        }
+        let Some(group) = &item.target.exclusive_group else {
+            continue;
+        };
+        let candidate = (item.target.exclusive_priority, item.target.id.clone());
+        winners
+            .entry(group.clone())
+            .and_modify(|winner| {
+                if candidate > *winner {
+                    *winner = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+    for item in &mut planned {
+        let Some(group) = &item.target.exclusive_group else {
+            continue;
+        };
+        if matches!(item.selection, PlanSelection::Selected)
+            && winners
+                .get(group)
+                .is_some_and(|(_, id)| id != &item.target.id)
+        {
+            let winner = &winners[group].1;
+            item.selection = PlanSelection::Skipped(format!("superseded by {winner}"));
+        }
+    }
+    planned
 }
 
 /// Detect all selected built-in workspace targets from one explicit scan.
@@ -354,25 +496,43 @@ pub fn detect_workspace_targets(
             detected
                 .entry(path.clone())
                 .or_insert_with(|| DetectedTarget {
-                    id: definition.id,
-                    description: definition.description,
-                    project_root,
-                    path,
+                    id: definition.id.into(),
+                    provider: ProviderIdentity::workspace(),
+                    description: definition.description.into(),
+                    project_root: Some(project_root),
+                    path: Some(path.clone()),
                     class: definition.class,
                     properties: definition.properties(),
-                    children_only: definition.children_only,
-                    apparent,
-                    allocated,
-                    estimate: estimate_subtree(&scan.arena, candidate, scan.coverage_complete()),
+                    minimum_level: minimum_level_for(definition.properties()),
+                    usage: UsageEstimate::Filesystem {
+                        apparent,
+                        allocated,
+                        reclaimable: estimate_subtree(
+                            &scan.arena,
+                            candidate,
+                            scan.coverage_complete(),
+                        ),
+                    },
                     age_days,
                     stale_after_days: definition.stale_after_days,
                     stale: age_days.map(|age| age >= u64::from(definition.stale_after_days)),
                     safety,
-                    identity: CandidateIdentity {
-                        device: scan.arena.nodes[candidate.as_usize()].device,
-                        inode: scan.arena.nodes[candidate.as_usize()].inode,
-                        kind: scan.arena.nodes[candidate.as_usize()].kind,
+                    operation: PlannedOperation::DirectDelete {
+                        path,
+                        children_only: definition.children_only,
+                        identity: CandidateIdentity {
+                            device: scan.arena.nodes[candidate.as_usize()].device,
+                            inode: scan.arena.nodes[candidate.as_usize()].inode,
+                            kind: scan.arena.nodes[candidate.as_usize()].kind,
+                        },
                     },
+                    exclusive_group: None,
+                    exclusive_priority: 0,
+                    consequence: workspace_consequence(definition).into(),
+                    evidence: vec![format!(
+                        "detected {} beside {}",
+                        definition.detector.directory, definition.detector.marker
+                    )],
                 });
         }
     }
@@ -384,22 +544,53 @@ pub fn detect_workspace_targets(
     let mut candidates: Vec<_> = detected.into_values().collect();
     candidates.sort_by(|left, right| {
         left.path
-            .components()
-            .count()
-            .cmp(&right.path.components().count())
+            .as_ref()
+            .map_or(0, |path| path.components().count())
+            .cmp(
+                &right
+                    .path
+                    .as_ref()
+                    .map_or(0, |path| path.components().count()),
+            )
             .then_with(|| left.path.cmp(&right.path))
     });
     let mut roots: Vec<DetectedTarget> = Vec::new();
     for candidate in candidates {
-        if roots
-            .iter()
-            .any(|parent| candidate.path.starts_with(&parent.path))
-        {
+        if roots.iter().any(|parent| {
+            candidate.path.as_ref().is_some_and(|candidate_path| {
+                parent
+                    .path
+                    .as_ref()
+                    .is_some_and(|parent_path| candidate_path.starts_with(parent_path))
+            })
+        }) {
             continue;
         }
         roots.push(candidate);
     }
     roots
+}
+
+fn minimum_level_for(properties: TargetProperties) -> CleanupLevel {
+    if matches!(properties.rebuild_cost, Some(RebuildCost::High)) {
+        CleanupLevel::Aggressive
+    } else if properties.recoverability == Recoverability::Downloadable
+        || matches!(properties.automation, Automation::Confirmed)
+    {
+        CleanupLevel::Standard
+    } else {
+        CleanupLevel::Safe
+    }
+}
+
+fn workspace_consequence(definition: &TargetDefinition) -> &'static str {
+    match definition.id {
+        "cargo.target" => "Rust build output will be rebuilt on the next build",
+        "node.modules" => "dependencies must be restored by the package manager",
+        "node.next" => "Next.js output will be regenerated on the next build",
+        "node.dist" => "distribution output will be regenerated by its build",
+        _ => "generated workspace output will need to be recreated",
+    }
 }
 
 fn modified_age_days(arena: &Arena, index: NodeIndex, now: u64) -> Option<u64> {
@@ -590,8 +781,16 @@ mod tests {
         );
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0].id, "node.modules");
-        assert_eq!(detected[0].allocated, 4096);
-        assert_eq!(detected[0].estimate.floor, Some(4096));
+        let UsageEstimate::Filesystem {
+            allocated,
+            reclaimable,
+            ..
+        } = &detected[0].usage
+        else {
+            panic!("workspace target must carry filesystem usage")
+        };
+        assert_eq!(*allocated, 4096);
+        assert_eq!(reclaimable.floor, Some(4096));
         assert_eq!(detected[0].safety, CandidateSafety::Eligible);
     }
 
@@ -656,6 +855,40 @@ mod tests {
         let detected = detect_workspace_targets(&scan, BUILTIN_TARGETS, None);
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0].id, "node.modules");
-        assert_eq!(detected[0].path, Path::new("/fixture/project/node_modules"));
+        assert_eq!(
+            detected[0].path.as_deref(),
+            Some(Path::new("/fixture/project/node_modules"))
+        );
+    }
+
+    #[test]
+    fn planner_selects_only_one_overlapping_action() {
+        let mut targets =
+            detect_workspace_targets(&fixture_scan("/fixture", false), BUILTIN_TARGETS, None);
+        let mut alternative = targets[0].clone();
+        targets[0].id = "mode.normal".into();
+        targets[0].exclusive_group = Some("mode".into());
+        targets[0].exclusive_priority = 10;
+        targets[0].minimum_level = CleanupLevel::Safe;
+        alternative.id = "mode.broad".into();
+        alternative.exclusive_group = Some("mode".into());
+        alternative.exclusive_priority = 20;
+        alternative.minimum_level = CleanupLevel::Safe;
+        targets.push(alternative);
+
+        let planned = plan_cleanup(targets, CleanupLevel::Aggressive, &[], true);
+        assert_eq!(
+            planned
+                .iter()
+                .filter(|item| matches!(item.selection, PlanSelection::Selected))
+                .count(),
+            1
+        );
+        assert!(planned.iter().any(|item| {
+            matches!(
+                &item.selection,
+                PlanSelection::Skipped(reason) if reason == "superseded by mode.broad"
+            )
+        }));
     }
 }

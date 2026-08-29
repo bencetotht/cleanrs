@@ -15,7 +15,7 @@ use comfy_table::{
 use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use cleanrs_core::targets::{CandidateSafety, PlanSelection, Recoverability};
+use cleanrs_core::targets::{CandidateSafety, PlanSelection, PlannedOperation, UsageEstimate};
 use cleanrs_core::{Confidence, DoctorReport, ScanObserver, ScanProgress};
 
 use crate::{CleanOutput, Metric, ScanOutput, TargetsOutput, format_interval, human_bytes};
@@ -277,11 +277,13 @@ impl TerminalUi {
         targets.set_header(vec![
             self.header("RECLAIMABLE"),
             self.header("CONFIDENCE"),
-            self.header("CLASS"),
+            self.header("PROVIDER"),
+            self.header("LEVEL"),
             self.header("AGE"),
             self.header("STATUS"),
             self.header("TARGET"),
-            self.header("PATH"),
+            self.header("LOCATION / OPERATION"),
+            self.header("CONSEQUENCE"),
         ]);
         for target in &output.targets {
             let age = target.age_days.map_or_else(
@@ -297,19 +299,34 @@ impl TerminalUi {
                     self.value(format!("refused: {reason}"), Color::Red)
                 }
             };
-            let class = match target.properties.recoverability {
-                Recoverability::Generated => format!("{:?}", target.class).to_lowercase(),
-                Recoverability::Downloadable => format!("{:?}", target.class).to_lowercase(),
-                Recoverability::UserData => "user data".into(),
-            };
+            let (usage, confidence) = usage_display(&target.usage);
+            let location = target.path.as_ref().map_or_else(
+                || {
+                    target
+                        .provider
+                        .context
+                        .clone()
+                        .unwrap_or_else(|| "—".into())
+                },
+                |path| target_display_path(&output.scope, path),
+            );
             targets.add_row(vec![
-                self.value(format_interval(&target.estimate), Color::Cyan),
-                self.confidence(target.estimate.confidence),
-                Cell::new(class),
+                self.value(usage, Color::Cyan),
+                confidence.map_or_else(
+                    || self.value("unknown", Color::Yellow),
+                    |confidence| self.confidence(confidence),
+                ),
+                Cell::new(&target.provider.id),
+                Cell::new(format!("{:?}", target.minimum_level).to_lowercase()),
                 Cell::new(age),
                 status,
-                Cell::new(target.id),
-                Cell::new(target_display_path(&output.scope, &target.path)),
+                Cell::new(&target.id),
+                Cell::new(format!(
+                    "{} · {}",
+                    location,
+                    operation_display(&target.operation)
+                )),
+                Cell::new(&target.consequence),
             ]);
         }
         println!("{targets}");
@@ -355,6 +372,7 @@ impl TerminalUi {
             self.value("read-only; no action was run", Color::Green),
         ]);
         println!("{summary}");
+        self.print_provider_statuses(&output.providers);
         if output.default_limit_applied && output.hidden > 0 {
             println!();
             println!(
@@ -377,21 +395,29 @@ impl TerminalUi {
             self.header("ACTION"),
             self.header("RECLAIMABLE"),
             self.header("CONFIDENCE"),
+            self.header("PROVIDER"),
             self.header("TARGET"),
-            self.header("PATH"),
+            self.header("OPERATION"),
+            self.header("CONSEQUENCE"),
             self.header("REASON"),
         ]);
         for planned in &output.targets {
             let (action, reason, color) = match &planned.selection {
-                PlanSelection::Selected => ("delete", "selected", Color::Yellow),
+                PlanSelection::Selected => ("plan", "selected", Color::Yellow),
                 PlanSelection::Skipped(reason) => ("skip", reason.as_str(), Color::DarkGrey),
             };
+            let (usage, confidence) = usage_display(&planned.target.usage);
             plan.add_row(vec![
                 self.value(action, color),
-                self.value(format_interval(&planned.target.estimate), Color::Cyan),
-                self.confidence(planned.target.estimate.confidence),
-                Cell::new(planned.target.id),
-                Cell::new(target_display_path(&output.scope, &planned.target.path)),
+                self.value(usage, Color::Cyan),
+                confidence.map_or_else(
+                    || self.value("unknown", Color::Yellow),
+                    |confidence| self.confidence(confidence),
+                ),
+                Cell::new(&planned.target.provider.id),
+                Cell::new(&planned.target.id),
+                Cell::new(operation_display(&planned.target.operation)),
+                Cell::new(&planned.target.consequence),
                 Cell::new(reason),
             ]);
         }
@@ -409,8 +435,20 @@ impl TerminalUi {
             Cell::new(output.selected_targets),
         ]);
         summary.add_row(vec![
-            Cell::new("Estimated reclaimable"),
+            Cell::new("Filesystem reclaimable"),
             self.value(planned_interval, Color::Cyan),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Provider-reported reclaimable"),
+            self.value(human_bytes(output.selected_provider_reported), Color::Cyan),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Provider-reported actions"),
+            Cell::new(output.selected_provider_actions),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Selected actions with unknown size"),
+            Cell::new(output.selected_unknown_actions),
         ]);
         summary.add_row(vec![
             Cell::new("Coverage"),
@@ -426,11 +464,52 @@ impl TerminalUi {
         ]);
         println!();
         println!("{summary}");
+        self.print_provider_statuses(&output.providers);
         println!();
         println!(
             "{} Permanent execution remains disabled until the documented Phase 2 safety gates pass.",
             self.warning("NOTICE")
         );
+    }
+
+    fn print_provider_statuses(&self, statuses: &[cleanrs_core::providers::ProviderStatus]) {
+        if statuses.is_empty() {
+            return;
+        }
+        println!();
+        println!("{}", self.section("Providers"));
+        let mut providers = self.table();
+        providers.set_header(vec![
+            self.header("PROVIDER"),
+            self.header("DETECTED"),
+            self.header("VERSION / CONTEXT"),
+            self.header("STATUS"),
+        ]);
+        for status in statuses {
+            let identity = [status.version.as_deref(), status.context.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            providers.add_row(vec![
+                Cell::new(&status.id),
+                self.value(
+                    if status.detected { "yes" } else { "no" },
+                    if status.detected {
+                        Color::Green
+                    } else {
+                        Color::DarkGrey
+                    },
+                ),
+                Cell::new(if identity.is_empty() {
+                    "—"
+                } else {
+                    &identity
+                }),
+                Cell::new(&status.message),
+            ]);
+        }
+        println!("{providers}");
     }
 
     fn table(&self) -> Table {
@@ -525,6 +604,48 @@ fn target_display_path(scope: &Path, path: &Path) -> String {
             || path.display().to_string(),
             |relative| format!("./{}", relative.display()),
         )
+}
+
+fn usage_display(usage: &UsageEstimate) -> (String, Option<Confidence>) {
+    match usage {
+        UsageEstimate::Filesystem { reclaimable, .. } => {
+            (format_interval(reclaimable), Some(reclaimable.confidence))
+        }
+        UsageEstimate::ProviderReported {
+            bytes, confidence, ..
+        } => (
+            bytes.map_or_else(|| "unknown".into(), human_bytes),
+            Some(*confidence),
+        ),
+        UsageEstimate::Unknown { .. } => ("unknown".into(), None),
+    }
+}
+
+fn operation_display(operation: &PlannedOperation) -> String {
+    match operation {
+        PlannedOperation::DirectDelete {
+            path,
+            children_only,
+            ..
+        } => {
+            if *children_only {
+                format!("delete children of {}", path.display())
+            } else {
+                format!("delete {}", path.display())
+            }
+        }
+        PlannedOperation::Command { command } => {
+            let mut parts = command
+                .environment
+                .iter()
+                .map(|(key, value)| format!("{key}={value:?}"))
+                .collect::<Vec<_>>();
+            parts.push(command.executable.display().to_string());
+            parts.extend(command.args.iter().map(|argument| format!("{argument:?}")));
+            parts.join(" ")
+        }
+        PlannedOperation::Informational => "informational only".into(),
+    }
 }
 
 /// An indeterminate spinner backed by the scanner's monotonic counters.

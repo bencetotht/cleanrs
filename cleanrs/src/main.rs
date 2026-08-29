@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -6,9 +7,12 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use cleanrs_core::accounting::{estimate_subtree, estimate_subtrees};
 use cleanrs_core::fs::{Arena, NodeIndex, ScanResult, doctor};
+use cleanrs_core::providers::{
+    HOMEBREW_ACTION_IDS, ProviderStatus, SystemProviderHost, inspect_builtin_providers,
+};
 use cleanrs_core::targets::{
-    BUILTIN_TARGETS, CleanupLevel, DetectedTarget, PlanSelection, PlannedTarget,
-    detect_workspace_targets, plan_cleanup,
+    BUILTIN_TARGETS, CleanupLevel, DetectedTarget, PlanSelection, PlannedOperation, PlannedTarget,
+    UsageEstimate, detect_workspace_targets, plan_cleanup,
 };
 use cleanrs_core::{ReclaimEstimate, ScanOptions, Scanner};
 use serde::Serialize;
@@ -77,6 +81,10 @@ struct TargetArgs {
     /// Directory worker count (blocking workers; no async runtime).
     #[arg(long)]
     workers: Option<usize>,
+
+    /// Inspect only workspace targets and skip machine-wide providers.
+    #[arg(long)]
+    workspace_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -137,6 +145,10 @@ struct CleanArgs {
     /// Directory worker count (blocking workers; no async runtime).
     #[arg(long)]
     workers: Option<usize>,
+
+    /// Plan only workspace targets and skip machine-wide providers.
+    #[arg(long)]
+    workspace_only: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -256,6 +268,7 @@ struct TargetsOutput {
     total_detected: usize,
     hidden: usize,
     default_limit_applied: bool,
+    providers: Vec<ProviderStatus>,
     targets: Vec<DetectedTarget>,
 }
 
@@ -267,6 +280,10 @@ pub(crate) struct CleanOutput {
     pub(crate) execution: &'static str,
     pub(crate) selected_targets: usize,
     pub(crate) selected_estimate: ReclaimEstimate,
+    pub(crate) selected_provider_reported: u64,
+    pub(crate) selected_provider_actions: usize,
+    pub(crate) selected_unknown_actions: usize,
+    pub(crate) providers: Vec<ProviderStatus>,
     pub(crate) targets: Vec<PlannedTarget>,
 }
 
@@ -280,8 +297,8 @@ fn run_targets(args: TargetArgs) -> Result<()> {
         .filter(|definition| args.only.is_empty() || args.only.iter().any(|id| id == definition.id))
         .filter(|definition| !args.exclude.iter().any(|id| id == definition.id))
         .collect();
-    validate_builtin_ids(&args.only, "--only")?;
-    validate_builtin_ids(&args.exclude, "--exclude")?;
+    validate_target_ids(&args.only, "--only")?;
+    validate_target_ids(&args.exclude, "--exclude")?;
 
     let mut options = ScanOptions::default();
     if let Some(workers) = args.workers {
@@ -307,6 +324,13 @@ fn run_targets(args: TargetArgs) -> Result<()> {
         scan.with_context(|| format!("failed to inspect targets in {}", args.path.display()))?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut targets = detect_workspace_targets(&scan, &definitions, home.as_deref());
+    let provider_ids = selected_provider_ids(&args.only, &args.exclude);
+    let provider_inventory = if args.workspace_only || provider_ids.is_empty() {
+        Default::default()
+    } else {
+        inspect_builtin_providers(&SystemProviderHost::default(), &provider_ids)
+    };
+    targets.extend(provider_inventory.items);
     targets.sort_by(|left, right| {
         std::cmp::Reverse(target_sort_size(left))
             .cmp(&std::cmp::Reverse(target_sort_size(right)))
@@ -326,6 +350,7 @@ fn run_targets(args: TargetArgs) -> Result<()> {
         total_detected,
         hidden: total_detected.saturating_sub(targets.len()),
         default_limit_applied,
+        providers: provider_inventory.statuses,
         targets,
     };
     if args.json {
@@ -349,8 +374,8 @@ fn run_clean(args: CleanArgs) -> Result<()> {
     if args.workers == Some(0) {
         bail!("--workers must be at least 1");
     }
-    validate_builtin_ids(&args.only, "--only")?;
-    validate_builtin_ids(&args.exclude, "--exclude")?;
+    validate_target_ids(&args.only, "--only")?;
+    validate_target_ids(&args.exclude, "--exclude")?;
     let definitions: Vec<_> = BUILTIN_TARGETS
         .iter()
         .copied()
@@ -378,7 +403,14 @@ fn run_clean(args: CleanArgs) -> Result<()> {
     let scan =
         scan.with_context(|| format!("failed to build cleanup plan in {}", args.path.display()))?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let detected = detect_workspace_targets(&scan, &definitions, home.as_deref());
+    let mut detected = detect_workspace_targets(&scan, &definitions, home.as_deref());
+    let provider_ids = selected_provider_ids(&args.only, &args.exclude);
+    let provider_inventory = if args.workspace_only || provider_ids.is_empty() {
+        Default::default()
+    } else {
+        inspect_builtin_providers(&SystemProviderHost::default(), &provider_ids)
+    };
+    detected.extend(provider_inventory.items);
     let level = CleanupLevel::from(args.level);
     let mut targets = plan_cleanup(detected, level, &args.only, args.ignore_staleness);
     targets.sort_by(|left, right| {
@@ -395,15 +427,43 @@ fn run_clean(args: CleanArgs) -> Result<()> {
         .collect();
     let selected_roots: Vec<_> = selected
         .iter()
-        .map(|planned| {
-            (0..scan.arena.nodes.len())
+        .filter_map(|planned| {
+            if !matches!(
+                planned.target.operation,
+                PlannedOperation::DirectDelete { .. }
+            ) {
+                return None;
+            }
+            let index = (0..scan.arena.nodes.len())
                 .map(NodeIndex::from_usize)
-                .find(|index| scan.arena.path(*index) == planned.target.path)
-                .expect("detected target path must remain in its source arena")
+                .find(|index| {
+                    planned
+                        .target
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| scan.arena.path(*index) == *path)
+                })
+                .expect("direct-delete target path must remain in its source arena");
+            Some(index)
         })
         .collect();
     let selected_estimate =
         estimate_subtrees(&scan.arena, &selected_roots, scan.coverage_complete());
+    let selected_provider_reported = selected
+        .iter()
+        .filter_map(|planned| match planned.target.usage {
+            UsageEstimate::ProviderReported { bytes, .. } => bytes,
+            _ => None,
+        })
+        .fold(0_u64, u64::saturating_add);
+    let selected_provider_actions = selected
+        .iter()
+        .filter(|planned| matches!(planned.target.usage, UsageEstimate::ProviderReported { .. }))
+        .count();
+    let selected_unknown_actions = selected
+        .iter()
+        .filter(|planned| matches!(planned.target.usage, UsageEstimate::Unknown { .. }))
+        .count();
     let output = CleanOutput {
         scope: scan.root.clone(),
         level,
@@ -411,6 +471,10 @@ fn run_clean(args: CleanArgs) -> Result<()> {
         execution: "dry-run; no action was run",
         selected_targets: selected.len(),
         selected_estimate,
+        selected_provider_reported,
+        selected_provider_actions,
+        selected_unknown_actions,
+        providers: provider_inventory.statuses,
         targets,
     };
     if args.json {
@@ -423,16 +487,27 @@ fn run_clean(args: CleanArgs) -> Result<()> {
 }
 
 fn target_sort_size(target: &DetectedTarget) -> u64 {
-    target.estimate.ceiling.unwrap_or(target.allocated)
+    target.usage.sortable_bytes()
 }
 
-fn validate_builtin_ids(ids: &[String], flag: &str) -> Result<()> {
+fn validate_target_ids(ids: &[String], flag: &str) -> Result<()> {
     for id in ids {
-        if !BUILTIN_TARGETS.iter().any(|definition| definition.id == id) {
+        if !BUILTIN_TARGETS.iter().any(|definition| definition.id == id)
+            && !HOMEBREW_ACTION_IDS.contains(&id.as_str())
+        {
             bail!("unknown target ID {id:?} passed to {flag}");
         }
     }
     Ok(())
+}
+
+fn selected_provider_ids(only: &[String], exclude: &[String]) -> HashSet<String> {
+    HOMEBREW_ACTION_IDS
+        .iter()
+        .filter(|id| only.is_empty() || only.iter().any(|selected| selected == **id))
+        .filter(|id| !exclude.iter().any(|excluded| excluded == **id))
+        .map(|id| (*id).to_owned())
+        .collect()
 }
 
 fn run_scan(args: ScanArgs) -> Result<()> {
