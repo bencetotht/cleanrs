@@ -1,9 +1,7 @@
 //! TTY-aware human output. JSON, completions, and man pages bypass this module.
 
 use std::io::{self, IsTerminal};
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -300,7 +298,7 @@ impl TerminalUi {
             targets.add_row(vec![
                 self.value(usage, Color::Cyan),
                 Cell::new(target_project_name(target)),
-                Cell::new(target_location(&output.scope, target)),
+                Cell::new(target_location(target)),
                 Cell::new(age),
                 status,
                 Cell::new(&target.id),
@@ -386,7 +384,7 @@ impl TerminalUi {
                 self.value(action, color),
                 self.value(usage, Color::Cyan),
                 Cell::new(target_project_name(&planned.target)),
-                Cell::new(target_location(&output.scope, &planned.target)),
+                Cell::new(target_location(&planned.target)),
                 Cell::new(&planned.target.id),
                 Cell::new(reason),
             ]);
@@ -564,14 +562,25 @@ fn display_path(root: &Path, path: &Path, depth: usize) -> String {
     format!("{}{visible}", "  ".repeat(depth.saturating_sub(1)))
 }
 
-fn target_display_path(scope: &Path, path: &Path) -> String {
-    path.strip_prefix(scope)
-        .ok()
-        .filter(|relative| !relative.as_os_str().is_empty())
-        .map_or_else(
-            || path.display().to_string(),
-            |relative| format!("./{}", relative.display()),
-        )
+fn target_display_path(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    home_relative_display(path, home.as_deref())
+}
+
+fn home_relative_display(path: &Path, home: Option<&Path>) -> String {
+    let Some(home) = home else {
+        return path.display().to_string();
+    };
+    path.strip_prefix(home).map_or_else(
+        |_| path.display().to_string(),
+        |relative| {
+            if relative.as_os_str().is_empty() {
+                "~".into()
+            } else {
+                format!("~/{}", relative.display())
+            }
+        },
+    )
 }
 
 /// Use the owning workspace name as the primary human identifier. Provider
@@ -591,7 +600,7 @@ fn target_project_name(target: &DetectedTarget) -> String {
 
 /// Keep the default table focused on location. Exact command argv and direct
 /// deletion semantics remain in the JSON representation for detailed review.
-fn target_location(scope: &Path, target: &DetectedTarget) -> String {
+fn target_location(target: &DetectedTarget) -> String {
     target.path.as_ref().map_or_else(
         || {
             target
@@ -600,7 +609,7 @@ fn target_location(scope: &Path, target: &DetectedTarget) -> String {
                 .clone()
                 .unwrap_or_else(|| "—".into())
         },
-        |path| target_display_path(scope, path),
+        |path| target_display_path(path),
     )
 }
 
@@ -687,5 +696,16 @@ mod tests {
     fn counts_have_grouping() {
         assert_eq!(grouped(12), "12");
         assert_eq!(grouped(12_345_678), "12,345,678");
+    }
+
+    #[test]
+    fn target_paths_keep_the_command_root_in_home_relative_form() {
+        let home = Path::new("/Users/test");
+        let target = Path::new("/Users/test/Developer/Projects/example/target");
+        assert_eq!(
+            home_relative_display(target, Some(home)),
+            "~/Developer/Projects/example/target"
+        );
+        assert_eq!(home_relative_display(home, Some(home)), "~");
     }
 }

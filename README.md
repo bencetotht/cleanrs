@@ -212,9 +212,10 @@ result. Human output is sorted by reclaimable ceiling and shows the largest 25
 targets by default; use `--top N` or `--min-size SIZE` to tune it. JSON remains
 complete unless one of those filters is supplied.
 The default `targets` and `clean` tables lead with reclaimable size, project
-name, and location. Exact commands, consequences, provider identities, and
-evidence remain in `--json`, keeping ordinary terminal rows compact enough to
-scan quickly.
+name, and a home-relative location such as
+`~/Developer/Projects/example/target`. Exact commands, consequences, provider
+identities, and evidence remain in `--json`, keeping ordinary terminal rows
+compact enough to scan quickly.
 
 Homebrew is detected through its resolved executable, version, and prefix.
 Routine cleanup, scrub, and autoremove are separate actions with exact argv

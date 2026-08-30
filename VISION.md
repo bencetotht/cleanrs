@@ -1042,8 +1042,10 @@ for JSON and redirected output. Human results use metric-aware tables and
 semantic colors; redirected results use colorless ASCII tables.
 For `targets` and `clean`, the default human table is a decision overview:
 reclaimable size, project, and location come first, followed by compact age and
-selection information. Exact argv, consequences, provider identity, and full
-evidence belong to JSON rather than being wrapped into every terminal row.
+selection information. Paths retain their complete home-relative context (for
+example `~/Developer/Projects/example/target`) rather than becoming ambiguous
+scan-root-relative fragments. Exact argv, consequences, provider identity, and
+full evidence belong to JSON rather than being wrapped into every terminal row.
 
 `scan` ranks by **allocated** size by default. This is not only the honest
 default — it is also a safety property: dataless cloud files have enormous

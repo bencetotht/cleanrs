@@ -242,9 +242,10 @@ disk analyzers.
   remains unreachable by severity, and `safe` plans have conservative
   unattended limits of 100 actions or 50 GiB.
 - Default `targets` and `clean` tables prioritize reclaimable size, project
-  name, and location. Full operation argv, consequences, identities, and
-  evidence remain available in JSON without forcing narrow terminal columns to
-  wrap into unreadable multi-line rows.
+  name, and the complete home-relative location (including the command's scan
+  root). Full operation argv, consequences, identities, and evidence remain
+  available in JSON without forcing narrow terminal columns to wrap into
+  unreadable multi-line rows.
 
 ### Provider inventory
 
