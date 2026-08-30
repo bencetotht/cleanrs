@@ -15,7 +15,7 @@ use comfy_table::{
 use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use cleanrs_core::targets::{CandidateSafety, PlanSelection, PlannedOperation, UsageEstimate};
+use cleanrs_core::targets::{CandidateSafety, DetectedTarget, PlanSelection, UsageEstimate};
 use cleanrs_core::{Confidence, DoctorReport, ScanObserver, ScanProgress};
 
 use crate::{CleanOutput, Metric, ScanOutput, TargetsOutput, format_interval, human_bytes};
@@ -276,14 +276,11 @@ impl TerminalUi {
         let mut targets = self.table();
         targets.set_header(vec![
             self.header("RECLAIMABLE"),
-            self.header("CONFIDENCE"),
-            self.header("PROVIDER"),
-            self.header("LEVEL"),
+            self.header("PROJECT"),
+            self.header("LOCATION"),
             self.header("AGE"),
             self.header("STATUS"),
             self.header("TARGET"),
-            self.header("LOCATION / OPERATION"),
-            self.header("CONSEQUENCE"),
         ]);
         for target in &output.targets {
             let age = target.age_days.map_or_else(
@@ -299,34 +296,14 @@ impl TerminalUi {
                     self.value(format!("refused: {reason}"), Color::Red)
                 }
             };
-            let (usage, confidence) = usage_display(&target.usage);
-            let location = target.path.as_ref().map_or_else(
-                || {
-                    target
-                        .provider
-                        .context
-                        .clone()
-                        .unwrap_or_else(|| "—".into())
-                },
-                |path| target_display_path(&output.scope, path),
-            );
+            let (usage, _) = usage_display(&target.usage);
             targets.add_row(vec![
                 self.value(usage, Color::Cyan),
-                confidence.map_or_else(
-                    || self.value("unknown", Color::Yellow),
-                    |confidence| self.confidence(confidence),
-                ),
-                Cell::new(&target.provider.id),
-                Cell::new(format!("{:?}", target.minimum_level).to_lowercase()),
+                Cell::new(target_project_name(target)),
+                Cell::new(target_location(&output.scope, target)),
                 Cell::new(age),
                 status,
                 Cell::new(&target.id),
-                Cell::new(format!(
-                    "{} · {}",
-                    location,
-                    operation_display(&target.operation)
-                )),
-                Cell::new(&target.consequence),
             ]);
         }
         println!("{targets}");
@@ -394,11 +371,9 @@ impl TerminalUi {
         plan.set_header(vec![
             self.header("ACTION"),
             self.header("RECLAIMABLE"),
-            self.header("CONFIDENCE"),
-            self.header("PROVIDER"),
+            self.header("PROJECT"),
+            self.header("LOCATION"),
             self.header("TARGET"),
-            self.header("OPERATION"),
-            self.header("CONSEQUENCE"),
             self.header("REASON"),
         ]);
         for planned in &output.targets {
@@ -406,18 +381,13 @@ impl TerminalUi {
                 PlanSelection::Selected => ("plan", "selected", Color::Yellow),
                 PlanSelection::Skipped(reason) => ("skip", reason.as_str(), Color::DarkGrey),
             };
-            let (usage, confidence) = usage_display(&planned.target.usage);
+            let (usage, _) = usage_display(&planned.target.usage);
             plan.add_row(vec![
                 self.value(action, color),
                 self.value(usage, Color::Cyan),
-                confidence.map_or_else(
-                    || self.value("unknown", Color::Yellow),
-                    |confidence| self.confidence(confidence),
-                ),
-                Cell::new(&planned.target.provider.id),
+                Cell::new(target_project_name(&planned.target)),
+                Cell::new(target_location(&output.scope, &planned.target)),
                 Cell::new(&planned.target.id),
-                Cell::new(operation_display(&planned.target.operation)),
-                Cell::new(&planned.target.consequence),
                 Cell::new(reason),
             ]);
         }
@@ -467,7 +437,7 @@ impl TerminalUi {
         self.print_provider_statuses(&output.providers);
         println!();
         println!(
-            "{} Permanent execution remains disabled until the documented Phase 2 safety gates pass.",
+            "{} Permanent execution remains disabled until Phase 3 identity revalidation and journalling are implemented.",
             self.warning("NOTICE")
         );
     }
@@ -477,39 +447,37 @@ impl TerminalUi {
             return;
         }
         println!();
-        println!("{}", self.section("Providers"));
-        let mut providers = self.table();
-        providers.set_header(vec![
-            self.header("PROVIDER"),
-            self.header("DETECTED"),
-            self.header("VERSION / CONTEXT"),
-            self.header("STATUS"),
-        ]);
-        for status in statuses {
-            let identity = [status.version.as_deref(), status.context.as_deref()]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" · ");
-            providers.add_row(vec![
-                Cell::new(&status.id),
-                self.value(
-                    if status.detected { "yes" } else { "no" },
-                    if status.detected {
-                        Color::Green
-                    } else {
-                        Color::DarkGrey
-                    },
-                ),
-                Cell::new(if identity.is_empty() {
-                    "—"
-                } else {
-                    &identity
-                }),
-                Cell::new(&status.message),
-            ]);
+        let inspected = statuses
+            .iter()
+            .filter(|status| status.detected)
+            .map(|status| status.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !inspected.is_empty() {
+            println!("{} {inspected}", self.muted("Providers inspected:"));
         }
-        println!("{providers}");
+
+        // Successful identity/context details remain available in JSON. The
+        // default terminal view only expands providers that need attention.
+        let notices = statuses
+            .iter()
+            .filter(|status| {
+                !status.detected
+                    || status.message.contains("failed")
+                    || (status.message.contains("skipped")
+                        && !status.message.contains("0 manifest(s) skipped"))
+            })
+            .collect::<Vec<_>>();
+        if !notices.is_empty() {
+            println!();
+            println!("{}", self.section("Provider notices"));
+            let mut providers = self.table();
+            providers.set_header(vec![self.header("PROVIDER"), self.header("STATUS")]);
+            for status in notices {
+                providers.add_row(vec![Cell::new(&status.id), Cell::new(&status.message)]);
+            }
+            println!("{providers}");
+        }
     }
 
     fn table(&self) -> Table {
@@ -606,6 +574,36 @@ fn target_display_path(scope: &Path, path: &Path) -> String {
         )
 }
 
+/// Use the owning workspace name as the primary human identifier. Provider
+/// actions have no project root, so their stable provider name is the clearest
+/// equivalent label.
+fn target_project_name(target: &DetectedTarget) -> String {
+    target
+        .project_root
+        .as_deref()
+        .and_then(Path::file_name)
+        .or_else(|| target.path.as_deref().and_then(Path::file_name))
+        .map_or_else(
+            || target.provider.id.clone(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+}
+
+/// Keep the default table focused on location. Exact command argv and direct
+/// deletion semantics remain in the JSON representation for detailed review.
+fn target_location(scope: &Path, target: &DetectedTarget) -> String {
+    target.path.as_ref().map_or_else(
+        || {
+            target
+                .provider
+                .context
+                .clone()
+                .unwrap_or_else(|| "—".into())
+        },
+        |path| target_display_path(scope, path),
+    )
+}
+
 fn usage_display(usage: &UsageEstimate) -> (String, Option<Confidence>) {
     match usage {
         UsageEstimate::Filesystem { reclaimable, .. } => {
@@ -618,33 +616,6 @@ fn usage_display(usage: &UsageEstimate) -> (String, Option<Confidence>) {
             Some(*confidence),
         ),
         UsageEstimate::Unknown { .. } => ("unknown".into(), None),
-    }
-}
-
-fn operation_display(operation: &PlannedOperation) -> String {
-    match operation {
-        PlannedOperation::DirectDelete {
-            path,
-            children_only,
-            ..
-        } => {
-            if *children_only {
-                format!("delete children of {}", path.display())
-            } else {
-                format!("delete {}", path.display())
-            }
-        }
-        PlannedOperation::Command { command } => {
-            let mut parts = command
-                .environment
-                .iter()
-                .map(|(key, value)| format!("{key}={value:?}"))
-                .collect::<Vec<_>>();
-            parts.push(command.executable.display().to_string());
-            parts.extend(command.args.iter().map(|argument| format!("{argument:?}")));
-            parts.join(" ")
-        }
-        PlannedOperation::Informational => "informational only".into(),
     }
 }
 

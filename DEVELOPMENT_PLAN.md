@@ -241,6 +241,10 @@ disk analyzers.
 - Informational operations cannot enter a cleanup plan. Explicit-only user data
   remains unreachable by severity, and `safe` plans have conservative
   unattended limits of 100 actions or 50 GiB.
+- Default `targets` and `clean` tables prioritize reclaimable size, project
+  name, and location. Full operation argv, consequences, identities, and
+  evidence remain available in JSON without forcing narrow terminal columns to
+  wrap into unreadable multi-line rows.
 
 ### Provider inventory
 
@@ -364,9 +368,9 @@ Every detected item or action should expose, where available:
       custom/shared target directories without duplicate candidates.
 - [x] Cargo build candidates use configurable approximately 14-day artifact and
       marker activity evidence, with unknown evidence reported conservatively.
-- [x] Human and JSON Cargo plans show the resolved workspace/build directory,
-      measured interval, evidence, rebuild consequence, and exact cleanup
-      operation.
+- [x] Human Cargo plans lead with project, resolved build directory, interval,
+      age, and selection status; JSON additionally carries all evidence, the
+      rebuild consequence, and exact cleanup operation.
 - [x] Cargo parser/resolution fixtures cover a standalone crate, a multi-member
       workspace, custom `CARGO_TARGET_DIR`, a shared target directory, fresh
       output, stale output, and out-of-scope refusal. Cargo candidates reuse the
@@ -378,7 +382,8 @@ Every detected item or action should expose, where available:
 - [x] Explicit-only actions never enter a level-selected plan.
 - [x] Adversarial path tests cover normalization widening, symlink ancestors, target
       replacement metadata, mount roots, and cloud refusal.
-- [x] Human and JSON plans show the exact operation and consequence.
+- [x] Human plans show the decision-oriented project/location summary; JSON
+      shows the exact operation and consequence for detailed review or tooling.
 
 **Status: complete for the read-only Phase 2 boundary.** The implementation can
 inspect and construct fully reviewable plan data, but deliberately has no

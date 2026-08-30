@@ -151,9 +151,41 @@ fn targets_human_output_is_explicitly_read_only() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("RECLAIMABLE"));
+    assert!(stdout.contains("PROJECT"));
+    assert!(stdout.contains("LOCATION"));
     assert!(stdout.contains("cargo.target"));
     assert!(stdout.contains("read-only; no action was run"));
+    assert!(!stdout.contains("LOCATION / OPERATION"));
     assert!(!stdout.contains("\u{1b}["));
+}
+
+#[test]
+fn clean_human_output_prioritizes_project_and_location() {
+    let fixture = tempdir().unwrap();
+    fs::write(fixture.path().join("package.json"), b"{}").unwrap();
+    fs::create_dir(fixture.path().join("node_modules")).unwrap();
+    fs::write(fixture.path().join("node_modules/payload"), b"generated").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args([
+            "clean",
+            fixture.path().to_str().unwrap(),
+            "--workspace-only",
+            "--level",
+            "standard",
+            "--ignore-staleness",
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let header = stdout.lines().find(|line| line.contains("ACTION")).unwrap();
+    assert!(header.contains("RECLAIMABLE"));
+    assert!(header.contains("PROJECT"));
+    assert!(header.contains("LOCATION"));
+    assert!(!header.contains("OPERATION"));
+    assert!(!stdout.contains("delete "));
 }
 
 #[test]
