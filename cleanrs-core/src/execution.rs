@@ -495,10 +495,30 @@ fn identity_from_fd(fd: RawFd) -> io::Result<CandidateIdentity> {
 #[cfg(unix)]
 fn identity_from_stat(stat: &libc::stat) -> CandidateIdentity {
     CandidateIdentity {
-        device: stat.st_dev as u64,
+        device: stat_device(stat),
         inode: stat.st_ino,
-        kind: kind_from_mode(u32::from(stat.st_mode)),
+        kind: kind_from_mode(stat_mode(stat)),
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn stat_device(stat: &libc::stat) -> u64 {
+    stat.st_dev
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn stat_device(stat: &libc::stat) -> u64 {
+    stat.st_dev as u64
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn stat_mode(stat: &libc::stat) -> u32 {
+    stat.st_mode
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn stat_mode(stat: &libc::stat) -> u32 {
+    u32::from(stat.st_mode)
 }
 
 #[cfg(unix)]
@@ -508,12 +528,52 @@ fn kind_from_metadata(metadata: &fs::Metadata) -> NodeKind {
 
 #[cfg(unix)]
 fn kind_from_mode(mode: u32) -> NodeKind {
-    match mode & u32::from(libc::S_IFMT) {
-        value if value == u32::from(libc::S_IFREG) => NodeKind::File,
-        value if value == u32::from(libc::S_IFDIR) => NodeKind::Directory,
-        value if value == u32::from(libc::S_IFLNK) => NodeKind::Symlink,
+    match mode & mode_type_mask() {
+        value if value == regular_file_mode() => NodeKind::File,
+        value if value == directory_mode() => NodeKind::Directory,
+        value if value == symlink_mode() => NodeKind::Symlink,
         _ => NodeKind::Other,
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const fn mode_type_mask() -> u32 {
+    libc::S_IFMT
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn mode_type_mask() -> u32 {
+    u32::from(libc::S_IFMT)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const fn regular_file_mode() -> u32 {
+    libc::S_IFREG
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn regular_file_mode() -> u32 {
+    u32::from(libc::S_IFREG)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const fn directory_mode() -> u32 {
+    libc::S_IFDIR
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn directory_mode() -> u32 {
+    u32::from(libc::S_IFDIR)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const fn symlink_mode() -> u32 {
+    libc::S_IFLNK
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn symlink_mode() -> u32 {
+    u32::from(libc::S_IFLNK)
 }
 
 #[cfg(unix)]

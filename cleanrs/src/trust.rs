@@ -1,5 +1,6 @@
 //! Persistent trust for explicitly named command configuration.
 
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -144,7 +145,11 @@ impl TrustStore {
 
 pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
 }
 
 fn hash_file(path: &Path) -> Result<String> {

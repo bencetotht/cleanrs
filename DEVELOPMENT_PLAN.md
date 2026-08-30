@@ -431,6 +431,9 @@ what happened.
 - Human dry-run output ends with a context-aware tip: selected plans suggest
   `--apply`, while severity-skipped plans suggest the required level before
   reminding the user to review and apply.
+- Platform-specific `libc::stat` conversions and allocation-free digest
+  formatting keep strict workspace Clippy checks clean on macOS and Linux,
+  including the Rust 1.85 CI toolchain.
 - Fixture tests prove dry-run is inert and every destructive test operates only
   inside a unique temporary sandbox.
 
