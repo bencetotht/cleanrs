@@ -33,8 +33,8 @@ One provider may expose actions at several levels.
 
 | Level | Intended meaning | Examples |
 |---|---|---|
-| `safe` | Downloadable caches and cheap generated output with low surprise | Homebrew downloads, package-manager caches, stale build output |
-| `standard` | Broader generated state with noticeable rebuild cost | old toolchains, stopped runtime/build state, older project artifacts |
+| `safe` | Cheap generated output with low surprise and no network dependency | narrowly scoped generated caches and artifacts |
+| `standard` | Downloadable state and broader generated output with noticeable rebuild cost | package-manager caches, stopped runtime/build state, older project artifacts |
 | `aggressive` | Large unused state whose removal may disrupt a workflow | unused images, dormant environments, extensive Xcode state |
 | explicit-only | User data or unusually consequential state | Docker volumes, VM disks, repositories, unsynced project data |
 
@@ -42,13 +42,18 @@ No severity level reaches explicit-only actions. They require a named target or
 action. Scheduled application is restricted to `safe`; a scheduled broader run
 may produce a plan but must not apply it.
 
+**Correction:** an earlier version listed Homebrew downloads as a `safe`
+example. The supported native `brew cleanup` operation also removes old
+installed versions, so cleanrs initially classifies that mixed action as
+`standard`. It must not be scheduled as a `safe` download-cache-only action.
+
 ## Phase overview
 
 | Phase | Delivers | Current state |
 |---|---|---|
 | 0 | Honest safety and accounting foundation | **Practical baseline complete; deeper research deferred** |
 | 1 | Fast read-only scanner and diagnostics | **Useful MVP implemented; performance and UX work remains** |
-| 2 | Developer-storage inventory and cleanup plans | **Next priority; workspace slice implemented** |
+| 2 | Developer-storage inventory and cleanup plans | **Read-only foundation complete; execution remains Phase 3** |
 | 3 | Cleanup execution and lightweight history | **Not started; inert apply path exists** |
 | 4 | Project hygiene and stale-project intelligence | **Not started** |
 | 5 | Index, scheduling, and ratatui daily-driver UI | **Terminal groundwork only** |
@@ -195,29 +200,124 @@ disk analyzers.
 - `clean` dry-run planning, selection explanations, a deduplicated interval,
   and captured device/inode/type.
 - `clean --apply` refuses before scanning and cannot currently mutate data.
+- Unified workspace/provider inventory items with owned IDs, provider identity,
+  typed usage sources, exact direct-delete or argv-array operations,
+  consequences, evidence, and action-level minimum severity.
+- A bounded read-only provider host with canonical executable discovery,
+  subprocess timeout/output limits, and injectable command fixtures.
+- Homebrew capability detection pinned to the resolved executable, version, and
+  prefix, with routine cleanup, scrub, and autoremove represented separately.
+- Homebrew cleanup uses the native dry-run estimate instead of treating the
+  whole cache as reclaimable. Routine and scrub plans are mutually exclusive,
+  and cleanup explicitly disables implicit autoremove so plans do not widen or
+  double count.
+- `targets` and `clean` combine workspace findings with machine-wide provider
+  actions; `--workspace-only` suppresses provider inspection.
+- A resolved registry merges built-ins, the fixed user config location,
+  explicitly named config, and CLI targets by stable ID. It supports
+  enable/disable overrides, export, CLI-only mode, and never reads the working
+  directory implicitly.
+- Configured paths and marker targets are sized in the explicit scan; direct
+  deletion plans capture identity and reject a scan-root target, mount/cloud
+  hazards, and symlinked ancestors. Configured commands and ad-hoc commands are
+  argv arrays and remain plans only. Unknown fields, invalid ages, incomplete
+  detectors, and detector/operation mismatches fail closed.
+- Explicit config command targets require a per-run review acknowledgement.
+  Persistent content-hash trust is deliberately deferred until Phase 3, before
+  any configured command can execute.
+- Read-only provider baselines cover Nix; pnpm/npm/npx/Yarn/Bun;
+  uv/pip/Poetry/Conda; Cargo/rustup; Docker/OrbStack; Xcode; and CocoaPods.
+  Stateful objects and capabilities without a stable granular cleanup remain
+  informational rather than receiving a speculative command.
+- Docker enumerates local Unix-socket contexts separately, pins context and
+  endpoint, reports build cache/stopped containers/images/volumes independently,
+  skips remote contexts, and never emits a generic volume-prune plan.
+- Cargo uses bounded, frozen metadata inspection to resolve workspace roots and
+  target directories, collapses member crates by target directory, uses newest
+  manifest/build activity with a 14-day default, and plans a workspace-pinned
+  `cargo clean` only for the ordinary workspace-local target. Custom, shared,
+  and out-of-scope directories are visible but refused until ownership is
+  complete.
+- Informational operations cannot enter a cleanup plan. Explicit-only user data
+  remains unreachable by severity, and `safe` plans have conservative
+  unattended limits of 100 actions or 50 GiB.
+- Default `targets` and `clean` tables prioritize reclaimable size, project
+  name, and the complete home-relative location (including the command's scan
+  root). Full operation argv, consequences, identities, and evidence remain
+  available in JSON without forcing narrow terminal columns to wrap into
+  unreadable multi-line rows.
 
-### Provider inventory to implement
+### Provider inventory
 
 Start with tools actually present on the development Macs, then widen coverage:
 
-- Homebrew: downloads, old formula/cask versions, autoremove candidates, and
-  cleanup preview where supported.
-- Nix: store usage, roots/generations, and garbage-collection opportunities.
-- pnpm, npm/npx, Yarn, and Bun: shared caches/stores and native prune commands.
-- uv, pip, Poetry, and Conda: download caches, environments, and native cleanup
+- Homebrew (**implemented**): routine cleanup, scrub, and
+  autoremove are distinct read-only plans. More granular formula/cask reporting
+  may be added when it improves decisions without duplicating native output.
+- Nix (**implemented baseline**): plain garbage collection and old-generation
+  collection are separate severity levels; exact byte opportunity remains
+  unknown when Nix does not expose one cheaply.
+- pnpm, npm/npx, Yarn, and Bun (**implemented baseline**): shared caches/stores
+  and native supported actions; npm/npx remains informational where the
+  installed npm has no stable separate action.
+- uv, pip, Poetry, and Conda (**implemented baseline**): download caches,
+  environments, and native cleanup
   actions with environments separated from disposable caches.
-- Cargo/rustup: project targets, registry/git caches, and old toolchains.
-- Docker Desktop and OrbStack: build cache, stopped objects, images, and volumes
+- Cargo/rustup (**implemented baseline**): resolved project targets plus
+  informational registry/git-cache and toolchain inventory.
+- Docker Desktop and OrbStack (**implemented baseline**): local Docker-context
+  build cache, stopped objects, images, and volumes
   as separate actions and contexts.
-- Xcode: DerivedData, archives, device support, simulator caches, and simulator
+- Xcode (**implemented baseline**): DerivedData, archives, device support,
+  simulator caches, and simulator
   user data as different risk classes.
-- Gradle, Maven, CocoaPods, and other tools added when encountered locally.
+- CocoaPods has a native cache plan; Gradle, Maven, and other tools are added
+  when encountered locally rather than being Phase 2 exit gates.
 - VMware/other VM disks and Claude Cowork storage as informational or
   explicit-only targets, not generic caches.
 
 Each provider implements a read-only `detect`/`inspect`/`plan` path before any
 execution exists. A planned command is stored as an executable plus argv array;
 there is no shell.
+
+### Cargo build inventory — Phase 2 scope
+
+Cargo build storage is useful before the broader project-intelligence phase and
+therefore remains a Phase 2 deliverable:
+
+- Scan only explicit or configured project roots such as `~/Developer` and
+  `~/Projects`; never make the home directory an implicit search root.
+- Detect Cargo packages and workspaces, resolve the workspace root, and collapse
+  member crates that share one build directory into one candidate.
+- Resolve the effective build directory, including `CARGO_TARGET_DIR` and
+  supported Cargo configuration, rather than assuming every project uses a
+  sibling `target/`.
+- A shared target directory is eligible for a directory-wide action only when
+  every discovered owning workspace is inside inspection scope and satisfies
+  the policy. Incomplete ownership or an active owner refuses the broad action
+  instead of deleting artifacts needed by another project.
+- Record the newest meaningful build-artifact timestamp together with
+  `Cargo.toml`/workspace-marker activity. A target becomes a stale-build
+  candidate after approximately 14 days by default, configurable per target.
+  Unknown or contradictory activity evidence must be shown, not treated as
+  stale.
+- The Cargo-aware implementation uses the newest manifest or build artifact and
+  a 14-day default. If frozen metadata is unavailable, the older marker
+  detector remains a conservative fallback instead of mutating a lockfile or
+  downloading dependencies during inspection.
+- Plan one exact cleanup operation per resolved build directory. Prefer a
+  workspace-pinned `cargo clean` argv when it addresses exactly the inspected
+  directory; otherwise use the guarded direct-delete operation reserved for
+  proven workspace-local generated artifacts.
+- Treat Cargo build output as generated but potentially expensive to rebuild.
+  Staleness makes it eligible for review; it does not silently lower rebuild
+  cost or authorize deletion of the repository.
+- Report binaries, incremental state, dependencies, examples, and other
+  build-output categories when they can be attributed without double counting,
+  while keeping the cleanup action at the resolved build-directory boundary.
+- Phase 2 plans cleanup only. Actual removal remains behind Phase 3's
+  `--apply`, identity revalidation, path invariants, and sandboxed execution
+  tests.
 
 ### Target output contract
 
@@ -261,16 +361,36 @@ Every detected item or action should expose, where available:
 - [x] A dataless descendant refuses an otherwise valid `node_modules` target.
 - [x] Working-directory configuration is ignored.
 - [x] `clean --apply` is inert in this phase.
-- [ ] Homebrew, Nix, JS package managers, Python environment managers,
+- [x] Homebrew, Nix, JS package managers, Python environment managers,
       Cargo/rustup, Docker/OrbStack, and Xcode appear in inventory when present.
-- [ ] Each provider has fixture or command-output parser tests that do not
+- [x] Homebrew appears as separate cleanup, scrub, and autoremove actions with
+      provider-reported/unknown estimates and pinned command plans.
+- [x] Explicit-root Cargo inventory resolves packages, workspace members, and
+      custom/shared target directories without duplicate candidates.
+- [x] Cargo build candidates use configurable approximately 14-day artifact and
+      marker activity evidence, with unknown evidence reported conservatively.
+- [x] Human Cargo plans lead with project, resolved build directory, interval,
+      age, and selection status; JSON additionally carries all evidence, the
+      rebuild consequence, and exact cleanup operation.
+- [x] Cargo parser/resolution fixtures cover a standalone crate, a multi-member
+      workspace, custom `CARGO_TARGET_DIR`, a shared target directory, fresh
+      output, stale output, and out-of-scope refusal. Cargo candidates reuse the
+      common cloud/dataless and mount-boundary validators and their fixtures.
+- [x] Each provider has fixture or command-output parser tests that do not
       require deleting real data.
-- [ ] Severity is assigned per action; Docker build cache, images, and volumes
+- [x] Severity is assigned per action; Docker build cache, images, and volumes
       cannot collapse into one generic Docker target.
-- [ ] Explicit-only actions never enter a level-selected plan.
-- [ ] Adversarial path tests cover traversal, symlink ancestors, target
+- [x] Explicit-only actions never enter a level-selected plan.
+- [x] Adversarial path tests cover normalization widening, symlink ancestors, target
       replacement metadata, mount roots, and cloud refusal.
-- [ ] Human and JSON plans show the exact operation and consequence.
+- [x] Human plans show the decision-oriented project/location summary; JSON
+      shows the exact operation and consequence for detailed review or tooling.
+
+**Status: complete for the read-only Phase 2 boundary.** The implementation can
+inspect and construct fully reviewable plan data, but deliberately has no
+deletion or provider-command execution API. Provider-specific execution support,
+identity revalidation, persistent command-config trust, and journalling are
+Phase 3 work rather than hidden Phase 2 mutations.
 
 ---
 
@@ -345,8 +465,13 @@ risk depends on project state.
 ### Current state
 
 - Marker-based workspace detection exists for several common artifact names.
-- Cargo workspace roots, shared target directories, Git state, Python
-  environments, and project activity evidence are not implemented.
+- The Phase 2 Cargo scanner resolves workspace roots and target directories,
+  collapses members, and uses a 14-day newest-manifest/build-artifact threshold.
+- Custom/shared target directories retain observed owner evidence but are
+  conservatively refused because a single explicit scan cannot yet prove
+  complete ownership.
+- Git state, repository-level sleeper-project evidence, and individually safe
+  Python-environment recommendations are not implemented.
 
 ### Work
 
@@ -356,7 +481,19 @@ risk depends on project state.
   project contents.
 - Detect project-local `node_modules`, `.venv`, Cargo `target`, Gradle output,
   Xcode build output, and other regenerated artifacts.
-- Recognize shared/custom `CARGO_TARGET_DIR` and avoid duplicate accounting.
+- Consume and revalidate Phase 2's shared/custom `CARGO_TARGET_DIR` ownership
+  map instead of rediscovering or double-counting the same build directory.
+- Build on Phase 2's approximately 14-day Cargo build candidates with stronger
+  repository-level activity evidence: recent commits, dirty/untracked work,
+  marker changes, newest build output, worktree activity, and optional
+  ecosystem-specific signals.
+- Distinguish “stale build output” from “dormant project.” Fourteen days is an
+  artifact-cleanup threshold, not proof that a repository was abandoned.
+- Rank sleeper-project build cleanup by reclaimable size and inactivity
+  evidence, while showing which evidence caused the recommendation and which
+  evidence weakened it.
+- Allow per-root and per-project retention overrides for long-lived or
+  expensive-to-rebuild Rust projects.
 - Distinguish package-manager caches from project-local dependency copies.
 - Identify large inactive projects and worktrees as recommendations.
 - Never equate “old,” “clean,” or “pushed” with permission to delete a
@@ -370,6 +507,13 @@ risk depends on project state.
       fixtures are classified distinctly.
 - [ ] Large project-local artifacts are attributed to their project and native
       ecosystem.
+- [ ] Cargo sleeper-project recommendations combine Phase 2 build age with
+      repository activity and never label a project abandoned from mtime alone.
+- [ ] Shared Cargo build directories retain owner evidence; one dormant project
+      cannot authorize cleanup that disrupts an active or out-of-scope owner.
+- [ ] A stale Cargo build can be proposed for cleanup without proposing
+      repository deletion, including for dirty, untracked, remote-less, and
+      unpushed repository fixtures.
 - [ ] Shared cache/build directories are counted once.
 - [ ] No severity level selects repository or environment user data.
 - [ ] Recommendations explain the evidence and exact proposed action.
@@ -497,17 +641,19 @@ seams but do not constitute supported Linux behavior.
 
 Work should continue in this order:
 
-1. Define the provider/action data model and severity mapping used by
-   `targets` and `clean`.
-2. Implement read-only Homebrew and Nix detection/inspection/planning.
-3. Add pnpm/npm/Yarn/Bun and uv/pip/Poetry/Conda inventory.
-4. Add Cargo/rustup, Docker/OrbStack, and Xcode actions with risk separated per
-   action.
-5. Finish the Phase 2 path-safety and provider-context test suite.
-6. Implement Phase 3 execution for a deliberately small safe-action subset.
-7. In parallel with normal feature work, land the Phase 1 largest-file view,
+1. Design Phase 3's immutable reviewed-plan handoff, provider/filesystem
+   identity revalidation, confirmation boundary, and lightweight journal.
+2. Add persistent canonical-path plus content-hash trust before configured
+   command targets can enter any executable path.
+3. Implement Phase 3 execution for a deliberately small safe-action subset,
+   with every destructive test confined to an explicit temporary sandbox.
+4. Add replacement-race, provider-context-change, partial-failure, and journal
+   fixtures before widening the executable action set.
+5. In parallel with normal feature work, land the Phase 1 largest-file view,
    packed-record parser fixtures, and a checked-in performance baseline.
 
-The first concrete implementation task is the provider/action model plus
-Homebrew inspection and dry-run planning. It exercises the architecture with a
-real native cleanup tool while remaining read-only.
+The Phase 2 registry, provider/action inventory, Cargo build scanner, separated
+Docker/Xcode risk model, and path-safety planning suite are complete. The next
+concrete task is the smallest safe Phase 3 execution vertical slice; read-only
+plans remain the only behavior until its revalidation and journal prerequisites
+land together.

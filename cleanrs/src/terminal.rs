@@ -1,9 +1,7 @@
 //! TTY-aware human output. JSON, completions, and man pages bypass this module.
 
 use std::io::{self, IsTerminal};
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +13,7 @@ use comfy_table::{
 use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use cleanrs_core::targets::{CandidateSafety, PlanSelection, Recoverability};
+use cleanrs_core::targets::{CandidateSafety, DetectedTarget, PlanSelection, UsageEstimate};
 use cleanrs_core::{Confidence, DoctorReport, ScanObserver, ScanProgress};
 
 use crate::{CleanOutput, Metric, ScanOutput, TargetsOutput, format_interval, human_bytes};
@@ -276,12 +274,11 @@ impl TerminalUi {
         let mut targets = self.table();
         targets.set_header(vec![
             self.header("RECLAIMABLE"),
-            self.header("CONFIDENCE"),
-            self.header("CLASS"),
+            self.header("PROJECT"),
+            self.header("LOCATION"),
             self.header("AGE"),
             self.header("STATUS"),
             self.header("TARGET"),
-            self.header("PATH"),
         ]);
         for target in &output.targets {
             let age = target.age_days.map_or_else(
@@ -297,19 +294,14 @@ impl TerminalUi {
                     self.value(format!("refused: {reason}"), Color::Red)
                 }
             };
-            let class = match target.properties.recoverability {
-                Recoverability::Generated => format!("{:?}", target.class).to_lowercase(),
-                Recoverability::Downloadable => format!("{:?}", target.class).to_lowercase(),
-                Recoverability::UserData => "user data".into(),
-            };
+            let (usage, _) = usage_display(&target.usage);
             targets.add_row(vec![
-                self.value(format_interval(&target.estimate), Color::Cyan),
-                self.confidence(target.estimate.confidence),
-                Cell::new(class),
+                self.value(usage, Color::Cyan),
+                Cell::new(target_project_name(target)),
+                Cell::new(target_location(target)),
                 Cell::new(age),
                 status,
-                Cell::new(target.id),
-                Cell::new(target_display_path(&output.scope, &target.path)),
+                Cell::new(&target.id),
             ]);
         }
         println!("{targets}");
@@ -355,6 +347,7 @@ impl TerminalUi {
             self.value("read-only; no action was run", Color::Green),
         ]);
         println!("{summary}");
+        self.print_provider_statuses(&output.providers);
         if output.default_limit_applied && output.hidden > 0 {
             println!();
             println!(
@@ -376,22 +369,23 @@ impl TerminalUi {
         plan.set_header(vec![
             self.header("ACTION"),
             self.header("RECLAIMABLE"),
-            self.header("CONFIDENCE"),
+            self.header("PROJECT"),
+            self.header("LOCATION"),
             self.header("TARGET"),
-            self.header("PATH"),
             self.header("REASON"),
         ]);
         for planned in &output.targets {
             let (action, reason, color) = match &planned.selection {
-                PlanSelection::Selected => ("delete", "selected", Color::Yellow),
+                PlanSelection::Selected => ("plan", "selected", Color::Yellow),
                 PlanSelection::Skipped(reason) => ("skip", reason.as_str(), Color::DarkGrey),
             };
+            let (usage, _) = usage_display(&planned.target.usage);
             plan.add_row(vec![
                 self.value(action, color),
-                self.value(format_interval(&planned.target.estimate), Color::Cyan),
-                self.confidence(planned.target.estimate.confidence),
-                Cell::new(planned.target.id),
-                Cell::new(target_display_path(&output.scope, &planned.target.path)),
+                self.value(usage, Color::Cyan),
+                Cell::new(target_project_name(&planned.target)),
+                Cell::new(target_location(&planned.target)),
+                Cell::new(&planned.target.id),
                 Cell::new(reason),
             ]);
         }
@@ -409,8 +403,20 @@ impl TerminalUi {
             Cell::new(output.selected_targets),
         ]);
         summary.add_row(vec![
-            Cell::new("Estimated reclaimable"),
+            Cell::new("Filesystem reclaimable"),
             self.value(planned_interval, Color::Cyan),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Provider-reported reclaimable"),
+            self.value(human_bytes(output.selected_provider_reported), Color::Cyan),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Provider-reported actions"),
+            Cell::new(output.selected_provider_actions),
+        ]);
+        summary.add_row(vec![
+            Cell::new("Selected actions with unknown size"),
+            Cell::new(output.selected_unknown_actions),
         ]);
         summary.add_row(vec![
             Cell::new("Coverage"),
@@ -426,11 +432,50 @@ impl TerminalUi {
         ]);
         println!();
         println!("{summary}");
+        self.print_provider_statuses(&output.providers);
         println!();
         println!(
-            "{} Permanent execution remains disabled until the documented Phase 2 safety gates pass.",
+            "{} Permanent execution remains disabled until Phase 3 identity revalidation and journalling are implemented.",
             self.warning("NOTICE")
         );
+    }
+
+    fn print_provider_statuses(&self, statuses: &[cleanrs_core::providers::ProviderStatus]) {
+        if statuses.is_empty() {
+            return;
+        }
+        println!();
+        let inspected = statuses
+            .iter()
+            .filter(|status| status.detected)
+            .map(|status| status.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !inspected.is_empty() {
+            println!("{} {inspected}", self.muted("Providers inspected:"));
+        }
+
+        // Successful identity/context details remain available in JSON. The
+        // default terminal view only expands providers that need attention.
+        let notices = statuses
+            .iter()
+            .filter(|status| {
+                !status.detected
+                    || status.message.contains("failed")
+                    || (status.message.contains("skipped")
+                        && !status.message.contains("0 manifest(s) skipped"))
+            })
+            .collect::<Vec<_>>();
+        if !notices.is_empty() {
+            println!();
+            println!("{}", self.section("Provider notices"));
+            let mut providers = self.table();
+            providers.set_header(vec![self.header("PROVIDER"), self.header("STATUS")]);
+            for status in notices {
+                providers.add_row(vec![Cell::new(&status.id), Cell::new(&status.message)]);
+            }
+            println!("{providers}");
+        }
     }
 
     fn table(&self) -> Table {
@@ -517,14 +562,70 @@ fn display_path(root: &Path, path: &Path, depth: usize) -> String {
     format!("{}{visible}", "  ".repeat(depth.saturating_sub(1)))
 }
 
-fn target_display_path(scope: &Path, path: &Path) -> String {
-    path.strip_prefix(scope)
-        .ok()
-        .filter(|relative| !relative.as_os_str().is_empty())
+fn target_display_path(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    home_relative_display(path, home.as_deref())
+}
+
+fn home_relative_display(path: &Path, home: Option<&Path>) -> String {
+    let Some(home) = home else {
+        return path.display().to_string();
+    };
+    path.strip_prefix(home).map_or_else(
+        |_| path.display().to_string(),
+        |relative| {
+            if relative.as_os_str().is_empty() {
+                "~".into()
+            } else {
+                format!("~/{}", relative.display())
+            }
+        },
+    )
+}
+
+/// Use the owning workspace name as the primary human identifier. Provider
+/// actions have no project root, so their stable provider name is the clearest
+/// equivalent label.
+fn target_project_name(target: &DetectedTarget) -> String {
+    target
+        .project_root
+        .as_deref()
+        .and_then(Path::file_name)
+        .or_else(|| target.path.as_deref().and_then(Path::file_name))
         .map_or_else(
-            || path.display().to_string(),
-            |relative| format!("./{}", relative.display()),
+            || target.provider.id.clone(),
+            |name| name.to_string_lossy().into_owned(),
         )
+}
+
+/// Keep the default table focused on location. Exact command argv and direct
+/// deletion semantics remain in the JSON representation for detailed review.
+fn target_location(target: &DetectedTarget) -> String {
+    target.path.as_ref().map_or_else(
+        || {
+            target
+                .provider
+                .context
+                .clone()
+                .unwrap_or_else(|| "—".into())
+        },
+        |path| target_display_path(path),
+    )
+}
+
+fn usage_display(usage: &UsageEstimate) -> (String, Option<Confidence>) {
+    match usage {
+        UsageEstimate::Filesystem { reclaimable, .. } => {
+            (format_interval(reclaimable), Some(reclaimable.confidence))
+        }
+        UsageEstimate::ProviderReported {
+            bytes, confidence, ..
+        } => (
+            bytes.map_or_else(|| "unknown".into(), human_bytes),
+            Some(*confidence),
+        ),
+        UsageEstimate::Unknown { .. } => ("unknown".into(), None),
+    }
 }
 
 /// An indeterminate spinner backed by the scanner's monotonic counters.
@@ -595,5 +696,16 @@ mod tests {
     fn counts_have_grouping() {
         assert_eq!(grouped(12), "12");
         assert_eq!(grouped(12_345_678), "12,345,678");
+    }
+
+    #[test]
+    fn target_paths_keep_the_command_root_in_home_relative_form() {
+        let home = Path::new("/Users/test");
+        let target = Path::new("/Users/test/Developer/Projects/example/target");
+        assert_eq!(
+            home_relative_display(target, Some(home)),
+            "~/Developer/Projects/example/target"
+        );
+        assert_eq!(home_relative_display(home, Some(home)), "~");
     }
 }
