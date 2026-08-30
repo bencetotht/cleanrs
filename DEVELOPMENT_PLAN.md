@@ -434,6 +434,9 @@ what happened.
 - Platform-specific `libc::stat` conversions and allocation-free digest
   formatting keep strict workspace Clippy checks clean on macOS and Linux,
   including the Rust 1.85 CI toolchain.
+- Cargo-provider execution uses a deterministic provider stub in tests that
+  records the exact reviewed argv and refuses deletion outside its temporary
+  target, avoiding host Cargo/rustup coupling on Linux CI runners.
 - Fixture tests prove dry-run is inert and every destructive test operates only
   inside a unique temporary sandbox.
 

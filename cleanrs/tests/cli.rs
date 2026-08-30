@@ -404,9 +404,12 @@ fn clean_apply_deletes_only_the_selected_sandbox_artifact_and_journals_it() {
 }
 
 #[test]
+#[cfg(unix)]
 fn cargo_provider_command_revalidates_and_cleans_only_the_fixture_target() {
     let fixture = tempdir().unwrap();
     let scope = fixture.path().canonicalize().unwrap();
+    let fake_cargo_bin = install_fake_cargo(&scope);
+    let command_log = scope.join("cargo-command.log");
     fs::create_dir(scope.join("src")).unwrap();
     fs::write(
         scope.join("Cargo.toml"),
@@ -421,7 +424,8 @@ fn cargo_provider_command_revalidates_and_cleans_only_the_fixture_target() {
     fs::write(scope.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
     fs::create_dir(scope.join("target")).unwrap();
     fs::write(scope.join("target/generated"), b"generated").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cleanrs"));
+    command
         .args([
             "clean",
             scope.to_str().unwrap(),
@@ -437,11 +441,14 @@ fn cargo_provider_command_revalidates_and_cleans_only_the_fixture_target() {
         ])
         .env("HOME", &scope)
         .env("XDG_STATE_HOME", scope.join("state"))
-        .output()
-        .unwrap();
+        .env("PATH", fake_cargo_bin)
+        .env("FAKE_CARGO_LOG", &command_log)
+        .env("FAKE_CARGO_ALLOWED_TARGET", scope.join("target"));
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
-        "{}",
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!scope.join("target").exists());
@@ -449,6 +456,69 @@ fn cargo_provider_command_revalidates_and_cleans_only_the_fixture_target() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["results"][0]["result"]["status"], "success");
     assert_eq!(json["targets"][0]["operation"]["method"], "command");
+    assert_eq!(
+        fs::read_to_string(command_log).unwrap(),
+        format!(
+            "clean\n--frozen\n--manifest-path\n{}\n--target-dir\n{}\n",
+            scope.join("Cargo.toml").display(),
+            scope.join("target").display()
+        )
+    );
+}
+
+#[cfg(unix)]
+fn install_fake_cargo(root: &std::path::Path) -> std::path::PathBuf {
+    let bin = root.join("cargo-bin");
+    fs::create_dir(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    fs::write(
+        &cargo,
+        r#"#!/bin/sh
+set -eu
+
+case "${1-}" in
+  --version)
+    echo "cargo 1.85.0 (cleanrs fixture)"
+    ;;
+  metadata)
+    manifest=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--manifest-path" ]; then
+        manifest="$2"
+        shift 2
+      else
+        shift
+      fi
+    done
+    root=${manifest%/Cargo.toml}
+    printf '{"workspace_root":"%s","target_directory":"%s/target"}\n' "$root" "$root"
+    ;;
+  clean)
+    printf '%s\n' "$@" > "$FAKE_CARGO_LOG"
+    target=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--target-dir" ]; then
+        target="$2"
+        shift 2
+      else
+        shift
+      fi
+    done
+    [ "$target" = "$FAKE_CARGO_ALLOWED_TARGET" ] || exit 64
+    /bin/rm -- "$target/generated"
+    /bin/rmdir -- "$target"
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&cargo).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&cargo, permissions).unwrap();
+    bin
 }
 
 #[cfg(unix)]
