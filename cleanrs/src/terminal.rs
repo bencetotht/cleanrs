@@ -433,6 +433,29 @@ impl TerminalUi {
         println!();
         println!("{summary}");
         self.print_provider_statuses(&output.providers);
+        if output.execution.starts_with("dry-run") {
+            println!();
+            if output.selected_targets > 0 {
+                println!(
+                    "{} This was a dry run. Add {} to execute the reviewed plan.",
+                    self.muted("TIP"),
+                    self.warning("--apply")
+                );
+            } else if let Some(level) = required_cleanup_level(&output.targets) {
+                println!(
+                    "{} No actions were selected. Try {}, review the plan, then add {}.",
+                    self.muted("TIP"),
+                    self.warning(&format!("--level {level}")),
+                    self.warning("--apply")
+                );
+            } else {
+                println!(
+                    "{} No actions were selected. Adjust the filters or level, review again, then add {}.",
+                    self.muted("TIP"),
+                    self.warning("--apply")
+                );
+            }
+        }
     }
 
     pub(crate) fn print_apply_results(&self, output: &CleanOutput) {
@@ -578,6 +601,24 @@ impl TerminalUi {
             text.to_owned()
         }
     }
+}
+
+fn required_cleanup_level(
+    targets: &[cleanrs_core::targets::PlannedTarget],
+) -> Option<&'static str> {
+    let mut required = None;
+    for planned in targets {
+        let PlanSelection::Skipped(reason) = &planned.selection else {
+            continue;
+        };
+        if reason.contains("requires aggressive cleanup level") {
+            return Some("aggressive");
+        }
+        if reason.contains("requires standard cleanup level") {
+            required = Some("standard");
+        }
+    }
+    required
 }
 
 fn optional_bytes(value: Option<u64>, absent: &str, ui: &TerminalUi) -> Cell {

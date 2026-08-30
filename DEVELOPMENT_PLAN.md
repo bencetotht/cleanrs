@@ -428,6 +428,9 @@ what happened.
 - `history` reports successes, failures, skipped planning decisions, validation
   aborts, exact argv, estimates, removed allocation, provider-reported output,
   exit status, and concise output/error evidence.
+- Human dry-run output ends with a context-aware tip: selected plans suggest
+  `--apply`, while severity-skipped plans suggest the required level before
+  reminding the user to review and apply.
 - Fixture tests prove dry-run is inert and every destructive test operates only
   inside a unique temporary sandbox.
 
