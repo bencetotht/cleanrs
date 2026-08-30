@@ -21,7 +21,7 @@ console = "0.15"
 crossbeam-channel = "0.5"
 # 0.4.20 raised its MSRV to Rust 1.88. Keep the workspace's declared Rust
 # 1.85 support until cleanrs deliberately raises its own MSRV.
-globset = "=0.4.19"
+globset = "=0.4.20"
 indicatif = "0.17"
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
