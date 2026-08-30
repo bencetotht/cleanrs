@@ -295,6 +295,7 @@ fn clean_safe_level_explains_why_network_targets_are_skipped() {
             "clean",
             fixture.path().to_str().unwrap(),
             "--ignore-staleness",
+            "--workspace-only",
             "--json",
         ])
         .output()
@@ -459,4 +460,254 @@ fn clean_deduplicates_overlapping_homebrew_cleanup_modes() {
         .find(|target| target["id"] == "homebrew.cleanup.scrub")
         .unwrap();
     assert_eq!(scrub["selection"]["status"], "selected");
+}
+
+#[test]
+fn explicit_config_adds_a_scoped_path_target() {
+    let fixture = tempdir().unwrap();
+    let artifact = fixture.path().join("generated");
+    fs::create_dir(&artifact).unwrap();
+    fs::write(artifact.join("payload"), b"generated").unwrap();
+    let config = fixture.path().join("targets.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"[[target]]
+id = "custom.generated"
+description = "fixture generated output"
+detect = {{ path = {:?} }}
+class = "free"
+reclaim = {{ method = "delete" }}
+stale_after = "0d"
+"#,
+            artifact.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args([
+            "targets",
+            fixture.path().to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--no-builtin-targets",
+            "--json",
+        ])
+        .env("HOME", fixture.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["targets"][0]["id"], "custom.generated");
+    assert_eq!(json["targets"][0]["operation"]["method"], "direct_delete");
+    assert!(
+        artifact.exists(),
+        "registry inspection must remain read-only"
+    );
+}
+
+#[test]
+fn configured_path_normalization_cannot_widen_to_the_scan_root() {
+    let fixture = tempdir().unwrap();
+    let physical_root = fixture.path().canonicalize().unwrap();
+    let nested = physical_root.join("project/generated");
+    fs::create_dir_all(&nested).unwrap();
+    let config = fixture.path().join("targets.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"[[target]]
+id = "custom.widened"
+detect = {{ path = {:?} }}
+class = "free"
+reclaim = {{ method = "delete" }}
+"#,
+            nested.join("../..").display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args([
+            "targets",
+            physical_root.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--no-builtin-targets",
+            "--json",
+        ])
+        .env("HOME", &physical_root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let reason = json["targets"][0]["safety"]["reason"].as_str().unwrap();
+    assert!(reason.contains("scan root"), "unexpected refusal: {reason}");
+}
+
+#[test]
+fn explicit_config_command_requires_a_per_run_trust_decision() {
+    let fixture = tempdir().unwrap();
+    let config = fixture.path().join("targets.toml");
+    fs::write(
+        &config,
+        r#"[[target]]
+id = "custom.command"
+detect = { command = "echo" }
+class = "free"
+reclaim = { method = "run", argv = ["echo", "never executed"] }
+"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args([
+            "targets",
+            fixture.path().to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--no-builtin-targets",
+            "--json",
+        ])
+        .env("HOME", fixture.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--trust-config-commands"));
+}
+
+#[test]
+fn config_rejects_unknown_fields_and_detector_operation_mismatches() {
+    let fixture = tempdir().unwrap();
+    let unknown = fixture.path().join("unknown.toml");
+    fs::write(
+        &unknown,
+        r#"[[target]]
+id = "custom.typo"
+detect = { path = ".", exsits = true }
+class = "free"
+reclaim = { method = "delete" }
+"#,
+    )
+    .unwrap();
+    let unknown_output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args([
+            "targets",
+            fixture.path().to_str().unwrap(),
+            "--config",
+            unknown.to_str().unwrap(),
+            "--no-builtin-targets",
+        ])
+        .env("HOME", fixture.path())
+        .output()
+        .unwrap();
+    assert!(!unknown_output.status.success());
+    assert!(String::from_utf8_lossy(&unknown_output.stderr).contains("unknown field"));
+
+    let mismatch = fixture.path().join("mismatch.toml");
+    fs::write(
+        &mismatch,
+        r#"[[target]]
+id = "custom.mismatch"
+detect = { command = "echo" }
+class = "free"
+reclaim = { method = "run", argv = ["printf", "never executed"] }
+"#,
+    )
+    .unwrap();
+    let mismatch_output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args([
+            "targets",
+            fixture.path().to_str().unwrap(),
+            "--config",
+            mismatch.to_str().unwrap(),
+            "--trust-config-commands",
+            "--no-builtin-targets",
+        ])
+        .env("HOME", fixture.path())
+        .output()
+        .unwrap();
+    assert!(!mismatch_output.status.success());
+    assert!(String::from_utf8_lossy(&mismatch_output.stderr).contains("exact detected command"));
+}
+
+#[test]
+fn cli_command_target_preserves_json_argv_without_executing_it() {
+    let fixture = tempdir().unwrap();
+    let marker = fixture.path().join("must-not-exist");
+    let argv = serde_json::to_string(&vec![
+        "/usr/bin/touch".to_string(),
+        marker.display().to_string(),
+    ])
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args([
+            "targets",
+            fixture.path().to_str().unwrap(),
+            "--no-builtin-targets",
+            "--target-argv",
+            &argv,
+            "--json",
+        ])
+        .env("HOME", fixture.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["targets"][0]["operation"]["command"]["args"][0],
+        marker.display().to_string()
+    );
+    assert!(
+        !marker.exists(),
+        "planned argv must never execute in Phase 2"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn configured_path_with_symlinked_ancestor_is_refused() {
+    let fixture = tempdir().unwrap();
+    let real = fixture.path().join("real/generated");
+    fs::create_dir_all(&real).unwrap();
+    let link = fixture.path().join("linked");
+    std::os::unix::fs::symlink(fixture.path().join("real"), &link).unwrap();
+    let config = fixture.path().join("targets.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"[[target]]
+id = "custom.symlink"
+detect = {{ path = {:?} }}
+class = "free"
+reclaim = {{ method = "delete" }}
+"#,
+            link.join("generated").display().to_string()
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args([
+            "targets",
+            fixture.path().to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--no-builtin-targets",
+            "--json",
+        ])
+        .env("HOME", fixture.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        json["targets"][0]["safety"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("symlinked ancestor")
+    );
 }

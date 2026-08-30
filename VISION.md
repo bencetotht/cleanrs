@@ -1,7 +1,7 @@
 # cleanrs — Vision & Design
 
-> **Status:** design reference with Phase 0/1 implementation and read-only
-> Phase 2 workspace plus Homebrew inventory/planning slices in progress.
+> **Status:** design reference with Phase 0/1 implementation and the read-only
+> Phase 2 inventory/planning foundation implemented.
 > Empirical results and unresolved gates are tracked in
 > [docs/findings-phase0.md](docs/findings-phase0.md). This file remains the
 > reference for what cleanrs is, why it exists, and how it should be built.
@@ -489,24 +489,29 @@ download-cache-only `safe` action.
 
 ## 7. Providers
 
-The commands below are an initial provider backlog. Homebrew inspection and
-planning were verified against the installed Homebrew 6.0.18 command surface on
-2026-08-28; the remaining entries still require provider-specific validation.
+The commands below began as the provider backlog. Phase 2 now implements
+read-only detection, inspection, and planning for the developer-tool providers
+listed here and in §7.3. A declared plan is not yet an executable capability:
+Phase 3 must revalidate each provider command and context before enabling even a
+small supported subset.
 
 | Provider | Starting point | Known complications |
 |---|---|---|
 | Homebrew | `brew cleanup --dry-run`; `brew autoremove --dry-run` | Implemented as distinct routine cleanup, scrub, and autoremove actions. Cleanup is run with implicit autoremove disabled; routine and scrub are mutually exclusive. |
-| Docker build cache | `docker builder prune` | Addresses the *selected* builder; Buildx supports multiple builders, each with its own cache. Age and max-space filters (`--filter until=`, `--keep-storage`) are far better for routine cleanup than unfiltered prune. |
-| Docker images | `docker image prune` | `-a` can trigger very large future downloads; must not be presented as a generic safe action. |
-| Docker volumes | — | **`user_data`.** Never automated. |
-| Nix | `nix-collect-garbage` | `-d` additionally deletes old generations and destroys rollback capability. Plain GC and `-d` belong at different levels. |
-| Cargo | `cargo clean` / `cargo sweep` | Must resolve workspace roots and honour shared or custom `CARGO_TARGET_DIR`; a member crate inside a workspace must not trigger a duplicate clean of the same directory. |
-| Xcode simulators | `xcrun simctl delete unavailable` | Distinguish unavailable runtimes from in-use devices. |
-| OrbStack | Docker CLI pinned to the OrbStack context; OrbStack CLI for Linux machines | The Docker engine, OrbStack Linux machines, and OrbStack's host-side sparse storage are different resources. Docker volumes and machine disks are user data. Never delete OrbStack's backing files directly. |
+| Docker build cache | `docker builder prune --filter until=336h` | Implemented per local Unix-socket context, with context and endpoint pinned. Provider-reported engine bytes do not imply host sparse-image reclamation. |
+| Docker images / stopped containers | object-specific Docker prune commands | Implemented as separate actions; image cleanup is aggressive and never folded into build-cache cleanup. |
+| Docker volumes | informational inventory only | **`user_data`.** No generic volume-prune plan is emitted, even when named. |
+| Nix | `nix-collect-garbage` | Implemented with plain GC at standard and `-d` at aggressive because the latter also destroys old generations and rollback capability. |
+| Cargo | frozen `cargo metadata` plus workspace-pinned `cargo clean` | Implemented for explicit scan roots. Workspace members collapse by resolved target directory; custom/shared or out-of-scope directories are shown but refused until ownership is complete. |
+| Xcode | known developer paths plus `xcrun simctl delete unavailable` | Implemented with whole-cache DerivedData explicit-ID-only because rebuild cost can be high, archives/device support/simulator data protected or informational, and unavailable simulators separate. |
+| OrbStack | Docker context inventory plus OrbStack machine inventory | Docker actions are pinned to the OrbStack context; Linux machine disks remain informational user data. Never delete OrbStack backing files directly. |
 | Docker Desktop | Docker CLI pinned to the Docker Desktop context; Desktop-supported reset/uninstall flows for decommissioning | A currently inactive context can still contain named volumes and container writable layers. “Stale installation” is not proof that its VM disk is disposable. |
-| pnpm | `pnpm store path`, `pnpm store prune`; cache commands where supported | Store and metadata/dlx cache are distinct. Store pruning removes unreferenced packages but can cause later downloads; current cache commands are experimental and must be capability-detected. |
-| npm / npx | `npm config get cache`, `npm cache verify`, `npm cache npx ls/rm`; full clean only when confirmed | `verify` garbage-collects unneeded cache entries. Full cache removal requires force and future downloads; npx entries can be inspected and removed separately on current npm. |
-| Bun | `bun pm cache`, `bun pm cache rm` | The cache path is configurable. Bun uses APFS clones for installs on macOS, so selected cache bytes and host-reclaimed bytes may differ. |
+| pnpm | `pnpm store path`, `pnpm store prune` | Implemented as a network-restored standard action. Experimental cache commands are not assumed. |
+| npm / npx | `npm config get cache`, `npm cache verify` | Cache verification/GC is implemented. The separate npx cache is informational because the installed capability is not stable enough to plan. |
+| Yarn / Bun | native cache-clean commands | Implemented as separate network-restored actions. Yarn detection deliberately does not invoke a Corepack shim that could download a tool merely to answer `--version`; Bun clone sharing remains a reclamation caveat. |
+| Python managers | uv prune/clean, pip purge, Poetry cache, Conda dry-run/clean | Implemented with cache actions separate from Poetry/Conda environments, which remain informational user data. |
+| Cargo / rustup shared state | registry/git cache and installed toolchain inventory | Informational until stable granular native cleanup and individual toolchain selection are available. |
+| CocoaPods | `pod cache clean --all` | Implemented as a network-restored standard action. |
 | VMware Fusion | Inspect `.vmwarevm` bundles; direct the user to Fusion's snapshot and disk-cleanup operations | A bundle is user data. Never delete `.vmdk`, snapshot, suspend, or lock files individually. Snapshot consolidation can require substantial temporary free space. |
 | Claude Cowork VM | Inspect Claude's `vm_bundles` as an application-owned VM | The bundle may contain persistent Cowork/session state and there is no documented stable cleanup API. Report it separately; any reset/removal starts as explicit-target-only and requires Claude to be stopped plus a provider-version capability check. |
 | macOS wallpaper cache | Version- and schema-validated direct-cache provider | Generated BMP renditions can be enormous, but source wallpapers must be distinguished from generated cache. Start as confirmed-only until regeneration and safe quiescing are validated on supported macOS versions. |
@@ -707,6 +712,15 @@ Rules:
    string form is ever parsed into arguments, in configuration or on the
    command line.
 
+**Phase 2 implementation boundary:** the implicit user config is trusted by its
+fixed user-owned location. An explicitly named config containing a command
+target is rejected unless that invocation also supplies
+`--trust-config-commands`; no configured command can execute in Phase 2.
+Persistent canonical-path plus content-hash trust is intentionally deferred to
+Phase 3 and is required before configured command execution is enabled. This
+corrects the earlier implication that the persistent trust store already had to
+exist for read-only plan construction.
+
 Resolution order, later overriding earlier by `id`:
 
 1. Embedded default manifest.
@@ -723,7 +737,7 @@ Resolution order, later overriding earlier by `id`:
 | `id` | Stable identifier, e.g. `xcode.derived-data`. Used by `--only` / `--exclude`. |
 | `detect` | An existing path, a marker file found by scan, or an available command. |
 | `class` | Shorthand expanding to the §6.1 properties. |
-| `recoverability`, `rebuild_cost`, `network_required`, `automation` | Optional overrides. |
+| `recoverability`, `rebuild_cost`, `network_required`, `automation` | Future optional overrides; Phase 2 expands `class` atomically instead. |
 | `reclaim` | `delete` (with `children_only`) or `run` (an argv array). |
 | `stale_after` | Minimum age before eligibility. |
 | `scope` | Roots to search, for marker-based targets. |
@@ -733,9 +747,8 @@ Resolution order, later overriding earlier by `id`:
 ```toml
 [[target]]
 id = "xcode.derived-data"
-detect = { path = "~/Library/Developer/Xcode/DerivedData", exists = true }
-class = "free"
-rebuild_cost = "high"          # override: full rebuilds are not trivial
+detect = { path = "~/Library/Developer/Xcode/DerivedData" }
+class = "expensive"
 reclaim = { method = "delete", children_only = true }
 stale_after = "14d"
 
@@ -750,8 +763,7 @@ stale_after = "30d"
 [[target]]
 id = "docker.build-cache"
 detect = { command = "docker" }
-class = "cheap"
-network_required = true        # override: rebuilds may re-pull layers
+class = "network"
 reclaim = { method = "run", argv = ["docker", "builder", "prune", "-f"] }
 ```
 
@@ -767,9 +779,11 @@ cleanrs clean --target '~/Downloads/sdks:expensive:delete' --level aggressive
 ```
 
 Grammar: `PATH:CLASS[:METHOD]`, `METHOD` ∈ {`delete`, `delete-children`}. Paths
-containing `:` must use the long form.
+containing `:` must currently use a configuration file.
 
-The long form covers everything the configuration file can express:
+An expanded flag-per-field long form remains a future ergonomics improvement;
+Phase 2 uses `--config` for marker declarations. It does not currently accept
+the following aspirational form:
 
 ```
 cleanrs clean \
@@ -785,11 +799,12 @@ Command targets are given as an explicit argv array, never a shell string:
 
 ```
 cleanrs clean \
-  --target-argv '["docker","builder","prune","--filter","until=168h"]' \
-  --target-class cheap \
-  --target-requires docker \
-  --apply
+  --target-argv '["docker","builder","prune","--filter","until=168h"]'
 ```
+
+Phase 2 assigns ad-hoc command targets the `cheap` class; use a config target
+when another class, stable ID, or detector is required. `--apply` still refuses
+before inspection, so this only constructs a plan.
 
 The trust boundary in §9.1 concerns *files*, not what the user types. A command
 the user enters at their own prompt is theirs; the JSON array form exists to

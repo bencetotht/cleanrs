@@ -2,13 +2,14 @@
 
 Storage usage analyzer and cleaner for developers, written in Rust. Fully transparent.
 
-> **Status: practical filesystem baseline, read-only MVP, and Phase 2 provider work.** The read-only `scan`,
-> `doctor`, workspace/provider `targets`, and dry-run `clean` planning
-> commands are implemented. Homebrew cleanup, scrub, and autoremove are the
-> first native provider actions.
-> The next priority is widening developer-tool inventory and native cleanup planning;
-> deeper snapshot and File Provider research is deferred unless it enables a
-> concrete capability. See
+> **Status: practical filesystem baseline and complete read-only Phase 2
+> planning foundation.** The read-only `scan`, `doctor`, workspace/provider
+> `targets`, and dry-run `clean` commands are implemented. The target registry,
+> developer-tool providers, Docker context inventory, Xcode known paths, and
+> Cargo workspace build scanner all produce reviewable plans but cannot execute
+> them. The next priority is Phase 3's deliberately small, guarded execution
+> subset; deeper snapshot and File Provider research is deferred unless it
+> enables a concrete capability. See
 > [the findings](docs/findings-phase0.md), [VISION.md](VISION.md), and the
 > explicit progress boundary in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
 
@@ -139,9 +140,38 @@ Targets live in `~/.config/cleanrs/targets.toml`, or can be defined entirely on
 the command line — no config file is required:
 
 ```
-cleanrs clean --target '~/Library/Developer/Xcode/DerivedData:free:delete-children'
-cleanrs clean --level standard --apply
+cleanrs targets . --target '~/Library/Developer/Xcode/DerivedData:free:delete-children'
+cleanrs clean . --target-argv '["/absolute/tool", "cache", "prune"]'
+cleanrs targets --export
 ```
+
+`--target` uses `PATH:CLASS[:delete|delete-children]`; `--target-argv` is a JSON
+argv array and is never parsed by a shell. `--targets-only-cli` ignores both
+built-ins and config files, while `--no-builtin-targets` retains configured and
+CLI targets. The implicit config location is only
+`~/.config/cleanrs/targets.toml`; another file must be named with `--config`.
+Explicit config files containing commands require the per-run
+`--trust-config-commands` acknowledgement after review. Phase 3 will replace
+that acknowledgement with content-hash-backed persistent trust before any
+configured command can execute.
+
+```toml
+disable = ["docker.images"]
+
+[[target]]
+id = "workspace.coverage"
+description = "generated test coverage"
+detect = { marker = "Cargo.toml", dir = "coverage" }
+class = "free"
+reclaim = { method = "delete" }
+stale_after = "14d"
+scope = ["~/Developer"]
+```
+
+The TOML schema rejects unknown fields, incomplete detectors, invalid age
+values, and mismatched detector/operation pairs. A command target must use
+`reclaim = { method = "run", argv = [...] }`, and its first argv element must
+exactly match `detect.command`.
 
 ## Platform
 
@@ -169,13 +199,13 @@ path explanations, shell completions, and a generated man page are available in
 `cleanrs --help`. No deletion or provider-execution path exists yet.
 
 `targets` also defaults its workspace scan to the current directory rather than
-the home directory. It combines marker-scoped Cargo and Node.js build artifacts
-with machine-wide provider inventory,
+the home directory. It combines marker-scoped Node.js artifacts, Cargo-aware
+workspace builds, configured targets, and machine-wide provider inventory;
 deduplicates candidates, applies staleness policy, and displays the same honest
 reclaimability intervals. `--workspace-only` skips provider inspection.
 Candidate-level cloud/dataless and mount-boundary
-checks can refuse a finding without hiding it. Configuration, the remaining
-providers, and the full known-location catalog remain Phase 2 work.
+checks can refuse a finding without hiding it. Configured paths additionally
+refuse symlinked ancestors and paths that escape the explicit scan scope.
 Targets nested beneath an already detected artifact root are collapsed, so
 package metadata inside `node_modules` does not flood or double-count the
 result. Human output is sorted by reclaimable ceiling and shows the largest 25
@@ -190,11 +220,37 @@ routine and scrub estimates are never added together. Ordinary Homebrew cleanup
 starts at `standard` because the native operation mixes stale downloads with old
 installed versions, while scrub starts at `aggressive`.
 
+The provider inventory also covers Nix; pnpm, npm/npx, Yarn, and Bun; uv, pip,
+Poetry, and Conda; Cargo and rustup; CocoaPods; Docker and OrbStack; and Xcode.
+Each action has its own stable ID, severity, consequence, provider identity,
+and exact argv when a supported native action exists. Unsupported or stateful
+objects—npm's separate npx cache, Python environments, Rust toolchains and
+shared Cargo caches, OrbStack machines, Docker volumes, Xcode archives/device
+support/simulator data—remain informational. Whole-cache Xcode DerivedData is
+generated but high-cost and enters a plan only when its stable ID is named.
+Docker inspects local Unix-socket
+contexts separately, pins both context name and endpoint, skips remote contexts,
+and never combines build cache, stopped containers, images, and volumes into a
+generic prune.
+
+For Rust projects, Cargo metadata is queried with `--frozen --no-deps` for at
+most 256 manifests under the explicit scan root. Workspace members sharing a
+target directory collapse into one candidate. Activity is the newest
+`Cargo.toml` or build-artifact timestamp, with 14 days as the default stale
+threshold; `--cargo-stale-after DAYS` changes it for one inspection. A
+workspace-local `target/` receives an exact, workspace-pinned
+`cargo clean --frozen --manifest-path ... --target-dir ...` plan. Custom,
+shared, or out-of-scope target directories are still shown but refused until
+complete ownership can be proven; source repositories are never cleanup
+targets.
+
 `clean` uses the same explicit workspace scan, candidate safety checks, and
 provider inspection, then explains which actions the selected cleanup level and
 staleness policy would include. It records direct-delete candidates' device,
 inode, and type in preparation for the Phase 3 replacement check and pins
-provider plans to an executable/version/context. Dry-run is the only available
+provider plans to an executable/version/context. Informational findings cannot
+enter a plan, explicit-only/user-data actions require a named ID, and unattended
+safe plans are capped at 100 actions or 50 GiB. Dry-run is the only available
 mode: `--apply`
 refuses before scanning, and tests verify that neither form alters fixture data.
 Use `--ignore-staleness` only when intentionally reviewing currently active

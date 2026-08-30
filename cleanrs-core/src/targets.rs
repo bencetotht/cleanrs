@@ -8,13 +8,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::accounting::{Confidence, ReclaimEstimate, estimate_subtree};
 use crate::fs::{Arena, NodeFlags, NodeIndex, NodeKind, ScanResult};
 
 /// User-facing shorthand for a target's independent safety properties.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TargetClass {
     Free,
@@ -25,7 +25,7 @@ pub enum TargetClass {
 }
 
 /// How removed data can be recovered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Recoverability {
     Generated,
@@ -34,7 +34,7 @@ pub enum Recoverability {
 }
 
 /// Expected cost of reconstructing a target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RebuildCost {
     Trivial,
@@ -43,7 +43,7 @@ pub enum RebuildCost {
 }
 
 /// Whether a future execution may proceed without interactive confirmation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Automation {
     Unattended,
@@ -52,7 +52,7 @@ pub enum Automation {
 }
 
 /// Expanded safety policy carried by every resolved target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetProperties {
     pub recoverability: Recoverability,
     pub rebuild_cost: Option<RebuildCost>,
@@ -100,7 +100,7 @@ impl TargetClass {
 }
 
 /// Cleanup intensity used by the `clean` planner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CleanupLevel {
     Safe,
@@ -131,7 +131,9 @@ impl CleanupLevel {
     /// named explicitly; increasing the level never weakens that invariant.
     #[must_use]
     pub fn selects(self, properties: TargetProperties, explicitly_named: bool) -> bool {
-        if properties.recoverability == Recoverability::UserData {
+        if properties.recoverability == Recoverability::UserData
+            || matches!(properties.automation, Automation::ExplicitTargetOnly)
+        {
             return explicitly_named;
         }
         match self {
@@ -275,7 +277,7 @@ pub const BUILTIN_TARGETS: &[TargetDefinition] = &[
         },
         class: TargetClass::Cheap,
         rebuild_cost_override: Some(RebuildCost::High),
-        stale_after_days: 30,
+        stale_after_days: 14,
         children_only: false,
     },
     TargetDefinition {
@@ -390,6 +392,11 @@ pub fn plan_cleanup(
                 CandidateSafety::Refused(reason) => {
                     PlanSelection::Skipped(format!("safety refusal: {reason}"))
                 }
+                CandidateSafety::Eligible
+                    if matches!(&target.operation, PlannedOperation::Informational) =>
+                {
+                    PlanSelection::Skipped("informational only; no cleanup operation".into())
+                }
                 CandidateSafety::Eligible if !level.reaches(target.minimum_level) => {
                     PlanSelection::Skipped(
                         format!("requires {:?} cleanup level", target.minimum_level).to_lowercase(),
@@ -446,6 +453,28 @@ pub fn plan_cleanup(
             item.selection = PlanSelection::Skipped(format!("superseded by {winner}"));
         }
     }
+    if level == CleanupLevel::Safe {
+        const MAX_UNATTENDED_TARGETS: usize = 100;
+        const MAX_UNATTENDED_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+        let selected_count = planned
+            .iter()
+            .filter(|item| matches!(item.selection, PlanSelection::Selected))
+            .count();
+        let selected_bytes = planned
+            .iter()
+            .filter(|item| matches!(item.selection, PlanSelection::Selected))
+            .map(|item| item.target.usage.sortable_bytes())
+            .fold(0_u64, u64::saturating_add);
+        if selected_count > MAX_UNATTENDED_TARGETS || selected_bytes > MAX_UNATTENDED_BYTES {
+            for item in &mut planned {
+                if matches!(item.selection, PlanSelection::Selected) {
+                    item.selection = PlanSelection::Skipped(
+                        "unattended plan exceeds the conservative count/byte limit".into(),
+                    );
+                }
+            }
+        }
+    }
     planned
 }
 
@@ -490,7 +519,16 @@ pub fn detect_workspace_targets(
 
             let project_root = scan.arena.path(project);
             let path = scan.arena.path(candidate);
-            let age_days = modified_age_days(&scan.arena, candidate, now);
+            let age_days = if definition.id == "cargo.target" {
+                cargo_activity_age_days(
+                    &scan.arena,
+                    candidate,
+                    children[definition.detector.marker],
+                    now,
+                )
+            } else {
+                modified_age_days(&scan.arena, candidate, now)
+            };
             let safety = validate_candidate(&scan.arena, candidate, &project_root, home);
             let (apparent, allocated) = subtree_sizes(&scan.arena, candidate);
             detected
@@ -529,10 +567,17 @@ pub fn detect_workspace_targets(
                     exclusive_group: None,
                     exclusive_priority: 0,
                     consequence: workspace_consequence(definition).into(),
-                    evidence: vec![format!(
-                        "detected {} beside {}",
-                        definition.detector.directory, definition.detector.marker
-                    )],
+                    evidence: if definition.id == "cargo.target" {
+                        vec![
+                            "detected target beside Cargo.toml".into(),
+                            "age uses the newest Cargo.toml or build-artifact modification".into(),
+                        ]
+                    } else {
+                        vec![format!(
+                            "detected {} beside {}",
+                            definition.detector.directory, definition.detector.marker
+                        )]
+                    },
                 });
         }
     }
@@ -571,6 +616,89 @@ pub fn detect_workspace_targets(
     roots
 }
 
+/// Resolve one explicitly configured path against the immutable scan arena.
+/// Paths outside the explicit scan remain visible but refused.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn detect_explicit_path_target(
+    scan: &ScanResult,
+    id: String,
+    description: String,
+    path: PathBuf,
+    class: TargetClass,
+    minimum_level: CleanupLevel,
+    stale_after_days: u32,
+    children_only: bool,
+    home: Option<&Path>,
+) -> DetectedTarget {
+    let index = (0..scan.arena.nodes.len())
+        .map(NodeIndex::from_usize)
+        .find(|index| scan.arena.path(*index) == path);
+    let properties = class.properties();
+    let (usage, age_days, safety, operation) = if let Some(index) = index {
+        let (apparent, allocated) = subtree_sizes(&scan.arena, index);
+        let age_days = modified_age_days(&scan.arena, index, now_seconds());
+        let mut safety = validate_scanned_candidate(&scan.arena, index, home);
+        if path == scan.root {
+            safety = CandidateSafety::Refused(
+                "configured cleanup path cannot equal the explicit scan root".into(),
+            );
+        }
+        (
+            UsageEstimate::Filesystem {
+                apparent,
+                allocated,
+                reclaimable: estimate_subtree(&scan.arena, index, scan.coverage_complete()),
+            },
+            age_days,
+            safety,
+            PlannedOperation::DirectDelete {
+                path: path.clone(),
+                children_only,
+                identity: CandidateIdentity {
+                    device: scan.arena.nodes[index.as_usize()].device,
+                    inode: scan.arena.nodes[index.as_usize()].inode,
+                    kind: scan.arena.nodes[index.as_usize()].kind,
+                },
+            },
+        )
+    } else {
+        (
+            UsageEstimate::Unknown {
+                explanation: "configured path is outside the explicit scan scope".into(),
+            },
+            None,
+            CandidateSafety::Refused("configured path is outside the explicit scan scope".into()),
+            PlannedOperation::Informational,
+        )
+    };
+    DetectedTarget {
+        id,
+        provider: ProviderIdentity {
+            id: "configuration".into(),
+            executable: None,
+            version: None,
+            context: Some("resolved target registry".into()),
+        },
+        description,
+        project_root: path.parent().map(Path::to_path_buf),
+        path: Some(path.clone()),
+        class,
+        properties,
+        minimum_level,
+        usage,
+        age_days,
+        stale_after_days,
+        stale: age_days.map(|age| age >= u64::from(stale_after_days)),
+        safety,
+        operation,
+        exclusive_group: None,
+        exclusive_priority: 0,
+        consequence: "configured generated/downloadable data will need to be restored".into(),
+        evidence: vec![format!("resolved configured path: {}", path.display())],
+    }
+}
+
 fn minimum_level_for(properties: TargetProperties) -> CleanupLevel {
     if matches!(properties.rebuild_cost, Some(RebuildCost::High)) {
         CleanupLevel::Aggressive
@@ -596,6 +724,30 @@ fn workspace_consequence(definition: &TargetDefinition) -> &'static str {
 fn modified_age_days(arena: &Arena, index: NodeIndex, now: u64) -> Option<u64> {
     let modified = arena.nodes[index.as_usize()].modified_unix_seconds;
     u64::try_from(modified)
+        .ok()
+        .filter(|modified| *modified <= now)
+        .map(|modified| (now - modified) / 86_400)
+}
+
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+pub(crate) fn cargo_activity_age_days(
+    arena: &Arena,
+    target: NodeIndex,
+    manifest: NodeIndex,
+    now: u64,
+) -> Option<u64> {
+    let mut newest = arena.nodes[manifest.as_usize()].modified_unix_seconds;
+    let mut stack = vec![target];
+    while let Some(index) = stack.pop() {
+        newest = newest.max(arena.nodes[index.as_usize()].modified_unix_seconds);
+        stack.extend(arena.children(index));
+    }
+    u64::try_from(newest)
         .ok()
         .filter(|modified| *modified <= now)
         .map(|modified| (now - modified) / 86_400)
@@ -634,6 +786,28 @@ fn validate_candidate(
         }
     }
 
+    validate_scanned_candidate(arena, candidate, home)
+}
+
+pub(crate) fn validate_scanned_candidate(
+    arena: &Arena,
+    candidate: NodeIndex,
+    home: Option<&Path>,
+) -> CandidateSafety {
+    let path = arena.path(candidate);
+    if path == Path::new("/") || home.is_some_and(|home| path == home) {
+        return CandidateSafety::Refused("protected filesystem root".into());
+    }
+    if let Some(home) = home {
+        for denied in [
+            home.join("Library/Mobile Documents"),
+            home.join("Library/CloudStorage"),
+        ] {
+            if path.starts_with(&denied) {
+                return CandidateSafety::Refused("path is inside synced cloud storage".into());
+            }
+        }
+    }
     let mut stack = vec![candidate];
     while let Some(index) = stack.pop() {
         let node = &arena.nodes[index.as_usize()];
@@ -650,7 +824,7 @@ fn validate_candidate(
     CandidateSafety::Eligible
 }
 
-fn subtree_sizes(arena: &Arena, root: NodeIndex) -> (u64, u64) {
+pub(crate) fn subtree_sizes(arena: &Arena, root: NodeIndex) -> (u64, u64) {
     use std::collections::HashSet;
     let mut stack = vec![root];
     let mut apparent = 0_u64;
@@ -756,6 +930,20 @@ mod tests {
     }
 
     #[test]
+    fn explicit_only_generated_data_requires_its_stable_id() {
+        let mut protected = TargetClass::Cheap.properties();
+        protected.automation = Automation::ExplicitTargetOnly;
+        for level in [
+            CleanupLevel::Safe,
+            CleanupLevel::Standard,
+            CleanupLevel::Aggressive,
+        ] {
+            assert!(!level.selects(protected, false));
+            assert!(level.selects(protected, true));
+        }
+    }
+
+    #[test]
     fn planner_explains_level_and_staleness_selection() {
         let targets = detect_workspace_targets(
             &fixture_scan("/fixture", false),
@@ -770,6 +958,33 @@ mod tests {
 
         let standard = plan_cleanup(targets, CleanupLevel::Standard, &[], true);
         assert_eq!(standard[0].selection, PlanSelection::Selected);
+    }
+
+    #[test]
+    fn safe_plans_refuse_to_cross_the_unattended_count_limit() {
+        let mut template = detect_workspace_targets(
+            &fixture_scan("/fixture", false),
+            BUILTIN_TARGETS,
+            Some(Path::new("/Users/test")),
+        )
+        .remove(0);
+        template.class = TargetClass::Free;
+        template.properties = TargetClass::Free.properties();
+        template.minimum_level = CleanupLevel::Safe;
+        template.stale = Some(true);
+        let targets = (0..101)
+            .map(|index| {
+                let mut target = template.clone();
+                target.id = format!("fixture.{index}");
+                target
+            })
+            .collect();
+
+        let planned = plan_cleanup(targets, CleanupLevel::Safe, &[], false);
+        assert!(planned.iter().all(|item| matches!(
+            &item.selection,
+            PlanSelection::Skipped(reason) if reason.contains("count/byte limit")
+        )));
     }
 
     #[test]
