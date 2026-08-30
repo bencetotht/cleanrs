@@ -1,8 +1,7 @@
 //! Declarative cleanup targets and read-only workspace detection.
 //!
-//! Phase 2 deliberately builds planning before execution. This module contains
-//! no deletion or command-spawning API: it turns target definitions and an
-//! already collected filesystem scan into inspectable candidates.
+//! This module turns target definitions and a collected filesystem scan into
+//! inspectable candidates. Mutation remains isolated in the execution module.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -42,7 +41,7 @@ pub enum RebuildCost {
     High,
 }
 
-/// Whether a future execution may proceed without interactive confirmation.
+/// Whether execution may proceed without interactive confirmation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Automation {
@@ -201,7 +200,7 @@ pub struct CommandSpec {
     pub environment: BTreeMap<String, String>,
 }
 
-/// Exact operation described by a Phase 2 plan. Nothing in this enum executes.
+/// Exact operation described by a plan. This data is inert by itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum PlannedOperation {
@@ -326,7 +325,7 @@ pub enum CandidateSafety {
     Refused(String),
 }
 
-/// A detected, sized, but never executed target candidate.
+/// A detected and sized target candidate.
 #[derive(Debug, Clone, Serialize)]
 pub struct DetectedTarget {
     pub id: String,
@@ -342,7 +341,7 @@ pub struct DetectedTarget {
     pub stale_after_days: u32,
     pub stale: Option<bool>,
     pub safety: CandidateSafety,
-    /// Filesystem identity captured during planning for Phase 3 revalidation.
+    /// Filesystem identity captured during planning for immediate revalidation.
     pub operation: PlannedOperation,
     /// Actions in the same group overlap. The planner selects only the highest
     /// priority applicable member, so totals never double count alternatives.

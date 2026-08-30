@@ -1,9 +1,9 @@
 //! Core filesystem and accounting primitives for `cleanrs`.
 //!
-//! This crate is intentionally read-only in phases 0 and 1. It does not expose
-//! deletion APIs.
+//! Mutating cleanup is exposed only through the guarded Phase 3 execution API.
 
 pub mod accounting;
+pub mod execution;
 pub mod fs;
 pub mod index;
 pub mod journal;

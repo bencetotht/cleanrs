@@ -14,6 +14,12 @@ use cleanrs_core::targets::{
     detect_explicit_path_target,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+enum CommandTrust<'a> {
+    ImplicitUserConfig,
+    ExplicitHash(Option<&'a str>),
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,17 +84,17 @@ impl ResolvedRegistry {
     pub(crate) fn load(
         home: Option<&Path>,
         explicit: Option<&Path>,
-        trust_explicit_commands: bool,
+        trusted_explicit_hash: Option<&str>,
     ) -> Result<Self> {
         let mut resolved = Self::default();
         if let Some(home) = home {
             let user = home.join(".config/cleanrs/targets.toml");
             if user.is_file() {
-                resolved.merge_file(&user, true)?;
+                resolved.merge_file(&user, CommandTrust::ImplicitUserConfig)?;
             }
         }
         if let Some(explicit) = explicit {
-            resolved.merge_file(explicit, trust_explicit_commands)?;
+            resolved.merge_file(explicit, CommandTrust::ExplicitHash(trusted_explicit_hash))?;
         }
         Ok(resolved)
     }
@@ -166,7 +172,7 @@ impl ResolvedRegistry {
         Ok(())
     }
 
-    fn merge_file(&mut self, path: &Path, commands_trusted: bool) -> Result<()> {
+    fn merge_file(&mut self, path: &Path, command_trust: CommandTrust<'_>) -> Result<()> {
         let canonical = path
             .canonicalize()
             .with_context(|| format!("failed to resolve config {}", path.display()))?;
@@ -174,16 +180,21 @@ impl ResolvedRegistry {
             .with_context(|| format!("failed to read config {}", canonical.display()))?;
         let config: RegistryFile = toml::from_str(&text)
             .with_context(|| format!("failed to parse config {}", canonical.display()))?;
-        if !commands_trusted
-            && config
-                .targets
-                .iter()
-                .any(|target| target.detect.command.is_some() || target.reclaim.method == "run")
-        {
-            bail!(
-                "{} contains command targets; repeat with --trust-config-commands after reviewing its canonical path and content",
-                canonical.display()
-            );
+        let contains_commands = config
+            .targets
+            .iter()
+            .any(|target| target.detect.command.is_some() || target.reclaim.method == "run");
+        if contains_commands {
+            if let CommandTrust::ExplicitHash(expected) = command_trust {
+                let actual = hash_text(&text);
+                if expected != Some(actual.as_str()) {
+                    bail!(
+                        "{} contains command targets and its current content is not trusted; review it and run `cleanrs trust-config {}`",
+                        canonical.display(),
+                        canonical.display()
+                    );
+                }
+            }
         }
         for id in config.enable {
             self.disabled.remove(&id);
@@ -277,6 +288,13 @@ impl ResolvedRegistry {
         })
         .context("failed to serialize resolved registry")
     }
+}
+
+fn hash_text(text: &str) -> String {
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn validate_target(target: &ConfiguredTarget) -> Result<()> {
@@ -407,8 +425,7 @@ fn command_item(
         },
         exclusive_group: None,
         exclusive_priority: 0,
-        consequence: "configured command consequence must be reviewed before Phase 3 execution"
-            .into(),
+        consequence: "configured command consequence must be reviewed before execution".into(),
         evidence: vec!["loaded from a trusted registry source".into()],
     }
 }
