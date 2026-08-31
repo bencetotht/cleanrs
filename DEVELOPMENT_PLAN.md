@@ -53,9 +53,9 @@ installed versions, so cleanrs initially classifies that mixed action as
 |---|---|---|
 | 0 | Honest safety and accounting foundation | **Practical baseline complete; deeper research deferred** |
 | 1 | Fast read-only scanner and diagnostics | **Useful MVP implemented; performance and UX work remains** |
-| 2 | Developer-storage inventory and cleanup plans | **Read-only foundation complete; execution remains Phase 3** |
-| 3 | Cleanup execution and lightweight history | **Not started; inert apply path exists** |
-| 4 | Project hygiene and stale-project intelligence | **Not started** |
+| 2 | Developer-storage inventory and cleanup plans | **Complete** |
+| 3 | Cleanup execution and lightweight history | **Complete** |
+| 4 | Project hygiene and stale-project intelligence | **Next priority** |
 | 5 | Index, scheduling, and ratatui daily-driver UI | **Terminal groundwork only** |
 | 6 | Extensibility and optional portability | **Deferred** |
 
@@ -199,7 +199,8 @@ disk analyzers.
 - `targets` human/JSON output with filters.
 - `clean` dry-run planning, selection explanations, a deduplicated interval,
   and captured device/inode/type.
-- `clean --apply` refuses before scanning and cannot currently mutate data.
+- At the Phase 2 boundary, `clean --apply` refused before scanning. Phase 3 now
+  supplies the guarded mutation path without changing Phase 2's plan semantics.
 - Unified workspace/provider inventory items with owned IDs, provider identity,
   typed usage sources, exact direct-delete or argv-array operations,
   consequences, evidence, and action-level minimum severity.
@@ -222,9 +223,9 @@ disk analyzers.
   hazards, and symlinked ancestors. Configured commands and ad-hoc commands are
   argv arrays and remain plans only. Unknown fields, invalid ages, incomplete
   detectors, and detector/operation mismatches fail closed.
-- Explicit config command targets require a per-run review acknowledgement.
-  Persistent content-hash trust is deliberately deferred until Phase 3, before
-  any configured command can execute.
+- At the Phase 2 boundary, explicit config commands required a per-run review
+  acknowledgement. Phase 3 replaced this with persistent canonical-path plus
+  content-hash trust before configured command execution.
 - Read-only provider baselines cover Nix; pnpm/npm/npx/Yarn/Bun;
   uv/pip/Poetry/Conda; Cargo/rustup; Docker/OrbStack; Xcode; and CocoaPods.
   Stateful objects and capabilities without a stable granular cleanup remain
@@ -392,6 +393,10 @@ deletion or provider-command execution API. Provider-specific execution support,
 identity revalidation, persistent command-config trust, and journalling are
 Phase 3 work rather than hidden Phase 2 mutations.
 
+This paragraph records the Phase 2 exit boundary. Phase 3 has since implemented
+those execution, revalidation, trust, and journal capabilities on top of the
+unchanged planning model.
+
 ---
 
 ## Phase 3 — Cleanup execution and lightweight history
@@ -402,9 +407,38 @@ what happened.
 ### Already completed
 
 - Dry-run is the default.
-- `--apply` is accepted but refuses before scanning.
-- Plans already capture device, inode, and file type for future revalidation.
-- Fixture tests prove current dry runs do not delete candidates.
+- Dry-run and apply consume the same owned reviewed-plan representation.
+- `--apply` requires confirmation unless `--yes` is present; JSON apply requires
+  `--yes`, and destructive execution as root is refused.
+- Plans capture device, inode, and file type and revalidate them after a final
+  metadata-only cloud/mount/coverage preflight.
+- Direct deletion uses descriptor-relative `openat`/`fstatat`/`unlinkat`
+  traversal, never follows symlinks, and supports guarded whole-directory and
+  children-only operations.
+- Provider commands execute as the exact captured executable plus argv and
+  permitted environment, with executable and provider identity/context
+  revalidation immediately before spawn. Output is streamed interactively and
+  retained as bounded history summaries.
+- Explicit command configs use persistent canonical-path plus SHA-256 content
+  trust. Editing or replacing the file invalidates trust; trust can be listed
+  and revoked.
+- The private JSONL journal is append-only, records a durable pending snapshot
+  before mutation and a snapshot after each action, collapses snapshots by run
+  ID for history, and rotates at a bounded size.
+- `history` reports successes, failures, skipped planning decisions, validation
+  aborts, exact argv, estimates, removed allocation, provider-reported output,
+  exit status, and concise output/error evidence.
+- Human dry-run output ends with a context-aware tip: selected plans suggest
+  `--apply`, while severity-skipped plans suggest the required level before
+  reminding the user to review and apply.
+- Platform-specific `libc::stat` conversions and allocation-free digest
+  formatting keep strict workspace Clippy checks clean on macOS and Linux,
+  including the Rust 1.85 CI toolchain.
+- Cargo-provider execution uses a deterministic provider stub in tests that
+  records the exact reviewed argv and refuses deletion outside its temporary
+  target, avoiding host Cargo/rustup coupling on Linux CI runners.
+- Fixture tests prove dry-run is inert and every destructive test operates only
+  inside a unique temporary sandbox.
 
 ### Direct deletion
 
@@ -416,6 +450,9 @@ what happened.
 - Refuse root execution unless explicitly overridden for a justified action.
 - Require `--apply`; require confirmation unless `--yes` is present.
 - Keep all destructive tests inside unique temporary fixture directories.
+- **`--trash` is deliberately deferred.** Same-volume Trash moves do not
+  reclaim storage and require separate moved-byte/cross-volume semantics; the
+  current flag refuses explicitly instead of pretending to recover space.
 
 ### Provider execution
 
@@ -445,15 +482,21 @@ a database project.
 
 ### Practical completion criteria
 
-- [ ] Dry-run and apply derive from the same immutable plan representation.
-- [ ] Every destructive test is confined to a temporary sandbox.
-- [ ] Symlink and replacement-race fixtures abort without touching the resolved
+- [x] Dry-run and apply derive from the same immutable plan representation.
+- [x] Every destructive test is confined to a temporary sandbox.
+- [x] Symlink and replacement-race fixtures abort without touching the resolved
       target or anything outside it.
-- [ ] Provider context changes abort instead of redirecting a command.
-- [ ] Partial provider and filesystem failures are visible and journalled.
-- [ ] `history` can explain what ran, what was skipped, and what failed.
-- [ ] Explicit-only actions cannot run through a severity level or scheduled
+- [x] Provider context changes abort instead of redirecting a command.
+- [x] Partial provider and filesystem failures are visible and journalled.
+- [x] `history` can explain what ran, what was skipped, and what failed.
+- [x] Explicit-only actions cannot run through a severity level or scheduled
       safe cleanup.
+
+**Status: complete.** Phase 3 enables guarded permanent cleanup for eligible
+direct-delete and native provider actions. It does not yet implement Trash or
+claim observed APFS container recovery. The journal labels current evidence as
+removed allocation or provider reported; container-delta calibration remains a
+separate accounting enhancement.
 
 ---
 
@@ -641,19 +684,18 @@ seams but do not constitute supported Linux behavior.
 
 Work should continue in this order:
 
-1. Design Phase 3's immutable reviewed-plan handoff, provider/filesystem
-   identity revalidation, confirmation boundary, and lightweight journal.
-2. Add persistent canonical-path plus content-hash trust before configured
-   command targets can enter any executable path.
-3. Implement Phase 3 execution for a deliberately small safe-action subset,
-   with every destructive test confined to an explicit temporary sandbox.
-4. Add replacement-race, provider-context-change, partial-failure, and journal
-   fixtures before widening the executable action set.
-5. In parallel with normal feature work, land the Phase 1 largest-file view,
+1. Begin Phase 4 project hygiene using Phase 3's shared plan/execution/history
+   pipeline rather than adding a second mutation path.
+2. Strengthen Cargo shared-target ownership and project-activity evidence before
+   widening stale-project cleanup recommendations.
+3. Add repository state, worktree, lockfile, and process-activity evidence for
+   project-level decisions.
+4. In parallel with normal feature work, land the Phase 1 largest-file view,
    packed-record parser fixtures, and a checked-in performance baseline.
+5. Revisit Trash only as an explicit moved-not-reclaimed workflow, and add
+   observed APFS container-free-space evidence only when its measurement
+   boundary is truthful and reproducible.
 
-The Phase 2 registry, provider/action inventory, Cargo build scanner, separated
-Docker/Xcode risk model, and path-safety planning suite are complete. The next
-concrete task is the smallest safe Phase 3 execution vertical slice; read-only
-plans remain the only behavior until its revalidation and journal prerequisites
-land together.
+Phases 0–3 now provide accounting, read-only inventory, immutable cleanup plans,
+guarded execution, persistent config trust, and lightweight history. Phase 4 is
+the next concrete feature boundary.

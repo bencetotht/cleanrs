@@ -1,8 +1,7 @@
 //! Read-only developer-tool detection, inspection, and cleanup planning.
 //!
-//! Phase 2 may execute tightly scoped inspection commands, but it never runs a
-//! planned cleanup command. External commands are always an executable plus an
-//! argv array; no shell is involved.
+//! Inspection remains read-only. Planned cleanup commands are handed to the
+//! Phase 3 executor as an executable plus argv array; no shell is involved.
 
 use std::collections::{BTreeMap, HashSet};
 use std::env;
@@ -145,8 +144,8 @@ impl ProviderHost for SystemProviderHost {
     }
 }
 
-/// A built-in provider supplies read-only detection and inspection. Execution
-/// and verification deliberately remain Phase 3 capabilities.
+/// A built-in provider supplies read-only detection and inspection. The shared
+/// executor revalidates the resulting identity immediately before execution.
 pub trait Provider {
     fn id(&self) -> &'static str;
     fn action_ids(&self) -> &'static [&'static str];
@@ -1263,11 +1262,19 @@ impl Provider for XcodeProvider {
         let Some(executable) = host.resolve_executable("xcrun")? else {
             return Ok(None);
         };
+        let xcode_select = host
+            .resolve_executable("xcode-select")?
+            .ok_or_else(|| ProviderError::new("xcode-select executable was not found"))?;
+        let developer_directory =
+            successful_stdout(host, &plain_inspection_command(&xcode_select, &["-p"]))?;
         Ok(Some(ProviderIdentity {
             id: "xcode".into(),
             executable: Some(executable),
             version: None,
-            context: Some("active Xcode developer directory".into()),
+            context: Some(format!(
+                "developer directory {}",
+                developer_directory.trim()
+            )),
         }))
     }
 

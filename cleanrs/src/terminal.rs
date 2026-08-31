@@ -428,16 +428,73 @@ impl TerminalUi {
         ]);
         summary.add_row(vec![
             Cell::new("Execution"),
-            self.value(output.execution, Color::Green),
+            self.value(&output.execution, Color::Green),
         ]);
         println!();
         println!("{summary}");
         self.print_provider_statuses(&output.providers);
+        if output.execution.starts_with("dry-run") {
+            println!();
+            if output.selected_targets > 0 {
+                println!(
+                    "{} This was a dry run. Add {} to execute the reviewed plan.",
+                    self.muted("TIP"),
+                    self.warning("--apply")
+                );
+            } else if let Some(level) = required_cleanup_level(&output.targets) {
+                println!(
+                    "{} No actions were selected. Try {}, review the plan, then add {}.",
+                    self.muted("TIP"),
+                    self.warning(&format!("--level {level}")),
+                    self.warning("--apply")
+                );
+            } else {
+                println!(
+                    "{} No actions were selected. Adjust the filters or level, review again, then add {}.",
+                    self.muted("TIP"),
+                    self.warning("--apply")
+                );
+            }
+        }
+    }
+
+    pub(crate) fn print_apply_results(&self, output: &CleanOutput) {
         println!();
-        println!(
-            "{} Permanent execution remains disabled until Phase 3 identity revalidation and journalling are implemented.",
-            self.warning("NOTICE")
-        );
+        println!("{}", self.heading("Cleanup results"));
+        let mut table = self.table();
+        table.set_header(vec![
+            self.header("STATUS"),
+            self.header("TARGET"),
+            self.header("EVIDENCE"),
+        ]);
+        for applied in &output.results {
+            let result = &applied.result;
+            let (status, color) = match result.status {
+                cleanrs_core::execution::ActionStatus::Success => ("success", Color::Green),
+                cleanrs_core::execution::ActionStatus::Skipped => ("skipped", Color::DarkGrey),
+                cleanrs_core::execution::ActionStatus::ValidationAbort => {
+                    ("aborted", Color::Yellow)
+                }
+                cleanrs_core::execution::ActionStatus::Failed => ("failed", Color::Red),
+            };
+            let evidence = result
+                .removed_allocation
+                .map(|bytes| format!("{} allocation removed", human_bytes(bytes)))
+                .or_else(|| {
+                    result
+                        .provider_reported
+                        .map(|bytes| format!("provider reported {}", human_bytes(bytes)))
+                })
+                .or_else(|| result.error.clone())
+                .unwrap_or_else(|| "completed".into());
+            table.add_row(vec![
+                self.value(status, color),
+                Cell::new(&applied.target_id),
+                Cell::new(evidence),
+            ]);
+        }
+        println!("{table}");
+        println!("Outcome: {}", output.execution);
     }
 
     fn print_provider_statuses(&self, statuses: &[cleanrs_core::providers::ProviderStatus]) {
@@ -546,6 +603,24 @@ impl TerminalUi {
     }
 }
 
+fn required_cleanup_level(
+    targets: &[cleanrs_core::targets::PlannedTarget],
+) -> Option<&'static str> {
+    let mut required = None;
+    for planned in targets {
+        let PlanSelection::Skipped(reason) = &planned.selection else {
+            continue;
+        };
+        if reason.contains("requires aggressive cleanup level") {
+            return Some("aggressive");
+        }
+        if reason.contains("requires standard cleanup level") {
+            required = Some("standard");
+        }
+    }
+    required
+}
+
 fn optional_bytes(value: Option<u64>, absent: &str, ui: &TerminalUi) -> Cell {
     value.map_or_else(|| ui.value(absent, Color::Yellow), |bytes| ui.size(bytes))
 }
@@ -631,6 +706,37 @@ fn usage_display(usage: &UsageEstimate) -> (String, Option<Confidence>) {
 /// An indeterminate spinner backed by the scanner's monotonic counters.
 pub(crate) struct ScanProgressIndicator {
     bar: ProgressBar,
+}
+
+/// Spinner for a potentially long direct-delete action. Provider commands
+/// stream their own output and therefore do not use this indicator.
+pub(crate) struct ActionProgressIndicator {
+    bar: ProgressBar,
+}
+
+impl ActionProgressIndicator {
+    pub(crate) fn create(label: &str, enabled: bool) -> Option<Self> {
+        enabled.then(|| {
+            let bar = ProgressBar::new_spinner();
+            bar.set_style(
+                ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                    .expect("static action progress template"),
+            );
+            bar.set_message(format!("permanently deleting {label}"));
+            bar.enable_steady_tick(Duration::from_millis(90));
+            Self { bar }
+        })
+    }
+
+    pub(crate) fn finish(self, status: cleanrs_core::execution::ActionStatus) {
+        let message = match status {
+            cleanrs_core::execution::ActionStatus::Success => "deletion complete",
+            cleanrs_core::execution::ActionStatus::ValidationAbort => "deletion aborted",
+            cleanrs_core::execution::ActionStatus::Failed => "deletion failed",
+            cleanrs_core::execution::ActionStatus::Skipped => "deletion skipped",
+        };
+        self.bar.finish_with_message(message);
+    }
 }
 
 impl ScanProgressIndicator {

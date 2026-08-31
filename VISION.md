@@ -1,7 +1,8 @@
 # cleanrs — Vision & Design
 
-> **Status:** design reference with Phase 0/1 implementation and the read-only
-> Phase 2 inventory/planning foundation implemented.
+> **Status:** design reference with Phases 0–3 implemented: filesystem and
+> accounting foundations, read-only inventory/planning, guarded cleanup
+> execution, persistent command-config trust, and lightweight history.
 > Empirical results and unresolved gates are tracked in
 > [docs/findings-phase0.md](docs/findings-phase0.md). This file remains the
 > reference for what cleanrs is, why it exists, and how it should be built.
@@ -489,11 +490,11 @@ download-cache-only `safe` action.
 
 ## 7. Providers
 
-The commands below began as the provider backlog. Phase 2 now implements
-read-only detection, inspection, and planning for the developer-tool providers
-listed here and in §7.3. A declared plan is not yet an executable capability:
-Phase 3 must revalidate each provider command and context before enabling even a
-small supported subset.
+The commands below began as the provider backlog. Phase 2 implemented read-only
+detection, inspection, and planning for the developer-tool providers listed
+here and in §7.3. Phase 3 now executes eligible planned commands only after
+revalidating the executable and provider identity/context. Informational and
+refused actions still have no executable capability.
 
 | Provider | Starting point | Known complications |
 |---|---|---|
@@ -617,6 +618,11 @@ The rules:
   (§11), and the observed container free-space delta is recorded independently of
   both.
 
+**Phase 3 implementation correction:** permanent `--apply` is implemented, but
+`--trash` currently refuses and is deliberately deferred. Trash needs separate
+same-volume/cross-volume movement and “moved, not reclaimed” accounting; it must
+not borrow the permanent-deletion result path merely for convenience.
+
 ### 8.2 Path invariants for direct deletion
 
 Dry-run is not protection against path-resolution bugs. These are mandatory,
@@ -721,6 +727,12 @@ Phase 3 and is required before configured command execution is enabled. This
 corrects the earlier implication that the persistent trust store already had to
 exist for read-only plan construction.
 
+**Phase 3 implementation:** explicitly named command configs are trusted by
+canonical path plus SHA-256 content using `cleanrs trust-config`; editing or
+replacing a file invalidates the record. Trust can be listed or revoked.
+`--trust-config-commands` records the same persistent decision as a convenience,
+not a per-run bypass. Parsed command bytes are checked against the trusted hash.
+
 Resolution order, later overriding earlier by `id`:
 
 1. Embedded default manifest.
@@ -803,8 +815,9 @@ cleanrs clean \
 ```
 
 Phase 2 assigns ad-hoc command targets the `cheap` class; use a config target
-when another class, stable ID, or detector is required. `--apply` still refuses
-before inspection, so this only constructs a plan.
+when another class, stable ID, or detector is required. In Phase 3 the argv
+array remains inert without `--apply`; with apply it is shown in the reviewed
+plan, pinned to the executable identity, and executed directly without a shell.
 
 The trust boundary in §9.1 concerns *files*, not what the user types. A command
 the user enters at their own prompt is theirs; the JSON array form exists to
@@ -964,6 +977,14 @@ The journal also needs **rotation** and, because it records private directory,
 project, and client names, an option for **path redaction** (hashing or
 truncating paths while retaining sizes and target ids).
 
+**Phase 3 implementation boundary:** the private rotating JSONL journal records
+a durable pending snapshot before mutation and a newer snapshot after each
+action. It currently stores plan estimates, removed tree allocation,
+provider-reported output when parseable, exact argv, outcome, exit status, and
+bounded stdout/stderr summaries. `history` collapses snapshots by run ID. It
+does **not** yet measure or attribute `container_free_delta`, and path redaction
+remains future privacy work; neither absent field is synthesized.
+
 ---
 
 ## 12. Roadmap
@@ -1022,10 +1043,12 @@ cleanrs targets               List detected targets with sizes and confidence.
                               --only --exclude --target... --export
 cleanrs clean                 Reclaim space. Dry-run by DEFAULT.
                               --level safe|standard|aggressive
-                              --apply --yes --trash
+                              --apply --yes
+                              --trash (reserved; currently refuses)
                               --only --exclude --target... --config
-cleanrs history               Journal of past runs, estimated vs. observed,
-                              with discrepancy classes.
+cleanrs history               Journal of plan decisions, outcomes, removed
+                              allocation, provider reports, and errors.
+cleanrs trust-config PATH     Trust/list/revoke explicit command config content.
 cleanrs schedule install|remove|status
 cleanrs index [--reindex|--clear|--status]
 ```
@@ -1076,7 +1099,7 @@ becomes real, not before — premature fragmentation slows early iteration.
 
 ```
 cleanrs-core     Library. Modules: fs, accounting, targets, providers,
-                 index, journal.
+                 execution, index, journal.
 cleanrs          Binary. CLI, TUI, scheduling.
 ```
 
@@ -1104,7 +1127,8 @@ platform seams in several modules, not one.
 | Benchmarks | `criterion`, `hyperfine` | Micro and end-to-end. |
 | Testing | `insta`, `tempfile`, `proptest` | Snapshot and property tests. |
 
-`trash` is a dependency only for the opt-in `--trash` mode, not the default path.
+`trash` may become a dependency only when the deferred `--trash` mode implements
+truthful moved-not-reclaimed semantics; Phase 3 does not include it.
 
 ### 14.2 Implementation notes
 
