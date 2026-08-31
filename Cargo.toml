@@ -17,7 +17,7 @@ clap_complete = "4.5"
 clap_mangen = "0.2"
 # 7.2 uses let-chains, which are unavailable on the workspace's Rust 1.85 MSRV.
 comfy-table = "=7.1.4"
-console = "0.15"
+console = "0.16"
 crossbeam-channel = "0.5"
 # 0.4.20 raised its MSRV to Rust 1.88. Keep the workspace's declared Rust
 # 1.85 support until cleanrs deliberately raises its own MSRV.
