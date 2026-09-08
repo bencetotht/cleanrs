@@ -15,7 +15,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked -p cleanrs
       - run: tar -C target/release -czf cleanrs-aarch64-apple-darwin.tar.gz cleanrs
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: cleanrs-aarch64-apple-darwin.tar.gz
 
