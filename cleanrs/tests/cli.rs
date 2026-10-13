@@ -1429,3 +1429,248 @@ reclaim = {{ method = "run", argv = ["/usr/bin/touch", {:?}] }}
     assert!(String::from_utf8_lossy(&output.stderr).contains("interactive confirmation"));
     assert!(!marker.exists());
 }
+
+fn manual_selection_fixture() -> tempfile::TempDir {
+    let fixture = tempdir().unwrap();
+    for project in ["chosen", "sibling"] {
+        fs::create_dir_all(fixture.path().join(project).join("node_modules")).unwrap();
+        fs::write(fixture.path().join(project).join("package.json"), b"{}").unwrap();
+        fs::write(
+            fixture.path().join(project).join("node_modules/payload"),
+            b"generated fixture",
+        )
+        .unwrap();
+    }
+    fixture
+}
+
+fn manual_selection_command(fixture: &tempfile::TempDir) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cleanrs"));
+    command
+        .arg("clean")
+        .arg(fixture.path())
+        .arg("--workspace-only")
+        .arg("--only")
+        .arg("node.modules")
+        .arg("--select")
+        .arg(fixture.path().join("chosen/node_modules"))
+        .env("HOME", fixture.path())
+        .env("XDG_STATE_HOME", fixture.path().join("state"))
+        .env("NO_COLOR", "1");
+    command
+}
+
+#[test]
+fn clean_select_dry_run_selects_one_candidate_and_displays_manual_override() {
+    let fixture = manual_selection_fixture();
+    let output = manual_selection_command(&fixture).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("plan (manual)"));
+    assert!(stdout.contains("requires standard cleanup level"));
+    assert!(stdout.contains("Only your --select candidates are selected"));
+    assert!(!stdout.contains('\u{1b}'));
+    let output = manual_selection_command(&fixture)
+        .args(["--json", "--level", "aggressive", "--ignore-staleness"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["selected_targets"], 1,
+        "--select uses ManualOnly even when the level selects siblings"
+    );
+    assert_eq!(json["targets"][0]["selection"]["source"]["kind"], "manual");
+    assert_eq!(
+        json["targets"][0]["selection"]["source"]["overrode"],
+        serde_json::Value::Null
+    );
+    assert_eq!(json["targets"][1]["selection"]["status"], "skipped");
+    assert!(fixture.path().join("chosen/node_modules/payload").exists());
+    assert!(fixture.path().join("sibling/node_modules/payload").exists());
+    assert!(
+        !fixture.path().join("state").exists(),
+        "dry-run must not journal"
+    );
+}
+
+#[test]
+fn clean_select_apply_deletes_exact_candidate_and_history_marks_override() {
+    let fixture = manual_selection_fixture();
+    let output = manual_selection_command(&fixture)
+        .args(["--apply", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!fixture.path().join("chosen/node_modules").exists());
+    assert!(fixture.path().join("sibling/node_modules/payload").exists());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["results"].as_array().unwrap().len(), 1);
+    assert_eq!(json["results"][0]["result"]["status"], "success");
+    let history = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .arg("history")
+        .env("HOME", fixture.path())
+        .env("XDG_STATE_HOME", fixture.path().join("state"))
+        .output()
+        .unwrap();
+    assert!(history.status.success());
+    assert!(
+        String::from_utf8_lossy(&history.stdout)
+            .contains("[manual: requires standard cleanup level]")
+    );
+    assert!(!String::from_utf8_lossy(&history.stdout).contains("bytes allocation"));
+    let history = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args(["history", "--json"])
+        .env("HOME", fixture.path())
+        .env("XDG_STATE_HOME", fixture.path().join("state"))
+        .output()
+        .unwrap();
+    assert!(history.status.success());
+    let runs: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
+    let action = runs[0]["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["status"] == "success")
+        .unwrap();
+    assert_eq!(action["selection_source"], "manual");
+    assert_eq!(
+        action["overridden_skip_reason"],
+        "requires standard cleanup level"
+    );
+}
+
+#[test]
+fn clean_select_refused_candidate_fails_before_apply() {
+    let fixture = tempdir().unwrap();
+    let scope = fixture.path().canonicalize().unwrap();
+    let spec = format!("{}:cheap:delete", scope.display());
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .arg("clean")
+        .arg(fixture.path())
+        .args(["--targets-only-cli", "--target"])
+        .arg(spec)
+        .arg("--select")
+        .arg(fixture.path())
+        .arg("--json")
+        .env("HOME", fixture.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot select"));
+    assert!(stderr.contains("safety refusal"));
+    assert!(stderr.contains("cannot equal the explicit scan root"));
+    assert!(fixture.path().exists());
+}
+
+#[test]
+fn clean_select_unknown_path_lists_candidates_below_it() {
+    let fixture = manual_selection_fixture();
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .arg("clean")
+        .arg(fixture.path())
+        .args(["--workspace-only", "--only", "node.modules", "--select"])
+        .arg(fixture.path().join("chosen"))
+        .env("HOME", fixture.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown cleanup candidate"));
+    assert!(stderr.contains("possible candidates:"));
+    assert!(stderr.contains("chosen/node_modules"));
+    assert!(!stderr.contains("sibling/node_modules"));
+}
+
+#[test]
+fn clean_select_is_repeatable_and_canonicalizes_path_spelling() {
+    let fixture = manual_selection_fixture();
+    let output = manual_selection_command(&fixture)
+        .arg("--select")
+        .arg(fixture.path().join("sibling/../sibling/node_modules"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["selected_targets"], 2);
+    assert!(
+        json["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|target| target["selection"]["source"]["kind"] == "manual")
+    );
+}
+
+#[test]
+fn clean_select_user_data_still_requires_interactive_confirmation() {
+    let fixture = tempdir().unwrap();
+    fs::create_dir(fixture.path().join("data")).unwrap();
+    fs::write(
+        fixture.path().join("data/irreplaceable"),
+        b"fixture user data",
+    )
+    .unwrap();
+    let scope = fixture.path().canonicalize().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .arg("clean")
+        .arg(fixture.path())
+        .arg("--targets-only-cli")
+        .arg("--target")
+        .arg(format!(
+            "{}:irreplaceable:delete",
+            scope.join("data").display()
+        ))
+        .arg("--select")
+        .arg(fixture.path().join("data"))
+        .args(["--apply", "--yes", "--json"])
+        .env("HOME", fixture.path())
+        .env("XDG_STATE_HOME", fixture.path().join("state"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("explicit-only actions require interactive confirmation")
+    );
+    assert!(fixture.path().join("data/irreplaceable").exists());
+    assert!(!fixture.path().join("state").exists());
+}
+
+#[test]
+fn tui_rejects_non_tty_before_touching_terminal_modes() {
+    let fixture = tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .current_dir(fixture.path())
+        .arg("tui")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("requires a terminal on both stdin and stdout")
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "must not enter the alternate screen"
+    );
+}

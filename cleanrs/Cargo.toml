@@ -19,6 +19,10 @@ clap_mangen.workspace = true
 comfy-table.workspace = true
 cleanrs-core = { path = "../cleanrs-core" }
 console.workspace = true
+crossbeam-channel.workspace = true
+ratatui.workspace = true
+instability.workspace = true
+crossterm.workspace = true
 indicatif.workspace = true
 libc.workspace = true
 serde.workspace = true

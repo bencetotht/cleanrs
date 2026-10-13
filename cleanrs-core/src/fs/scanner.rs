@@ -1,6 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -116,6 +116,17 @@ impl<F: FileSystem> Scanner<F> {
         root: &Path,
         observer: Arc<dyn ScanObserver>,
     ) -> io::Result<ScanResult> {
+        self.scan_with_observer_cancellable(root, observer, None)
+    }
+
+    /// Cancellation is cooperative between directories. Partial arenas retain
+    /// an explicit coverage error, so accounting never reports them complete.
+    pub fn scan_with_observer_cancellable(
+        &self,
+        root: &Path,
+        observer: Arc<dyn ScanObserver>,
+        cancellation: Option<Arc<AtomicBool>>,
+    ) -> io::Result<ScanResult> {
         if std::fs::symlink_metadata(root)?.file_type().is_symlink() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -152,6 +163,7 @@ impl<F: FileSystem> Scanner<F> {
         std::thread::scope(|scope| {
             for _ in 0..self.options.workers.max(1) {
                 let context = WorkerContext {
+                    cancellation: cancellation.clone(),
                     filesystem: Arc::clone(&self.filesystem),
                     arena: Arc::clone(&arena),
                     errors: Arc::clone(&errors),
@@ -176,10 +188,20 @@ impl<F: FileSystem> Scanner<F> {
             .expect("scanner retained arena")
             .into_inner()
             .unwrap();
-        let coverage_errors = Arc::try_unwrap(errors)
+        let mut coverage_errors = Arc::try_unwrap(errors)
             .expect("scanner retained errors")
             .into_inner()
             .unwrap();
+        if cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            coverage_errors.push(CoverageError {
+                path: root.clone(),
+                kind: "cancelled".into(),
+                message: "scan cancelled".into(),
+            });
+        }
         Ok(ScanResult {
             root,
             arena,
@@ -215,6 +237,7 @@ struct Job {
 }
 
 struct WorkerContext<F> {
+    cancellation: Option<Arc<AtomicBool>>,
     filesystem: Arc<F>,
     arena: Arc<Mutex<Arena>>,
     errors: Arc<Mutex<Vec<CoverageError>>>,
@@ -233,6 +256,13 @@ struct WorkerContext<F> {
 
 fn worker_loop<F: FileSystem>(context: &WorkerContext<F>) {
     loop {
+        if context
+            .cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            break;
+        }
         let job = match context.receiver.recv_timeout(Duration::from_millis(10)) {
             Ok(job) => job,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -569,5 +599,49 @@ mod tests {
                 .count()
                 >= 2
         );
+    }
+    struct CancellingObserver(Arc<AtomicBool>);
+    impl ScanObserver for CancellingObserver {
+        fn on_progress(&self, _progress: ScanProgress) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn cancellation_stops_between_directories_and_marks_coverage_incomplete() {
+        let fixture = tempdir().unwrap();
+        for index in 0..100 {
+            let directory = fixture.path().join(format!("dir-{index}"));
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("unscanned"), b"payload").unwrap();
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let scan = Scanner::new(ScanOptions {
+            workers: 1,
+            ..ScanOptions::default()
+        })
+        .scan_with_observer_cancellable(
+            fixture.path(),
+            Arc::new(CancellingObserver(cancelled.clone())),
+            Some(cancelled),
+        )
+        .unwrap();
+        assert!(!scan.coverage_complete());
+        assert!(
+            scan.coverage_errors
+                .iter()
+                .any(|error| error.message == "scan cancelled")
+        );
+        assert_eq!(
+            scan.arena.nodes.len(),
+            101,
+            "only the root directory was processed"
+        );
+        let estimate = crate::accounting::estimate_subtree(
+            &scan.arena,
+            scan.arena.root(),
+            scan.coverage_complete(),
+        );
+        assert_ne!(estimate.confidence, crate::accounting::Confidence::High);
     }
 }

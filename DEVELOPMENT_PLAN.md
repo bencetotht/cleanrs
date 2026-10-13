@@ -55,8 +55,8 @@ installed versions, so cleanrs initially classifies that mixed action as
 | 1 | Fast read-only scanner and diagnostics | **Useful MVP implemented; performance and UX work remains** |
 | 2 | Developer-storage inventory and cleanup plans | **Complete** |
 | 3 | Cleanup execution and lightweight history | **Complete** |
-| 5A | Interactive TUI: explore, select, clean (pulled forward from Phase 5) | **Next priority** |
-| 4 | Project hygiene and stale-project intelligence | **Queued after 5A** |
+| 5A | Interactive TUI: explore, select, clean (pulled forward from Phase 5) | **M0–M5 complete; Phase 4 next** |
+| 4 | Project hygiene and stale-project intelligence | **Next priority** |
 | 5 | Index, scheduling, and remaining ratatui daily-driver work | **Terminal groundwork only** |
 
 **Correction (2026-10-13):** Phase 4 was previously the next priority. The
@@ -622,7 +622,8 @@ browser quits (with a confirmation only if a cleanup is running).
 #### 2. Targets view (`T`)
 
 `T` runs target detection scoped to the highlighted directory (or the current
-directory when a file is highlighted) — the same detection as
+directory when a file or recognized target directory is highlighted; recognized
+target rows focus that target) — the same detection as
 `cleanrs targets PATH --workspace-only`, plus machine-wide providers only when
 toggled on.
 
@@ -834,6 +835,370 @@ error, and panic (panic hook). Non-TTY invocation fails with a clear error
 | M4 | Review + run + results | Grouped review with override warnings, `y`-only confirmation, streamed execution via shared pipeline, results, affected-dir rescan |
 | M5 | Polish | Freshness labels, error messages, `NO_COLOR`, narrow-terminal layout (≥80 cols), docs (README/VISION/man page) |
 
+**M0 implemented (2026-10-13): prerequisite refactors 1–5 complete.**
+
+- [x] Shared non-printing `cleanrs/src/pipeline.rs`: `PlanRequest` builds an
+      owned `ReviewedPlan` without mutation, with `PlanObserver` scan/phase and
+      Cargo metadata counters. CLI confirmation and explicit trust-store writes
+      stay in presentation; registry/trust dependencies keep the pipeline in
+      the binary crate. Shared inventory helpers serve `targets` and `clean`.
+- [x] `execute_reviewed_plan` preserves root/unattended boundaries, durable
+      pending snapshots, direct-delete preflight, descriptor-relative deletion,
+      provider identity revalidation, exact argv, bounded output summaries, and
+      per-action journal snapshots. `ExecutionObserver` receives run/action,
+      stdout/stderr, and result events. Its cooperative stop token is checked
+      only between actions; remaining actions are journalled as skipped with
+      “stopped by user”. Output events carry raw newline-preserving byte
+      fragments (long lines split at 8 KiB), preserving CLI output bytes.
+- [x] Core `CandidateKey`, `SelectionSource`, `SelectionMode`, and
+      `plan_cleanup_with_selection` support per-candidate explicit choices.
+      Manual selections override level/age/explicit-only policy, reject safety
+      refusals and informational actions, reject manual exclusive conflicts,
+      and supersede level-selected exclusive alternatives. Automatic safe-plan
+      limits and unattended execution limits remain enforced. Totals still use
+      the existing deduplicated subtree interval calculation.
+- [x] Repeatable `clean --select PATH` resolves canonical candidate paths or
+      full command keys after detection and uses `ManualOnly`. Unknown paths
+      list up to five detected descendants. Human rows/tips mark manual choices
+      and overrides, with yellow/red semantics and `NO_COLOR`. Clap-generated
+      help and completions include the flag; man generation continues to work.
+      Plan JSON preserves
+      `selection.status`/skip reasons and adds `candidate_key` and selected
+      `selection.source` (`kind`, manual `overrode`).
+- [x] Journal actions add `selection_source` and `overridden_skip_reason`;
+      missing fields default to level/no override for old JSONL records. Human
+      history marks manual selections and their overridden reason; JSON exposes
+      the fields. The journal schema remains 1.
+- [x] `Scanner::scan_with_observer_cancellable` accepts an optional
+      `Arc<AtomicBool>` and checks it between directories. Cancelled arenas
+      contain a `scan cancelled` coverage error, keeping partial accounting
+      incomplete. Existing scan entry points retain their behavior.
+
+Fixture tests cover core manual policy, exclusive selection and mode rules,
+key serde/exact argv, pipeline event order and output streams, stop-after-start
+behavior and durable journal snapshots, old journal parsing, CLI dry-run/apply/
+history/refusal/canonical selection, user-data unattended refusal, and scan
+cancellation. All filesystem/mutation fixtures use unique temporary directories.
+M0 adds no dependencies, TUI modules, or subcommands. Prerequisite item 6 (scoped
+scan reuse) and M1–M5 remain unimplemented.
+
+**Verification:** `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace --all-targets` (95 tests), and
+`rustup run 1.85.0 cargo check --workspace --all-targets` all passed. CLI help,
+Bash completion generation, man generation, and `git diff --check` also passed.
+**Correction:** the existing `man` command generates top-level command
+information, not subcommand option listings; M0 preserves that behavior.
+
+
+**M1 implemented (2026-10-13): TUI skeleton and browser entry point.**
+
+- [x] `cleanrs tui [PATH]` is a read-only clap subcommand; PATH defaults to `.`,
+      is canonicalized, and must be a directory. Both stdin and stdout must be
+      terminals; rejection happens before terminal modes or traversal. Generated
+      help/completions/man continue to include the subcommand.
+- [x] `cleanrs/src/tui/{mod,app,event,keymap,worker,theme}.rs` and
+      `views/{mod,browser,help}.rs` implement the specified module layout.
+      `App::handle(Action)` and `App::on_worker(WorkerEvent)` are pure state
+      transitions; queued `Request` effects perform I/O on workers. A screen
+      stack currently implements Browser and Help, leaving targets/review/run/
+      results for M3/M4. `T` says “targets view not implemented yet”.
+- [x] Raw mode/alternate screen have an RAII restoration guard, including
+      partial setup errors. The panic hook restores the terminal before
+      delegating to the prior hook. A dedicated input thread polls with a
+      bounded shutdown interval; the main loop uses `crossbeam_channel::select!`
+      for input, worker events, and 12.5 Hz busy ticks, blocking when idle.
+- [x] One keymap table supplies dispatch, help and footer hints, including
+      consecutive `gg`, navigation, half-pages, filter editing, match jumps,
+      sorting, info, rescan, help/back, and quit. `NO_COLOR` preserves symbols
+      and uses a reverse-video cursor without assigning any colors.
+- [x] Ratatui **0.29.0** (declared Rust 1.74) and its compatible Crossterm
+      **0.28.1** backend are pinned. Ratatui 0.30 requires Rust 1.88; Crossterm
+      0.29 would introduce an incompatible second event/backend version.
+      The transitive `instability` macro dependency is constrained to **0.3.10**,
+      because 0.3.11+ requires Rust 1.88. Rust **1.85.0** workspace/all-targets
+      verification passes with these dependencies.
+- TUI logging destination: deliberately **disabled** (`io::sink`), the simple
+  option permitted for M1; `-v`/`RUST_LOG` filtering is retained. Worker errors
+  are traced and also shown as dismissable status messages. CLI logging stays
+  unchanged. A persistent TUI log file remains a follow-up.
+
+**M2 implemented (2026-10-13): progressive read-only storage browser.**
+
+- [x] Immediate child metadata produces file sizes and pending directory rows.
+      Two bounded child jobs each use one existing scanner worker, the M0
+      cancellation token, and throttled `ScanObserver` progress. Queued scans
+      under the visible directory move ahead of background siblings; changing
+      directories preserves outstanding work. Quit cancels every job and does
+      not wait on an in-flight OS syscall before restoring the terminal.
+- [x] Completed child arenas are shared through `Arc<Snapshot>` with path-keyed
+      directory cache entries. Descending into completed subtrees renders
+      cached children immediately. Bottom-up summaries and parent accumulation
+      deduplicate hardlinks, including those across independent child jobs.
+      Parent totals grow with completed results; the activity line displays
+      aggregated directories/entries/bytes, completed children, and idle age.
+- [x] Path/volume header uses cheap `statvfs` and, on macOS, `statfs` filesystem
+      name (verified against the installed SDK's `sys/mount.h`); unsupported
+      filesystem types report unknown. Rows show allocated bytes with the
+      existing formatting helper, proportional bars, percentages, directory
+      suffixes, and name truncation by terminal cell width at 80 columns.
+- [x] `◆ N targets` is explicitly a **hint**, computed from the built-in
+      workspace detector marker/directory pairs; no separate marker list or
+      authoritative Cargo/provider detection is added. Subtree warnings show
+      incomplete coverage, mount boundaries, firmlinks, and dataless/cloud
+      entries, with a help legend for compact badges.
+- [x] Info uses the existing `estimate_subtree` interval, confidence, explanation,
+      and immediately-private lower bound. Large-subtree accounting runs off
+      the UI thread; pending or unavailable accounting says so. Size/name/age
+      sorts retain cursor identity as sizes arrive; substring filter, match
+      cycling, parent-on-demand, and directory history are implemented.
+      Rescan cancels/invalidates overlapping ancestors and descendants so a late
+      ancestor arena cannot resurrect stale results; revision checks discard
+      obsolete events.
+- [x] Synthetic state tests cover movement/navigation/history, cached descent,
+      sort identity, filter, help/back, placeholder, rescan/stale events, and
+      quit. `TestBackend` tests cover partial/finished browser, info/help,
+      symbols with/without colors, badges, and 80-column Unicode truncation.
+      TempDir worker fixtures compare every child and parent total against
+      `Scanner::scan`, including cross-child hardlinks and symlinks; cancellation
+      tests stop queued jobs. A piped CLI test asserts the non-TTY error and no
+      alternate-screen output.
+
+**Correction to the earlier M0 note:** M1/M2 are now implemented; M3–M5 and
+optional prerequisite item 6 (authoritative detection scan reuse) remain open.
+No M0 scanner/pipeline/accounting/mutation APIs were changed. `main.rs` only adds
+TUI dispatch before CLI terminal logging; existing CLI integration tests gain a
+non-TTY TUI regression test.
+
+**Known limits:** navigating before an ancestor job finishes can duplicate its
+subtree work (still bounded to two scanner workers); active jobs are cooperative
+and queue priority does not preempt an in-flight scan. The session cache has no
+size cap yet. Browser roots/rows conservatively avoid dataless directories and
+firmlinks, including canonical root firmlinks that a whole-root CLI scan can
+traverse. Initial child paths preserve OS names; cached descendant names inherit
+the scanner arena's lossy UTF-8 name representation. No live interactive TUI was
+launched during verification. Target selection, review, execution and results
+remain intentionally unavailable.
+
+**Verification:** `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace --all-targets` (108 tests), and
+`rustup run 1.85.0 cargo check --workspace --all-targets` pass. Help, Bash
+completions, man generation, and `git diff --check` are also checked.
+
+
+**M3 implemented (2026-10-13): scoped targets and exact candidate selection.**
+
+- [x] `tui/app.rs` extends the existing screen stack and owns per-scope
+      `Targets` caches, `CandidateKey` ticks, visual ranges, filter/sort state,
+      freshness and request generations. `T` scopes to the highlighted
+      directory, falling back to the current directory for a file. Back/re-entry
+      retains cached ticks; `r` and `m` retain choices for surviving selectable
+      candidates and apply the level default to newly found candidates.
+      Presets `1`/`2`/`3` explicitly discard manual ticks.
+- [x] `tui/worker.rs::plan_request` matches the CLI defaults (safe, 14-day Cargo
+      threshold, fixed user config resolution, no ad-hoc targets). Folder-only
+      inspection is the default; `m` includes machine-wide providers. A separate
+      serialized cleanup worker runs `build_reviewed_plan` off the UI thread,
+      forwards phase/scan/Cargo counters, and coalesces queued plans for the same
+      scope. Generation checks discard obsolete results.
+- [x] `views/targets.rs` shows all four checkbox/refusal states, concrete policy
+      labels, exact paths/argv, operation, age/threshold, rebuild cost,
+      recoverability, consequence, interval and confidence. Core `PolicyStatus`
+      and `DetectedTarget::{policy_status, manually_selectable, explicit_only}`
+      centralize explanations/availability; `PlannedTarget::policy_status`
+      also exposes whole-plan skips. The planner uses this same structured
+      policy decision and preserves existing skip-reason strings/JSON.
+      The CLI usage formatter is reused instead of duplicating interval rules.
+- [x] Space, visual range, Ctrl-a/Ctrl-r/u, level presets, scope toggle,
+      re-detection, review, filter and sorting are in the single keymap table.
+      Ctrl-a adds the current level's eligible set across the whole inventory;
+      invert/range can explicitly tick policy-skipped items. Every selection
+      path excludes refused/informational rows; core rejects them again.
+      Help and footer derive from the table; help scrolls at narrow heights.
+- [x] Footer changes debounce for 150 ms before a full pipeline rebuild, even
+      after navigating back to the browser. It shows updating rather than a
+      stale interval and keeps provider estimates/unknown actions separate.
+      Review always performs another fresh rebuild.
+
+**Selection-source decision:** every final tick is passed as a manual key with
+`SelectionMode::ManualOnly`, including initial level-selected ticks. This
+matches `clean --select` exactly and keeps unticked level-eligible items out.
+Eligible manual actions have `SelectionSource::Manual { overrode: None }`;
+policy overrides have `Some(reason)`. Review labels the former group “Selected
+by level” because they satisfy that policy, while history truthfully records
+that the final selection was manual. No `LevelPlusManual` special case is used.
+
+**M4 implemented (2026-10-13): review, guarded run and results.**
+
+- [x] `views/review.rs` renders only the returned `ReviewedPlan`, grouping
+      policy-eligible picks, manual overrides with the specified warning, and
+      explicit-only/user-data picks with a red irreversible-loss warning.
+      Count, shared interval, separate provider estimates and permanent-deletion
+      notice remain visible. Review scrolls; empty `x` is a status message,
+      Enter is inert, `y` alone confirms, and `n`/Esc preserves ticks.
+- [x] `Request::Execute` invokes the existing `execute_reviewed_plan` with
+      `unattended = false`, the shared stop flag, execution observer and normal
+      journal location. `enforce_apply_boundary` runs before switching screens
+      and again in the pipeline. No revalidation, cloud/path protection,
+      descriptor-relative deletion or journal implementation was changed.
+- [x] `views/run.rs` shows completed/total gauge, pending/running/success/
+      failure/validation-abort/skip evidence, and scrollable last-200-line
+      stdout/stderr output, with a bounded 256-event worker channel for
+      backpressure. Control characters are removed from terminal display
+      only; original journal summaries remain intact. `q`/Ctrl-c asks “Stop
+      after the current action? y/n”; `y` sets the cooperative flag and does not
+      interrupt an in-flight action. Ctrl-c from run help follows the same flow.
+- [x] `views/results.rs` preserves history's evidence/status vocabulary,
+      separates removed allocation and provider reports, and shows the run ID
+      plus `cleanrs history`. Returning to the browser invalidates overlapping
+      ancestor/descendant arenas and targets scopes, then schedules fresh scans.
+      This also refreshes parents when provider commands expose a changed path.
+- [x] TUI diagnostics now append to a private `tui.log` beside history, with
+      ANSI disabled. This replaces M1's deliberately disabled logging.
+      Errors remain dismissable status messages and are traced.
+- [x] New `tui/tests.rs` covers selection keys/presets/refusal, cache reuse,
+      stale-plan rejection, grouped review, Enter versus y, retained ticks,
+      stop confirmation, worker planning progress/debounce, and all four views
+      on `TestBackend` with/without color, including narrow layouts. Fixture
+      `.next`/`dist`/`node_modules` keys produce the same actions, operations,
+      selection sources and interval as equivalent CLI `--select` requests.
+      Child-process execution fixtures set HOME/XDG state under a unique TempDir:
+      only the selected directory is removed, journal overrides persist, provider
+      streams arrive between start/finish, and stopping skips subsequent actions
+      while the running provider finishes. Existing CLI/core safety tests pass.
+
+**M2 review corrections implemented:** the initial browser cursor follows the
+top sorted row until the user first moves it; subsequent updates retain path
+identity. Singular badges say `◆ 1 target`, and recognized target-directory
+rows carry IDs such as `◆ node.modules`. State, render and scan-fixture tests
+cover these corrections. These changes supersede M2's unconditional cursor
+identity statement above.
+
+**Correction to earlier progress notes:** M3/M4 now replace the placeholder;
+selection/review/execution/results are available. M5 polish and optional
+prerequisite item 6 (reuse of authoritative scan facts) remain follow-ups.
+Existing scan-cache limits and possible duplicate ancestor/subtree work remain;
+selection totals intentionally rebuild through the pipeline rather than adding
+per-file private sizes. No new crates, dependencies, config search locations,
+CLI mutation flags or journal schema were added. The only M0 edits are the
+structured core accessor and making the CLI usage formatter crate-visible;
+shared pipeline/execution/journal code remains unchanged.
+
+**Verification:** all four required commands pass: `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace --all-targets` (121 tests), and
+`rustup run 1.85.0 cargo check --workspace --all-targets`.
+Headless tmux checks used only a temporary workspace and sandbox HOME/state:
+browser, targets, manual-override review, cancel/back and 80-column targets/review
+were inspected without confirming deletion. The sessions were killed afterwards.
+
+**Orchestrator end-to-end review of M0–M4 (2026-10-13).** Re-ran all four
+verification commands (121 tests pass). Drove the release binary in headless
+tmux with a `mktemp` fixture and `HOME` pointed at a `mktemp` directory:
+browser → `T` on a project → ticked a `needs standard` `node_modules` override
+→ review showed it in the warned "Manually selected — not eligible by default"
+group → `Enter` did not confirm, `y` did → exactly the three selected
+directories were deleted (sibling `package.json` and the other project's Cargo
+`target` untouched) → results screen and `cleanrs history` agree, including
+`[manual: requires standard cleanup level]` → returning to the browser
+showed rescanned sizes. Findings to address in M5:
+
+1. **Plan rebuild cost per tick.** Each selection change (debounced 150 ms)
+   rebuilds the full plan, which rescans the whole scope. On the author's
+   `~/Developer` (~108 GiB) a scan took ~25 s, so the footer total and `x`
+   would lag badly on large scopes. Compute the live footer from the cached
+   detection result (same core interval function over the selected
+   candidates), and rebuild through the pipeline only on `x`, with visible
+   progress. Consider prerequisite item 6 (scan reuse) here.
+2. **`T` on a row that is itself a target** (e.g. `node_modules/`) scopes
+   detection to that directory and finds 0 targets. When the highlighted row
+   is a recognized target directory, scope to the current directory and put
+   the cursor on that target.
+3. **Results screen sizes** print raw bytes ("removed 41943040 bytes
+   allocation"); use the shared human size formatter while keeping
+   history's vocabulary.
+4. **Detail pane** ends with a dangling separator ("confidence High ·").
+5. Every TUI tick is journalled as `manual` (`ManualOnly`, by design). The
+   history marker `[manual]` without a reason means "policy-eligible, picked
+   by hand"; document this in README/`history` help.
+
+
+**M5 implemented (2026-10-13): cache totals, review freshness, and polish.**
+
+- [x] `pipeline::SelectionAccounting` retains the detection arena and candidate
+      root indices in a non-serialized `Arc`; `SelectionSummary` serves both
+      CLI plan totals and immediate TUI footers via `estimate_subtrees` and the
+      identical saturating provider summation/unknown counts. Tick/range/all/
+      none/invert changes and cached level presets enqueue no scan/plan work.
+      All three policy presets are computed through the core planner on the
+      detection worker; App switches cached selections without filesystem I/O.
+      Review generations still reject an older selection’s in-flight plan.
+- [x] `x` shows “building reviewed plan…” plus `PlanObserver` phase/counter
+      progress. `build_tui_reviewed_plan` uses the shared builder in ManualOnly
+      mode, narrowing ticks that vanished, became refused, or changed captured
+      filesystem identity, usage, risk policy, provider identity, or exact operation. App names
+      every dropped tick in a yellow review notice (or a status if none remain).
+      CLI selection still errors for unknown/refused picks; execution,
+      immediate revalidation, preflight and journal behaviour are unchanged.
+- [x] Browser marker badges also drive `T` scoping: recognized target rows use
+      the current folder and focus the matching candidate, including cached
+      re-entry. Results and human history use `human_bytes` with the existing
+      “removed … allocation” / “provider reported” vocabulary; JSON stays bytes.
+      Detail confidence joins present explanation parts without a trailing dot.
+- [x] Browser scan and targets detection age share s/m/h freshness labels;
+      data older than ten minutes is yellow with “press r to refresh”. Every
+      view displays traced red errors dismissable by any key, while recognized
+      keys continue navigating. PermissionDenied listing failures use coverage
+      events/badges rather than error status; scanner subtree coverage stays
+      non-fatal. The private M4 log location remains unchanged.
+- [x] Help descriptions follow each screen’s actual review/stop/refresh actions.
+      Footers use the shared keymap and remove complete low-priority hints first
+      to fit the available width, retaining confirm/review/help/back. All views
+      are exercised at 80×24 and with colors disabled; below 80×20 the renderer
+      shows a centered “terminal too small (need 80x20)” message.
+- [x] README adds a keymap and partial-selection walkthrough, `[manual]` versus
+      override semantics, freshness/error/minimum-size details. VISION §13 and
+      `tui`/`history` clap help match; top-level man generation remains intact.
+- [x] Regression fixtures prove no tick/preset worker requests, cached interval
+      equivalence with a reviewed hardlink selection, separate provider/unknown
+      sums, grown-allocation refusal, marker-row focus,
+      vanished/replaced/newly-refused drop notices without widening, invalid
+      scope error rendering/dismissal, freshness, and complete help/no-color
+      layouts across every screen. Existing sandbox execution parity tests pass.
+
+**Correction to M3/M4 notes:** the 150 ms debounce and full pipeline rebuild
+for selection totals are removed. Only detection (`T` cache miss, `r`, `m`),
+review (`x`), and an uncached preset need planning. Cached presets apply the
+worker-computed policy choices and discard manual ticks entirely in memory. The UI reads cached facts
+for its total; it never executes that cache. M1’s indefinite idle wait is now a
+one-second freshness tick so aging data warns without requiring keyboard input.
+All previously ticked Phase 5A practical completion criteria remain met.
+
+**Deferred optimization:** optional prerequisite item 6 remains a follow-up:
+`T` and `x` still scan their scope rather than reusing browser arenas. Detection
+arenas are retained for exact live totals; the session cache still has no size
+cap. No real home/Developer workload was run for M5, and no large-tree scan-reuse
+performance claim is made.
+
+
+**M5 verification:** `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace --all-targets` (**128 tests**), and
+`rustup run 1.85.0 cargo check --workspace --all-targets` pass. `tui --help`,
+`history --help`, full `man` generation and `git diff --check` also pass.
+NO_COLOR tmux walkthroughs used only mktemp workspaces and isolated HOME/state
+at 110×30 and 80×24: browser → `T` on `node_modules` → one tick → review →
+Enter inert → n cancel → x/y confirm → results/history both say
+“removed 40.0 MiB allocation [manual: requires standard cleanup level]”
+(the manual suffix is in history) → browser refreshed to 12.0 MiB. Sibling
+`.next`, `dist`, `package.json` and the Cargo fixture stayed intact. Removing
+only the temporary project then pressing r showed a red planning error,
+appended it to the sandbox TUI log, and an unbound key dismissed it. At 60×15,
+the centered minimum-size message rendered. All sessions and fixtures were
+removed; no real home/Developer scan or mutation was performed.
+
+
 ### Testing strategy
 
 - `App` state transitions tested directly with synthetic key/worker events
@@ -848,22 +1213,22 @@ error, and panic (panic hook). Non-TTY invocation fails with a clear error
 
 ### Practical completion criteria
 
-- [ ] `cleanrs tui [PATH]` opens on the working directory by default and never
+- [x] `cleanrs tui [PATH]` opens on the working directory by default and never
       implicitly on the home directory; non-TTY invocation fails clearly.
-- [ ] Browser shows sizes progressively with visible scan activity and lets the
+- [x] Browser shows sizes progressively with visible scan activity and lets the
       user navigate before the scan finishes.
-- [ ] `T` lists the directory’s targets with the same IDs, states, and
+- [x] `T` lists the directory’s targets with the same IDs, states, and
       intervals as `cleanrs targets PATH --workspace-only`.
-- [ ] Items can be toggled individually, by range, all/none/invert, and by
+- [x] Items can be toggled individually, by range, all/none/invert, and by
       level preset; refused items cannot be selected by any key.
-- [ ] Manually selected ineligible items are executed, are highlighted in the
+- [x] Manually selected ineligible items are executed, are highlighted in the
       list and in a separate warned group on the review screen, and are
       journalled as manual selections.
-- [ ] Execution requires an explicit `y`, runs through the shared pipeline with
+- [x] Execution requires an explicit `y`, runs through the shared pipeline with
       full revalidation, shows live progress, and produces history identical to
       an equivalent `clean --select … --apply` run.
-- [ ] Totals are intervals computed by the shared plan-summary code.
-- [ ] `NO_COLOR` and narrow terminals remain usable; every long operation shows
+- [x] Totals are intervals computed by the shared plan-summary code.
+- [x] `NO_COLOR` and narrow terminals remain usable; every long operation shows
       progress.
 
 ### Follow-ups (not in this phase)
@@ -955,7 +1320,8 @@ rules.
 - CLI tables, progress indicators, semantic colors, redirected output, and
   `NO_COLOR` behavior provide reusable presentation groundwork.
 - `index.rs` is an inert placeholder.
-- No `tui`, `index`, or `schedule` command exists.
+- **Correction (Phase 5A):** `tui` now exists; `index` and `schedule` remain
+  unimplemented. The original Phase 5 status listed all three as unavailable.
 
 ### Incremental index
 
@@ -1063,29 +1429,25 @@ seams but do not constitute supported Linux behavior.
 
 Work should continue in this order:
 
-1. **Phase 5A M0:** extract the shared plan/execution/journal pipeline from
-   `main.rs`, add per-candidate selection with a recorded selection source,
-   ship `clean --select PATH`, and add scanner cancellation. CLI behaviour and
-   tests must remain unchanged.
-2. **Phase 5A M1–M5:** `cleanrs tui [PATH]` skeleton, browser with progressive
-   per-child scanning, scoped targets view with selection, review/run/results
-   through the shared pipeline, then polish and documentation.
-3. Investigate an observation from the 2026-10-13 real-tree dry run of
-   `~/Developer`: several `cargo.target` candidates `targets` reported as
-   `eligible` (71–125 days old) did not appear among the selected actions at
-   the `safe` or `standard` level. Confirm whether this is the intended
-   severity gate or a planning gap before the TUI presents the same selection.
-4. Begin Phase 4 project hygiene using the shared pipeline rather than adding a
-   second mutation path: Cargo shared-target ownership and project-activity
-   evidence first, then repository state, worktree, lockfile, and
-   process-activity evidence.
-5. In parallel with normal feature work, land the Phase 1 largest-file view,
-   packed-record parser fixtures, and a checked-in performance baseline.
+1. **Phase 5A M0–M5 complete:** shared cleanup pipeline, per-candidate
+   selection, browser/targets/review/run/results, cached totals, safety parity,
+   freshness, terminal polish and documentation are implemented (details above).
+2. Begin **Phase 4 project hygiene** using the shared pipeline: Cargo
+   shared-target ownership and project-activity evidence first, then repository
+   state, worktree, lockfile and process-activity evidence.
+3. **Resolved Cargo observation (2026-10-13):** stale `cargo.target` actions
+   intentionally require aggressive severity; the targets UI now says “needs
+   aggressive” at lower levels. Fourteen days is an artifact threshold, not
+   proof that the repository is abandoned.
+4. Alongside normal feature work, finish the Phase 1 largest-file view,
+   packed-record parser fixtures and a checked-in performance baseline.
+5. Keep the TUI follow-ups listed above: bare `cleanrs` launch, history view,
+   index-backed startup and mouse support; browser-arena detection/review reuse
+   remains optional measured performance work.
 6. Revisit Trash only as an explicit moved-not-reclaimed workflow, and add
    observed APFS container-free-space evidence only when its measurement
    boundary is truthful and reproducible.
 
 Phases 0–3 now provide accounting, read-only inventory, immutable cleanup plans,
 guarded execution, persistent config trust, and lightweight history. Phase 5A
-(the interactive TUI) is the next concrete feature boundary, followed by
-Phase 4.
+(the interactive TUI) now completes the next feature boundary; Phase 4 is next.

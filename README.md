@@ -6,8 +6,10 @@ Storage usage analyzer and cleaner for developers, written in Rust. Fully transp
 > workspace/provider `targets` commands are joined by immutable cleanup plans,
 > guarded `clean --apply`, persistent command-config trust, and action-level
 > `history`. Direct deletion is descriptor-relative and provider commands are
-> revalidated before execution. The interactive `cleanrs tui` (Phase 5A) is next,
-> followed by Phase 4 project hygiene; deeper snapshot
+> revalidated before execution. `cleanrs tui` now supports progressive sizes,
+> navigation, accounting details, scoped target selection, and reviewed cleanup
+> through the same guarded pipeline. Phase 5A polish comes next, followed by
+> Phase 4 project hygiene; deeper snapshot
 > and File Provider research remains deferred unless it enables a concrete
 > capability. See
 > [the findings](docs/findings-phase0.md), [VISION.md](VISION.md), and the
@@ -102,7 +104,8 @@ establish, before anything is built on top of it.
 
 ## Safety
 
-- Dry-run is the **default**. `--apply` is always required.
+- Dry-run is the **default**. CLI mutation requires `--apply`; the TUI requires
+  an explicit `y` on its review screen.
 - `--apply` deletes permanently, because moving files to the Trash does not
   return space to the disk. `--trash` is intentionally deferred and currently
   refuses; its future accounting must report *moved, not reclaimed*.
@@ -134,10 +137,10 @@ establish, before anything is built on top of it.
 cleanrs scan [PATH]      One-shot analysis (--json, --reclaimable, --explain)
 cleanrs doctor           Reconcile container state; report the unexplained gap
 cleanrs targets [PATH]   List workspace targets and machine-wide provider actions
-cleanrs clean [PATH]     Plan cleanup; --apply executes the reviewed plan
+cleanrs clean [PATH]     Plan cleanup; --select PATH picks items; --apply executes
 cleanrs history          Action outcomes and evidence from applied runs
 cleanrs trust-config     Trust/list/revoke an explicit command config by hash
-cleanrs tui [PATH]       Next: browse sizes, pick targets, review and clean
+cleanrs tui [PATH]       Browse storage, select targets, review and run cleanup
 cleanrs schedule         Planned launchd maintenance
 cleanrs index            Planned cache control
 ```
@@ -257,6 +260,13 @@ shared, or out-of-scope target directories are still shown but refused until
 complete ownership can be proven; source repositories are never cleanup
 targets.
 
+`clean --select PATH` selects an individual detected candidate; repeat the flag
+for multiple items. It selects exactly those items, overriding severity and
+staleness policy, while safety refusals remain enforced. Manual choices are
+marked in the plan and history; explicit-only/user-data actions still require
+interactive confirmation. Command candidates can be selected by the exact
+`candidate_key` string from `clean --json`. Dry-run remains the default.
+
 `clean` uses the same explicit workspace scan, candidate safety checks, and
 provider inspection, then explains which actions the selected cleanup level and
 staleness policy include. Dry-run remains the default. `--apply` executes that
@@ -278,11 +288,71 @@ Applied runs are appended to a private, rotating JSONL journal under
 `~/.local/state/cleanrs/history.jsonl`. A pending record is durable before the
 first mutation and each completed action adds a newer snapshot, so interruption
 remains visible. `cleanrs history` collapses those snapshots into one run and
-shows what ran, what was skipped, and what failed.
+shows what ran, what was skipped, and what failed. `[manual]` means
+“policy-eligible, picked by hand”; `[manual: <reason>]` means an explicit policy
+override. Every final TUI tick, including a preset pick, is journalled as manual.
 
 `doctor --scan PATH` reconciles one explicit scan scope against Data-volume
 usage and labels the remainder as unattributed. Without `--scan`, it stays cheap
 and reports the path attribution as unknown rather than inventing a number.
+
+### Interactive cleanup
+
+`cleanrs tui [PATH]` requires a terminal and starts in the working directory
+when PATH is omitted. Use `j`/`k` to move, `l`/Enter to open, `h` to go up,
+`/` to filter, `s` to sort, and `i` for accounting details. `T` opens cleanup
+targets for the highlighted directory, or the current directory for a file.
+On a recognized target row such as `node_modules/`, `T` uses the containing
+folder and focuses that target.
+
+In targets, Space toggles an item and moves down; `v` starts a range (move,
+then `v` or Space to select it; Esc cancels). Ctrl-a adds level-eligible items,
+Ctrl-r inverts selectable items, and `u` clears ticks. `1`/`2`/`3` reset to
+safe/standard/aggressive, discarding manual ticks. `m` includes machine-wide
+providers; `r` re-detects. Re-detection retains choices for surviving selectable
+candidates. Returning with `q`/Esc keeps the cached selection and detection age.
+
+The selected interval updates immediately from cached detection facts, using
+the same set accounting as CLI plans; ticks and level presets do not rescan.
+`x` rebuilds and reviews exactly the ticked candidates with visible progress.
+If an item vanished, changed identity/operation, or became refused since
+detection, review names the dropped selection. Ticking is explicit
+naming: level/staleness overrides appear in a warned group, and explicit-only
+or user-data choices carry a stronger warning. Refused and informational items
+cannot be selected. Only `y` on review confirms permanent deletion; Enter does
+not confirm, and `n`/Esc returns with ticks intact. During a run, `q` or Ctrl-c
+asks to stop after the current action; `[`/`]` scroll provider output. Results
+separate removed allocation from provider reports, show the run ID, and point
+to `cleanrs history`. Returning to the browser refreshes affected directories.
+
+`?` shows context help (scroll with `j`/`k`). `NO_COLOR` preserves meaningful
+symbols. Browser scan age and target detection age use seconds/minutes/hours;
+data older than ten minutes is yellow with “press r to refresh”. Errors appear
+as red status messages; any key dismisses them and navigation still works.
+The TUI supports terminals of at least 80×20, and shows a centered message
+below that size. Diagnostics go to `~/.local/state/cleanrs/tui.log` (or
+`$XDG_STATE_HOME/cleanrs/tui.log`) beside the history journal.
+
+| Screen | Main keys |
+|---|---|
+| All | `?` help; `q`/Esc back (quit in browser); Ctrl-c quit (ask to stop during a run) |
+| Lists | `j`/`k` or arrows move; `gg`/`G` first/last; Ctrl-d/Ctrl-u half page; `/` filter; `n`/`N` matches; `s` sort |
+| Browser | `l`/Enter/right open; `h`/left/Backspace parent; `-` previous directory; `T` targets; `i` info; `r` rescan |
+| Targets | Space toggle; `v` range; Ctrl-a eligible; Ctrl-r invert; `u` clear; `1`/`2`/`3` presets; `m` machine scope; `r` re-detect; `x` review |
+| Review | `y` confirm; `n`/Esc cancel; Enter does not confirm |
+| Run | `q`/Esc/Ctrl-c ask to stop; `y`/`n` answer; `[`/`]` scroll provider output |
+| Results | `j`/`k`, `gg`/`G`, Ctrl-d/Ctrl-u scroll; `q`/Esc returns to refreshed browser |
+
+To clean only some items:
+
+1. Start `cleanrs tui PATH`, navigate to a project, and press `T`.
+2. Press `u` to clear the initial preset. Move to each desired item and press
+   Space; only those ticks will enter review. `[!]` warns about a policy
+   override and `✗` marks an untickable refusal.
+3. Press `x`, wait for the fresh reviewed plan, and read its actions and any
+   dropped-item notice. Press `n` to revise your picks or `y` to delete exactly
+   the reviewed items permanently.
+4. Read results and use `cleanrs history` for the recorded evidence.
 
 ### Terminal output
 

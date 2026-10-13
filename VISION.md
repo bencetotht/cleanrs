@@ -1,8 +1,8 @@
 # cleanrs — Vision & Design
 
-> **Status:** design reference with Phases 0–3 implemented: filesystem and
+> **Status:** design reference with Phases 0–3 and Phase 5A implemented: filesystem and
 > accounting foundations, read-only inventory/planning, guarded cleanup
-> execution, persistent command-config trust, and lightweight history.
+> execution, persistent command-config trust, lightweight history, and interactive cleanup.
 > Empirical results and unresolved gates are tracked in
 > [docs/findings-phase0.md](docs/findings-phase0.md). This file remains the
 > reference for what cleanrs is, why it exists, and how it should be built.
@@ -1036,7 +1036,8 @@ Everything downstream depends on it.
 cleanrs scan [PATH]           One-shot analysis. Ranked by allocated by default.
                               --json --apparent --allocated --private --reclaimable
                               --depth N --min-size --exclude --explain
-cleanrs tui  [PATH]           Interactive browser (ratatui).
+cleanrs tui  [PATH]           Browse storage, select targets, review and run cleanup.
+                              Working directory default; y on review confirms.
 cleanrs doctor                Reconcile container state; report unexplained gap.
                               --container <id> --all-containers
 cleanrs targets               List detected targets with sizes and confidence.
@@ -1045,7 +1046,7 @@ cleanrs clean                 Reclaim space. Dry-run by DEFAULT.
                               --level safe|standard|aggressive
                               --apply --yes
                               --trash (reserved; currently refuses)
-                              --only --exclude --target... --config
+                              --only --exclude --select PATH --target... --config
 cleanrs history               Journal of plan decisions, outcomes, removed
                               allocation, provider reports, and errors.
 cleanrs trust-config PATH     Trust/list/revoke explicit command config content.
@@ -1053,9 +1054,12 @@ cleanrs schedule install|remove|status
 cleanrs index [--reindex|--clear|--status]
 ```
 
-Cross-cutting rules: dry-run default for anything destructive; `--json` on every
-command; meaningful exit codes for scripting; shell completions and a man page
-shipped; `NO_COLOR` respected; non-TTY degrades to plain output.
+Cross-cutting rules: dry-run default for anything destructive; meaningful exit
+codes for scripting; shell completions and a man page shipped; `NO_COLOR`
+respected. Ordinary CLI reports offer `--json` and non-TTY plain output.
+**Correction (Phase 5A):** the interactive `tui` command requires a terminal
+on stdin/stdout, has no JSON mode, and uses explicit `y` review confirmation
+in place of the CLI’s `--apply`. It never implicitly starts at the home directory.
 
 Filesystem scans have no knowable total until traversal completes, so interactive
 `scan` and scan-backed diagnostics show an **indeterminate** progress indicator
@@ -1069,6 +1073,33 @@ selection information. Paths retain their complete home-relative context (for
 example `~/Developer/Projects/example/target`) rather than becoming ambiguous
 scan-root-relative fragments. Exact argv, consequences, provider identity, and
 full evidence belong to JSON rather than being wrapped into every terminal row.
+
+`clean --select PATH` is explicit naming of individual detected candidates.
+Repeated selections use exactly the named candidates, even if severity,
+staleness, or explicit-only policy would otherwise skip them. Safety refusals
+remain absolute. Plans and history mark the manual choice and overridden policy
+reason; user-data/explicit-only actions still require interactive confirmation.
+Command candidates accept the exact `candidate_key` from plan JSON.
+
+`cleanrs tui [PATH]` links a progressive browser (`T` opens scoped targets)
+with per-item selection (Space, ranges, all/none/invert, level presets), review
+(`x`), execution (`y` only), and results. `T` on a recognized target directory
+uses its containing folder and focuses that target. Machine-wide providers
+are opt-in with `m`; refused/informational rows cannot be ticked. Live selected
+intervals use cached detection arenas and the shared plan-summary computation;
+`x` rebuilds through the authoritative pipeline with progress and names any
+selected candidates dropped after identity/operation changes or new refusals.
+No cached arena bypasses mutation revalidation or journalling (§8.2).
+
+Every final TUI tick is manual explicit naming: history’s `[manual]` means
+“policy-eligible, picked by hand”, while `[manual: <reason>]` records an override.
+Browser and detection ages use s/m/h and warn after ten minutes with a refresh
+hint. Every screen has `?` help, NO_COLOR retains semantic symbols, and the
+minimum layout is 80×20. Dismissable errors are logged to the fixed state
+location (`~/.local/state/cleanrs/tui.log`, or `$XDG_STATE_HOME/cleanrs/tui.log`).
+Results label removed allocation and provider reports separately; returning to
+the browser refreshes affected directories. The README contains the keymap and
+walkthrough for cleaning only selected items.
 
 `scan` ranks by **allocated** size by default. This is not only the honest
 default — it is also a safety property: dataless cloud files have enormous
