@@ -1087,9 +1087,21 @@ with per-item selection (Space, ranges, all/none/invert, level presets), review
 uses its containing folder and focuses that target. Machine-wide providers
 are opt-in with `m`; refused/informational rows cannot be ticked. Live selected
 intervals use cached detection arenas and the shared plan-summary computation;
-`x` rebuilds through the authoritative pipeline with progress and names any
+completed browser arenas can supply discovery facts, preserving their original
+age. Explicit refresh scans fresh; incomplete browser data or changed child
+identities fall back to scanning. `x` rebuilds through the authoritative pipeline,
+walking selected candidate trees and ancestor listings, with progress and names any
 selected candidates dropped after identity/operation changes or new refusals.
 No cached arena bypasses mutation revalidation or journalling (§8.2).
+The targets table shows project paths relative to its scope, with exact operations
+in the detail pane. Review shows counted policy groups, numbered actions,
+confidence, consequences and an explicit permanent-deletion confirmation.
+Session caches evict oldest completed arenas and all their aliases: browser
+storage is capped at 250,000 nodes/4,096 aliases and 32 listings/250,000 inactive rows; target detection
+at eight scopes/250,000 nodes. Active views, immutable reviewed plans and
+in-flight work may exceed cache limits, and are released when no longer needed.
+**Correction to the initial Phase 5A behavior:** detection/review no longer
+unconditionally rescan the full scope, and session caches are no longer unbounded.
 
 Every final TUI tick is manual explicit naming: history’s `[manual]` means
 “policy-eligible, picked by hand”, while `[manual: <reason>]` records an override.

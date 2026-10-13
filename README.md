@@ -310,11 +310,17 @@ then `v` or Space to select it; Esc cancels). Ctrl-a adds level-eligible items,
 Ctrl-r inverts selectable items, and `u` clears ticks. `1`/`2`/`3` reset to
 safe/standard/aggressive, discarding manual ticks. `m` includes machine-wide
 providers; `r` re-detects. Re-detection retains choices for surviving selectable
-candidates. Returning with `q`/Esc keeps the cached selection and detection age.
+candidates. Returning with `q`/Esc keeps the cached selection and detection age until that
+scope is evicted from the bounded session cache. The project-path column is
+relative to the targets scope; the detail pane keeps the exact operation.
 
 The selected interval updates immediately from cached detection facts, using
 the same set accounting as CLI plans; ticks and level presets do not rescan.
-`x` rebuilds and reviews exactly the ticked candidates with visible progress.
+`T` reuses completed browser scans when all child directories are available;
+incomplete scans or newly added/replaced directories fall back to a full scan.
+`r` always scans fresh. Cached detection keeps the browser facts' original age.
+`x` rebuilds and reviews exactly the ticked candidates with visible progress,
+scanning their trees and ancestor listings rather than unrelated projects.
 If an item vanished, changed identity/operation, or became refused since
 detection, review names the dropped selection. Ticking is explicit
 naming: level/staleness overrides appear in a warned group, and explicit-only
@@ -324,6 +330,15 @@ not confirm, and `n`/Esc returns with ticks intact. During a run, `q` or Ctrl-c
 asks to stop after the current action; `[`/`]` scroll provider output. Results
 separate removed allocation from provider reports, show the run ID, and point
 to `cleanrs history`. Returning to the browser refreshes affected directories.
+
+Session caches evict the oldest completed scans as whole arenas, including
+all descendant aliases and inactive listings that retain them. Browser arenas
+are capped at 250,000 nodes and 4,096 path aliases; listings at 32 folders and 250,000 inactive rows.
+Target detections are capped at eight scopes and 250,000 nodes in total.
+The visible folder/targets, reviewed plan, and in-flight work are working data
+and may exceed the cache limits; leaving oversized views releases their data.
+Review groups show action counts, numbered operations, confidence and rebuild
+consequences above the permanent-deletion confirmation.
 
 `?` shows context help (scroll with `j`/`k`). `NO_COLOR` preserves meaningful
 symbols. Browser scan age and target detection age use seconds/minutes/hours;

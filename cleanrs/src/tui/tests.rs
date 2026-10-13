@@ -128,6 +128,7 @@ fn fabricated(root: &Path) -> ReviewedPlan {
     }
     let accounting = Arc::new(pipeline::SelectionAccounting::new(arena, true, &targets));
     ReviewedPlan {
+        scan_finished: None,
         accounting,
         coverage_complete: true,
         providers: Vec::new(),
@@ -1545,4 +1546,114 @@ fn cached_summary_keeps_provider_reported_and_unknown_estimates_separate() {
     assert_eq!(summary.provider_actions, 3);
     assert_eq!(summary.unknown_actions, 1);
     assert_eq!(summary.estimate.ceiling, Some(0));
+}
+
+#[test]
+fn review_walk_is_limited_to_selected_trees() {
+    use std::{sync::Mutex, time::Instant};
+    struct Counting(Mutex<u64>);
+    impl PlanObserver for Counting {
+        fn on_event(&self, _: PlanEvent) {}
+        fn on_scan_progress(&self, progress: ScanProgress) {
+            *self.0.lock().unwrap() = progress.directories;
+        }
+    }
+    let fixture = tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("chosen/.next")).unwrap();
+    std::fs::write(root.join("chosen/package.json"), b"{}").unwrap();
+    std::fs::write(root.join("chosen/.next/payload"), vec![0; 4096]).unwrap();
+    for n in 0..100 {
+        std::fs::create_dir_all(root.join(format!("unrelated/{n}/deep"))).unwrap();
+        std::fs::write(
+            root.join(format!("unrelated/{n}/deep/payload")),
+            b"unrelated",
+        )
+        .unwrap();
+    }
+    let started = Instant::now();
+    let baseline = pipeline::build_reviewed_plan(
+        worker::plan_request(
+            root.clone(),
+            Some(root.join("home")),
+            CleanupLevel::Safe,
+            false,
+            None,
+        ),
+        Arc::new(Quiet),
+    )
+    .unwrap();
+    let full_elapsed = started.elapsed();
+    let key = baseline
+        .targets
+        .iter()
+        .find(|t| t.target.id == "node.next")
+        .unwrap()
+        .candidate_key
+        .clone();
+    let observer = Arc::new(Counting(Mutex::new(0)));
+    let started = Instant::now();
+    let reviewed = pipeline::build_tui_reviewed_plan(
+        worker::plan_request(
+            root.clone(),
+            Some(root.join("home")),
+            CleanupLevel::Safe,
+            false,
+            Some(HashSet::from([key])),
+        ),
+        observer.clone(),
+        &baseline,
+    )
+    .unwrap();
+    eprintln!(
+        "fixture review: full discovery {:?}; selected review {:?}",
+        full_elapsed,
+        started.elapsed()
+    );
+    assert_eq!(reviewed.actions.len(), 1);
+    assert_eq!(
+        reviewed.actions[0].target.path,
+        Some(root.join("chosen/.next"))
+    );
+    assert_eq!(
+        *observer.0.lock().unwrap(),
+        1,
+        "unrelated directories must never be walked"
+    );
+}
+
+#[test]
+fn relative_project_paths_and_wrapped_review_end_are_visible() {
+    let (_dir, mut app) = fixture();
+    let scope = app.target_scope.clone().unwrap();
+    let targets = app.targets_cache.get_mut(&scope).unwrap();
+    let baseline = Arc::make_mut(targets.baseline.as_mut().unwrap());
+    baseline.targets[0].target.project_root = Some(scope.join("first/apps/web"));
+    baseline.targets[1].target.project_root = Some(scope.join("second/apps/web"));
+    let text = rendered(&app, false, 150, 32).0;
+    assert!(text.contains("Project path"));
+    assert!(text.contains("first/apps/web") && text.contains("second/apps/web"));
+    app.handle(Action::Invert);
+    review(&mut app);
+    app.page_width = 80;
+    app.page_rows = 13;
+    app.handle(Action::Last);
+    let bottom = rendered(&app, false, 80, 24).0;
+    assert!(bottom.contains("After cleanup: regenerate with fixture build"));
+    let end = app.review_scroll;
+    app.handle(Action::Move(-1));
+    assert_eq!(app.review_scroll, end.saturating_sub(1));
+    app.handle(Action::Cancel);
+    assert!(app.reviewed.is_none());
+    app.handle(Action::Rescan);
+    assert!(
+        matches!(
+            app.drain_requests().last(),
+            Some(Request::Plan {
+                browser_scan: None,
+                ..
+            })
+        ),
+        "explicit refresh must bypass the browser cache"
+    );
 }

@@ -188,6 +188,13 @@ pub fn review_group(source: &SelectionSource, explicit_only: bool) -> usize {
     }
 }
 
+// Bound both arena storage and its aliases. The visible directory/review and
+// worker-owned scans are working data, not cache, and can exceed these limits.
+const CACHE_NODES: usize = 250_000;
+const CACHE_PATHS: usize = 4_096;
+const CACHE_LISTINGS: usize = 32;
+const CACHE_TARGET_SCOPES: usize = 8;
+
 pub struct App {
     pub current: PathBuf,
     pub home: Option<PathBuf>,
@@ -211,6 +218,7 @@ pub struct App {
     pub quit: bool,
     pub tick: usize,
     pub page_rows: usize,
+    pub page_width: u16,
     revision: u64,
     effects: Vec<Request>,
     explaining: Option<PathBuf>,
@@ -239,6 +247,7 @@ impl App {
             status: None,
             quit: false,
             tick: 0,
+            page_width: 80,
             page_rows: 20,
             revision: 0,
             effects: Vec::new(),
@@ -472,6 +481,88 @@ impl App {
         }
     }
 
+    fn trim_caches(&mut self) {
+        // Charge a shared snapshot once, then evict every alias together. Merely
+        // removing one path would leave the same arena retained by descendants.
+        loop {
+            let snapshots: HashMap<_, _> = self
+                .cache
+                .values()
+                .map(|(s, _)| (Arc::as_ptr(s), s.clone()))
+                .collect();
+            let nodes: usize = snapshots.values().map(|s| s.scan.arena.nodes.len()).sum();
+            if nodes <= CACHE_NODES && self.cache.len() <= CACHE_PATHS {
+                break;
+            }
+            let Some(oldest) = snapshots.values().min_by_key(|s| s.finished).cloned() else {
+                break;
+            };
+            self.cache.retain(|_, (s, _)| !Arc::ptr_eq(s, &oldest));
+            self.directories.retain(|path, d| {
+                path == &self.current
+                    || !d.rows.iter().any(|r| {
+                        r.source
+                            .as_ref()
+                            .is_some_and(|(s, _)| Arc::ptr_eq(s, &oldest))
+                    })
+            });
+            self.revision += 1;
+        }
+        let retained: HashSet<_> = self.cache.values().map(|(s, _)| Arc::as_ptr(s)).collect();
+        self.directories.retain(|path, d| {
+            path == &self.current
+                || !d.rows.iter().any(|r| {
+                    r.source
+                        .as_ref()
+                        .is_some_and(|(s, _)| !retained.contains(&Arc::as_ptr(s)))
+                })
+        });
+        // Directory listings also retain row sources; bound them independently.
+        while self.directories.len() > CACHE_LISTINGS
+            || self
+                .directories
+                .iter()
+                .filter(|(p, _)| *p != &self.current)
+                .map(|(_, d)| d.rows.len())
+                .sum::<usize>()
+                > CACHE_NODES
+        {
+            let Some(path) = self
+                .directories
+                .iter()
+                .filter(|(p, _)| *p != &self.current)
+                .min_by_key(|(_, d)| d.finished)
+                .map(|(p, _)| p.clone())
+            else {
+                break;
+            };
+            self.directories.remove(&path);
+            self.revision += 1;
+        }
+        loop {
+            let nodes: usize = self
+                .targets_cache
+                .values()
+                .filter_map(|t| t.baseline.as_ref())
+                .map(|p| p.accounting.node_count())
+                .sum();
+            if self.targets_cache.len() <= CACHE_TARGET_SCOPES && nodes <= CACHE_NODES {
+                break;
+            }
+            let active_targets = self.screens.contains(&Screen::Targets);
+            let Some(path) = self
+                .targets_cache
+                .iter()
+                .filter(|(p, _)| !active_targets || Some(*p) != self.target_scope.as_ref())
+                .min_by_key(|(_, t)| t.finished)
+                .map(|(p, _)| p.clone())
+            else {
+                break;
+            };
+            self.targets_cache.remove(&path);
+        }
+    }
+
     fn navigate(&mut self, path: PathBuf, remember: bool) {
         if path == self.current {
             return;
@@ -484,6 +575,7 @@ impl App {
         self.filtering = false;
         self.explaining = None;
         self.ensure_current();
+        self.trim_caches();
         self.reconcile_cursor();
     }
     fn ensure_current(&mut self) {
@@ -686,6 +778,7 @@ impl App {
             }
             _ => unreachable!("cleanup events handled separately"),
         }
+        self.trim_caches();
         self.reconcile_cursor();
     }
 }
@@ -812,6 +905,36 @@ impl App {
         let generation = self.generation;
         let scope = self.target_scope.clone().unwrap();
         let home = self.home.clone();
+        let browser_scan = (purpose == PlanPurpose::Detect
+            && self.targets().is_some_and(|t| t.generation == 0))
+        .then(|| {
+            let sources = if let Some((snapshot, index)) =
+                self.cache.get(&scope).cloned().or_else(|| {
+                    self.directory()
+                        .rows
+                        .iter()
+                        .find(|r| r.path == scope)
+                        .and_then(|r| r.source.clone())
+                }) {
+                snapshot
+                    .scan
+                    .arena
+                    .children(index)
+                    .filter(|i| {
+                        snapshot.scan.arena.nodes[i.as_usize()].kind
+                            == cleanrs_core::fs::NodeKind::Directory
+                    })
+                    .map(|i| (snapshot.clone(), i))
+                    .collect()
+            } else {
+                self.directories
+                    .get(&scope)
+                    .filter(|d| !d.busy())
+                    .map(|d| d.rows.iter().filter_map(|r| r.source.clone()).collect())
+                    .unwrap_or_default()
+            };
+            super::worker::BrowserScan { sources }
+        });
         let targets = self.targets_mut();
         targets.generation = generation;
         targets.planning = true;
@@ -831,6 +954,7 @@ impl App {
         );
         let detection = targets.baseline.clone();
         self.effects.push(Request::Plan {
+            browser_scan,
             detection,
             generation,
             purpose,
@@ -1030,6 +1154,7 @@ impl App {
                     } else {
                         self.screens.pop();
                         self.filtering = false;
+                        self.trim_caches();
                     }
                 }
                 _ => {}
@@ -1046,10 +1171,15 @@ impl App {
                 }
                 Action::First => self.review_scroll = 0,
                 Action::Last => {
-                    self.review_scroll = self.reviewed.as_ref().map_or(0, |p| p.actions.len() * 3)
+                    self.review_scroll = super::views::review::scroll_limit(
+                        self,
+                        self.page_width.saturating_sub(2),
+                        self.page_rows,
+                    );
                 }
                 Action::Cancel | Action::Back | Action::Quit => {
                     self.screens.pop();
+                    self.reviewed = None;
                 }
                 _ => {} // Enter is deliberately inert at the destructive boundary.
             },
@@ -1089,6 +1219,7 @@ impl App {
                     self.screens.truncate(1);
                     self.reviewed = None;
                     self.return_after_run();
+                    self.run = None;
                 }
                 Action::Move(d) => {
                     let run = self.run.as_mut().unwrap();
@@ -1251,7 +1382,7 @@ impl App {
                                     .collect();
                             }
                             targets.baseline = Some(plan.clone());
-                            targets.finished = Instant::now();
+                            targets.finished = plan.scan_finished.unwrap_or_else(Instant::now);
                         }
                         targets.summary = targets.baseline.as_ref().map(|baseline| {
                             baseline.accounting.summarize(
@@ -1378,6 +1509,7 @@ impl App {
             }
             _ => unreachable!("browser events handled separately"),
         }
+        self.trim_caches();
     }
 }
 
@@ -1607,5 +1739,43 @@ mod tests {
         assert!(row.navigable());
         row.own_flags = NodeFlags::DATALESS;
         assert!(!row.navigable());
+    }
+    #[test]
+    fn cache_eviction_releases_all_aliases_and_inactive_row_sources() {
+        let mut app = App::new("/fixture".into());
+        app.drain_requests();
+        let source = snapshot("/fixture/large", 42);
+        for n in 0..=CACHE_PATHS {
+            app.cache.insert(
+                PathBuf::from(format!("/alias/{n}")),
+                (source.clone(), source.scan.arena.root()),
+            );
+        }
+        let mut inactive = Directory::empty(0);
+        let mut retained = row("/fixture", "large", NodeKind::Directory, 42, false);
+        retained.source = Some((source.clone(), source.scan.arena.root()));
+        inactive.rows.push(retained);
+        app.directories.insert("/inactive".into(), inactive);
+        let weak = Arc::downgrade(&source);
+        drop(source);
+        app.trim_caches();
+        assert!(app.cache.is_empty());
+        assert!(!app.directories.contains_key(&PathBuf::from("/inactive")));
+        assert!(
+            weak.upgrade().is_none(),
+            "eviction must release the shared arena"
+        );
+        for n in 0..CACHE_LISTINGS + 10 {
+            app.directories
+                .insert(PathBuf::from(format!("/listing/{n}")), Directory::empty(0));
+        }
+        for n in 0..CACHE_TARGET_SCOPES + 10 {
+            app.targets_cache
+                .insert(PathBuf::from(format!("/targets/{n}")), Targets::default());
+        }
+        app.trim_caches();
+        assert_eq!(app.directories.len(), CACHE_LISTINGS);
+        assert_eq!(app.targets_cache.len(), CACHE_TARGET_SCOPES);
+        assert!(app.directories.contains_key(&app.current));
     }
 }

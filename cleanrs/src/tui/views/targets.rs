@@ -173,6 +173,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     let cursor = rows
         .iter()
         .position(|r| Some(&r.candidate_key) == targets.highlighted.as_ref());
+    let path_width = (frame.area().width.saturating_sub(60) / 2).max(12);
     let table = Table::new(
         rows.iter().map(|row| {
             let target = &row.target;
@@ -194,14 +195,21 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             } else {
                 ("[ ]", theme.dim())
             };
-            let project = target
+            let path = target
                 .project_root
                 .as_ref()
-                .and_then(|p| p.file_name())
-                .map_or_else(
-                    || target.provider.id.clone(),
-                    |n| n.to_string_lossy().into_owned(),
-                );
+                .or(target.path.as_ref())
+                .map(|p| {
+                    let relative = p
+                        .strip_prefix(app.target_scope.as_ref().unwrap())
+                        .unwrap_or(p);
+                    if relative.as_os_str().is_empty() {
+                        ".".into()
+                    } else {
+                        relative.display().to_string()
+                    }
+                })
+                .unwrap_or_else(|| target.provider.id.clone());
             Row::new(vec![
                 Cell::from(mark).style(style),
                 Cell::from(crate::terminal::usage_display(&target.usage).0).style(
@@ -211,7 +219,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
                         ratatui::style::Style::default()
                     },
                 ),
-                Cell::from(project),
+                Cell::from(super::truncate(&path, path_width as usize)),
                 Cell::from(target.id.clone()),
                 Cell::from(
                     target
@@ -237,13 +245,15 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         [
             Constraint::Length(3),
             Constraint::Length(if frame.area().width < 100 { 18 } else { 23 }),
-            Constraint::Percentage(20),
+            Constraint::Length(path_width),
             Constraint::Length(if frame.area().width < 100 { 14 } else { 17 }),
             Constraint::Length(if frame.area().width < 100 { 4 } else { 5 }),
             Constraint::Min(12),
         ],
     )
-    .header(Row::new(["", "Reclaimable", "Project", "Target", "Age", "Status"]).style(theme.dim()))
+    .header(
+        Row::new(["", "Reclaimable", "Project path", "Target", "Age", "Status"]).style(theme.dim()),
+    )
     .row_highlight_style(theme.focus_background())
     .highlight_symbol("▶ ");
     let mut state = TableState::default().with_selected(cursor);

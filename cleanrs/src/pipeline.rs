@@ -11,7 +11,10 @@ use cleanrs_core::execution::{
     ActionResult, ActionStatus, ExecutableIdentity, OutputStream, command_argv,
     executable_identity, execute_command_with_observer, execute_direct_delete,
 };
-use cleanrs_core::fs::{Arena, NodeIndex, ScanObserver, ScanProgress};
+use cleanrs_core::fs::{
+    Arena, FileSystem, NativeFileSystem, Node, NodeFlags, NodeIndex, NodeKind, ScanObserver,
+    ScanProgress, ScanResult,
+};
 use cleanrs_core::journal::{Journal, JournalAction, JournalRun, default_journal_path};
 use cleanrs_core::providers::{
     BUILTIN_PROVIDER_ACTION_IDS, ProviderHost, ProviderStatus, SystemProviderHost,
@@ -105,6 +108,8 @@ pub(crate) trait ExecutionObserver {
 /// No action is rediscovered or widened after this value is constructed.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ReviewedPlan {
+    #[serde(skip)]
+    pub(crate) scan_finished: Option<std::time::Instant>,
     pub(crate) coverage_complete: bool,
     pub(crate) providers: Vec<ProviderStatus>,
     pub(crate) selected_provider_actions: usize,
@@ -141,6 +146,10 @@ pub(crate) struct SelectionSummary {
     pub(crate) unknown_actions: usize,
 }
 impl SelectionAccounting {
+    pub(crate) fn node_count(&self) -> usize {
+        self.arena.nodes.len()
+    }
+
     pub(crate) fn new(arena: Arena, coverage_complete: bool, targets: &[PlannedTarget]) -> Self {
         let paths: HashMap<_, _> = targets
             .iter()
@@ -258,7 +267,7 @@ pub(crate) fn build_reviewed_plan(
     request: PlanRequest,
     observer: Arc<dyn PlanObserver>,
 ) -> Result<ReviewedPlan> {
-    build_plan(request, observer, None)
+    build_plan(request, observer, None, None)
 }
 
 /// Interactive review may only narrow stale ticks. CLI selection still fails
@@ -268,12 +277,123 @@ pub(crate) fn build_tui_reviewed_plan(
     observer: Arc<dyn PlanObserver>,
     detection: &ReviewedPlan,
 ) -> Result<ReviewedPlan> {
-    build_plan(request, observer, Some(detection))
+    build_plan(request, observer, Some(detection), None)
 }
+/// Browser facts accelerate discovery only. Execution always revalidates live paths.
+pub(crate) fn build_plan_from_scan(
+    request: PlanRequest,
+    observer: Arc<dyn PlanObserver>,
+    scan: ScanResult,
+    finished: std::time::Instant,
+) -> Result<ReviewedPlan> {
+    let mut plan = build_plan(request, observer, None, Some(scan))?;
+    plan.scan_finished = Some(finished);
+    Ok(plan)
+}
+
+/// Review enumerates only ancestors and selected candidate trees. New unrelated
+/// projects cannot widen a manual selection, so walking them serves no purpose.
+fn scan_review_selection(
+    request: &PlanRequest,
+    previous: &ReviewedPlan,
+    scanner: &Scanner,
+    observer: Arc<dyn ScanObserver>,
+) -> Result<ScanResult> {
+    let paths: Vec<_> = previous
+        .targets
+        .iter()
+        .filter(|t| request.manual_selections.contains(&t.candidate_key))
+        .filter_map(|t| t.target.path.clone())
+        .filter(|p| p.starts_with(&request.path))
+        .collect();
+    let filesystem = NativeFileSystem;
+    let root = filesystem.metadata(&request.path)?;
+    let mut arena = Arena::new(&request.path);
+    arena.update_metadata(arena.root(), metadata_node(&root));
+    let mut errors = Vec::new();
+    let mut pending = vec![(request.path.clone(), arena.root())];
+    while let Some((path, parent)) = pending.pop() {
+        let node = &arena.nodes[parent.as_usize()];
+        if node.kind != NodeKind::Directory
+            || node
+                .flags
+                .intersects(NodeFlags::DATALESS | NodeFlags::FIRMLINK | NodeFlags::MOUNT_BOUNDARY)
+        {
+            continue;
+        }
+        if paths.iter().any(|p| p == &path) {
+            let scan = scanner.scan_with_observer(&path, observer.clone())?;
+
+            arena.update_metadata(parent, scan.arena.nodes[0].clone());
+            // Root links belong to the destination arena, not the source scan.
+            // Copy metadata through push_child for descendants; leave root links intact.
+            scan.arena
+                .copy_children_into(scan.arena.root(), &mut arena, parent);
+            errors.extend(scan.coverage_errors);
+            continue;
+        }
+        match filesystem.read_dir(&path) {
+            Ok(entries) => {
+                for entry in entries {
+                    let child = path.join(&entry.name);
+                    let mut node = metadata_node(&entry.metadata);
+                    if node.device != root.device {
+                        node.flags.insert(NodeFlags::MOUNT_BOUNDARY);
+                    }
+                    let index = arena.push_child(parent, &entry.name.to_string_lossy(), node);
+                    if paths.iter().any(|p| p.starts_with(&child)) {
+                        pending.push((child, index));
+                    }
+                }
+            }
+            Err(error) => errors.push(cleanrs_core::fs::CoverageError {
+                path,
+                kind: "review".into(),
+                message: error.to_string(),
+            }),
+        }
+    }
+    let dataless_entries = arena
+        .nodes
+        .iter()
+        .filter(|n| n.flags.contains(NodeFlags::DATALESS))
+        .count();
+    let mount_boundaries = arena
+        .nodes
+        .iter()
+        .filter(|n| n.flags.contains(NodeFlags::MOUNT_BOUNDARY))
+        .count();
+    Ok(ScanResult {
+        root: request.path.clone(),
+        arena,
+        coverage_errors: errors,
+        backend: "selected review".into(),
+        dataless_entries,
+        mount_boundaries,
+    })
+}
+
+pub(crate) fn metadata_node(m: &cleanrs_core::fs::EntryMetadata) -> Node {
+    let mut node = Node::default();
+    node.kind = m.kind;
+    node.apparent_size = m.apparent_size;
+    node.allocated_size = m.allocated_size;
+    node.private_size = m.private_size;
+    node.device = m.device;
+    node.inode = m.inode;
+    node.link_count = m.link_count;
+    node.clone_id = m.clone_id;
+    node.clone_refcount = m.clone_refcount;
+    node.modified_unix_seconds = m.modified_unix_seconds;
+    node.flags = m.flags;
+    node
+}
+
 fn build_plan(
     request: PlanRequest,
     observer: Arc<dyn PlanObserver>,
     detection: Option<&ReviewedPlan>,
+    cached_scan: Option<ScanResult>,
 ) -> Result<ReviewedPlan> {
     if request.workers == Some(0) {
         bail!("--workers must be at least 1");
@@ -319,12 +439,25 @@ fn build_plan(
     observer.on_event(PlanEvent::PhaseStarted {
         phase: "workspace detection",
     });
-    let scan = scanner.scan_with_observer(
-        &request.path,
-        Arc::new(PlanningScanObserver(observer.clone())),
-    );
-    let scan = scan
-        .with_context(|| format!("failed to build cleanup plan in {}", request.path.display()))?;
+    let scan = if let Some(scan) = cached_scan {
+        scan
+    } else if let Some(previous) = detection {
+        scan_review_selection(
+            &request,
+            previous,
+            &scanner,
+            Arc::new(PlanningScanObserver(observer.clone())),
+        )?
+    } else {
+        scanner
+            .scan_with_observer(
+                &request.path,
+                Arc::new(PlanningScanObserver(observer.clone())),
+            )
+            .with_context(|| {
+                format!("failed to build cleanup plan in {}", request.path.display())
+            })?
+    };
     let mut detected = detect_workspace_targets(&scan, &definitions, home.as_deref());
     detected.extend(
         registry
@@ -489,6 +622,7 @@ fn build_plan(
         })
         .collect();
     let plan = ReviewedPlan {
+        scan_finished: None,
         coverage_complete,
         providers: provider_inventory.statuses,
         selected_provider_actions: summary.provider_actions,

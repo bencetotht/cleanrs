@@ -241,12 +241,91 @@ impl Row {
     }
 }
 
+/// Completed browser arenas supplied to discovery; shallow files are refreshed
+/// on the worker. A missing/new directory falls back to normal scanning.
+pub struct BrowserScan {
+    pub sources: Vec<(Arc<Snapshot>, NodeIndex)>,
+}
+impl BrowserScan {
+    fn assemble(self, path: &Path) -> std::io::Result<Option<ScanResult>> {
+        let filesystem = NativeFileSystem;
+        let root = filesystem.metadata(path)?;
+        if root.kind != NodeKind::Directory
+            || root
+                .flags
+                .intersects(NodeFlags::DATALESS | NodeFlags::FIRMLINK)
+        {
+            return Ok(None);
+        }
+        let mut arena = Arena::new(path);
+        arena.update_metadata(arena.root(), node_from_metadata(&root));
+        let mut errors = Vec::new();
+        let entries = filesystem.read_dir(path)?;
+        for entry in entries {
+            let child = path.join(&entry.name);
+            let mut node = node_from_metadata(&entry.metadata);
+            if node.device != root.device {
+                node.flags.insert(NodeFlags::MOUNT_BOUNDARY);
+            }
+            let traversable = node.kind == NodeKind::Directory
+                && !node.flags.intersects(
+                    NodeFlags::DATALESS | NodeFlags::FIRMLINK | NodeFlags::MOUNT_BOUNDARY,
+                );
+            let index = arena.push_child(arena.root(), &entry.name.to_string_lossy(), node);
+            if traversable {
+                let Some((snapshot, source)) = self
+                    .sources
+                    .iter()
+                    .find(|(s, i)| s.scan.arena.path(*i) == child)
+                else {
+                    return Ok(None);
+                };
+                let old = &snapshot.scan.arena.nodes[source.as_usize()];
+                if (old.device, old.inode) != (entry.metadata.device, entry.metadata.inode) {
+                    return Ok(None);
+                }
+                snapshot
+                    .scan
+                    .arena
+                    .copy_children_into(*source, &mut arena, index);
+                errors.extend(
+                    snapshot
+                        .scan
+                        .coverage_errors
+                        .iter()
+                        .filter(|e| e.path.starts_with(&child))
+                        .cloned(),
+                );
+            }
+        }
+        let dataless_entries = arena
+            .nodes
+            .iter()
+            .filter(|n| n.flags.contains(NodeFlags::DATALESS))
+            .count();
+        let mount_boundaries = arena
+            .nodes
+            .iter()
+            .filter(|n| n.flags.contains(NodeFlags::MOUNT_BOUNDARY))
+            .count();
+        Ok(Some(ScanResult {
+            root: path.into(),
+            arena,
+            coverage_errors: errors,
+            backend: "browser cache".into(),
+            dataless_entries,
+            mount_boundaries,
+        }))
+    }
+}
+
 pub enum Request {
     Plan {
         generation: u64,
         purpose: PlanPurpose,
         request: Box<PlanRequest>,
         detection: Option<Arc<ReviewedPlan>>,
+        browser_scan: Option<BrowserScan>,
     },
     Execute {
         plan: Arc<ReviewedPlan>,
@@ -548,6 +627,7 @@ fn cleanup_jobs(input: Receiver<Request>, output: Sender<WorkerEvent>) {
                 purpose,
                 request,
                 detection,
+                browser_scan,
             } => {
                 let scope = request.path.clone();
                 let observer = Arc::new(PlanForwarder {
@@ -565,7 +645,23 @@ fn cleanup_jobs(input: Receiver<Request>, output: Sender<WorkerEvent>) {
                             .expect("review requires cached detection"),
                     )
                 } else {
-                    pipeline::build_reviewed_plan(*request, observer)
+                    let finished = browser_scan
+                        .as_ref()
+                        .and_then(|s| s.sources.iter().map(|(s, _)| s.finished).min())
+                        .unwrap_or_else(Instant::now);
+                    match browser_scan
+                        .map(|scan| scan.assemble(&request.path))
+                        .transpose()
+                    {
+                        Ok(Some(Some(scan))) => {
+                            pipeline::build_plan_from_scan(*request, observer, scan, finished)
+                        }
+                        Ok(_) => pipeline::build_reviewed_plan(*request, observer),
+                        Err(error) => Err(anyhow::Error::new(error).context(format!(
+                            "failed to build cleanup plan in {}",
+                            request.path.display()
+                        ))),
+                    }
                 }
                 .map(Arc::new)
                 .map_err(|e| format!("{e:#}"));
@@ -1131,5 +1227,84 @@ mod tests {
             assert_eq!(snapshot.summaries[index.as_usize()].allocated, allocated);
             assert!(snapshot.summaries[index.as_usize()].incomplete);
         }
+    }
+    #[test]
+    fn browser_scan_rebases_nested_arenas_preserves_hardlinks_and_falls_back() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("project/.next/deep")).unwrap();
+        std::fs::create_dir(root.join("project/dist")).unwrap();
+        std::fs::write(root.join("project/package.json"), b"{}").unwrap();
+        std::fs::write(root.join("project/.next/deep/a"), vec![0; 8192]).unwrap();
+        std::fs::hard_link(
+            root.join("project/.next/deep/a"),
+            root.join("project/dist/b"),
+        )
+        .unwrap();
+        let snapshot = Arc::new(Snapshot::new(
+            Scanner::new(Default::default()).scan(&root).unwrap(),
+            "test".into(),
+        ));
+        let project = snapshot.directories[&root.join("project")];
+        let sources = || {
+            snapshot
+                .scan
+                .arena
+                .children(project)
+                .filter(|i| snapshot.scan.arena.nodes[i.as_usize()].kind == NodeKind::Directory)
+                .map(|i| (snapshot.clone(), i))
+                .collect()
+        };
+        let scan = BrowserScan { sources: sources() }
+            .assemble(&root.join("project"))
+            .unwrap()
+            .unwrap();
+        let reference = Scanner::new(Default::default())
+            .scan(&root.join("project"))
+            .unwrap();
+        let definitions = BUILTIN_TARGETS.to_vec();
+        let actual = cleanrs_core::targets::detect_workspace_targets(&scan, &definitions, None);
+        let expected =
+            cleanrs_core::targets::detect_workspace_targets(&reference, &definitions, None);
+        assert_eq!(actual.len(), expected.len());
+        for target in &actual {
+            let other = expected.iter().find(|t| t.id == target.id).unwrap();
+            assert_eq!(target.path, other.path);
+            assert_eq!(target.usage, other.usage);
+        }
+        assert_eq!(
+            crate::subtree_sizes(&scan.arena, scan.arena.root()),
+            crate::subtree_sizes(&reference.arena, reference.arena.root())
+        );
+        struct NoScan;
+        impl PlanObserver for NoScan {
+            fn on_event(&self, _: PlanEvent) {}
+            fn on_scan_progress(&self, _: ScanProgress) {
+                panic!("cached discovery must not scan");
+            }
+        }
+        let finished = snapshot.finished;
+        let plan = pipeline::build_plan_from_scan(
+            plan_request(
+                root.join("project"),
+                Some(root.join("home")),
+                CleanupLevel::Safe,
+                false,
+                None,
+            ),
+            Arc::new(NoScan),
+            scan,
+            finished,
+        )
+        .unwrap();
+        assert_eq!(plan.scan_finished, Some(finished));
+        assert_eq!(plan.targets.len(), actual.len());
+        std::fs::create_dir(root.join("project/new-directory")).unwrap();
+        assert!(
+            BrowserScan { sources: sources() }
+                .assemble(&root.join("project"))
+                .unwrap()
+                .is_none()
+        );
     }
 }

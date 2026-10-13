@@ -1199,6 +1199,60 @@ the centered minimum-size message rendered. All sessions and fixtures were
 removed; no real home/Developer scan or mutation was performed.
 
 
+**Post-M5 TUI improvements (2026-10-13).**
+
+- Targets now show a scope-relative project-path column instead of an ambiguous
+  basename. Narrow layouts truncate the column; the detail pane retains exact paths.
+- `T` assembles discovery arenas from completed browser child scans, including
+  nested arena indices and cross-tree hardlinks. Shallow root metadata/listings
+  are refreshed on the worker, and new/replaced/missing child scans fall back to
+  normal discovery. Cached facts retain their original age. `r` and machine/policy
+  re-detection bypass browser reuse.
+- `x` performs fresh metadata enumeration on the selected candidates' ancestor
+  chain and fresh scans of selected trees, then uses the existing shared planner,
+  policy/identity/operation/usage comparisons, and dropped-tick notices. Unrelated
+  subtrees are not walked. Review still checks live facts; execution's immediate
+  revalidation, provider identity, journal and explicit `y` boundary remain intact.
+- Browser cache limits: 250,000 unique arena nodes, 4,096 directory aliases and
+  32 listings/250,000 inactive rows. Target cache limits: eight scopes and 250,000 arena nodes. Eviction
+  removes oldest completed arenas with all aliases and inactive row references;
+  active working data may exceed the limits. Obsolete events cannot replace a
+  newly requested listing after eviction. Cancelled review and closed results
+  release their plans rather than retaining them indefinitely.
+- Review has a compact scope/level/selection summary, a titled action list,
+  counted policy groups, numbered actions, exact operation paths, per-action
+  confidence and consequences, and a persistent confirmation area. End-of-list
+  scrolling uses rendered wrapped-line counts through ratatui’s pinned
+  rendered-line-info feature, including narrow paths/warnings.
+
+**Correction to the deferred optimization above:** unconditional `T`/`x`
+full-scope scans and unbounded session caching are resolved. `T` can still scan
+on cache misses, and selecting every candidate still requires scanning all
+selected trees during review. This is session reuse, not Phase 5's durable index.
+No real home/Developer scan or mutation was used for these changes.
+
+Regression fixtures cover cached discovery without scanner callbacks, nested
+arena rebasing and hardlink parity, new-directory fallback, preserved scan age,
+explicit-refresh bypass, whole-arena alias/reference eviction, relative paths,
+wrapped review scrolling, and the existing changed/refused candidate checks.
+`review_walk_is_limited_to_selected_trees` creates 100 unrelated two-level
+branches and one selected tree; review emits exactly one scanned directory.
+An illustrative warm debug run (`cargo test -p cleanrs
+review_walk_is_limited_to_selected_trees -- --nocapture`) took 47.9 ms for full
+discovery and 24.5 ms for selected review. These fixture timings are not a
+real-workload benchmark or a latency promise; the deterministic traversal
+assertion is the performance regression gate.
+
+**Verification:** `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace --all-targets` (**132 tests**), and
+`rustup run 1.85.0 cargo check --workspace --all-targets` pass;
+`git diff --check` is clean. NO_COLOR sandbox tmux walkthroughs at 110×30 and
+80×24 verified repeated project paths, review groups, wrapped final-action
+scrolling, Enter remaining inert, and `n` returning to selection. Only temporary
+workspace/HOME/state paths were used; the sessions and fixtures were removed.
+
+
 ### Testing strategy
 
 - `App` state transitions tested directly with synthetic key/worker events
@@ -1442,8 +1496,8 @@ Work should continue in this order:
 4. Alongside normal feature work, finish the Phase 1 largest-file view,
    packed-record parser fixtures and a checked-in performance baseline.
 5. Keep the TUI follow-ups listed above: bare `cleanrs` launch, history view,
-   index-backed startup and mouse support; browser-arena detection/review reuse
-   remains optional measured performance work.
+   index-backed startup and mouse support. Browser-arena discovery reuse and
+   selection-scoped fresh review are implemented in the post-M5 improvements.
 6. Revisit Trash only as an explicit moved-not-reclaimed workflow, and add
    observed APFS container-free-space evidence only when its measurement
    boundary is truthful and reproducible.

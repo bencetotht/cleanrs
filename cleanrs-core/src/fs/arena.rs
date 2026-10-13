@@ -135,6 +135,32 @@ impl Arena {
         index
     }
 
+    /// Replace measured attributes while preserving names and destination links.
+    pub fn update_metadata(&mut self, index: NodeIndex, mut node: Node) {
+        let old = &self.nodes[index.as_usize()];
+        node.parent = old.parent;
+        node.first_child = old.first_child;
+        node.next_sibling = old.next_sibling;
+        node.name_offset = old.name_offset;
+        node.name_len = old.name_len;
+        self.nodes[index.as_usize()] = node;
+    }
+
+    /// Copy a subtree into another arena without retaining its old indices.
+    /// Iterative traversal also handles very deep fixture trees safely.
+    pub fn copy_children_into(&self, root: NodeIndex, destination: &mut Arena, parent: NodeIndex) {
+        let mut pending = vec![(root, parent)];
+        while let Some((source, parent)) = pending.pop() {
+            for child in self.children(source) {
+                let mut node = self.nodes[child.as_usize()].clone();
+                node.first_child = None;
+                node.next_sibling = None;
+                let index = destination.push_child(parent, self.name(child), node);
+                pending.push((child, index));
+            }
+        }
+    }
+
     /// Borrow a node's interned name.
     #[must_use]
     pub fn name(&self, index: NodeIndex) -> &str {

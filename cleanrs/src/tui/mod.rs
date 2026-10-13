@@ -200,11 +200,12 @@ pub fn run(path: &Path, verbose: u8) -> Result<()> {
                         14
                     }
                 }
-                app::Screen::Review => 9,
+                app::Screen::Review => 11,
                 app::Screen::Run => size.height.saturating_mul(55) / 100,
                 _ => 8,
             }
         };
+        app.page_width = size.width;
         app.page_rows = size.height.saturating_sub(overhead).max(1) as usize;
         terminal.draw(|frame| views::render(frame, &app, theme))?;
         // Busy frames animate at 12.5 Hz; idle freshness updates once per
