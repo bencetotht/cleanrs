@@ -9,7 +9,11 @@ use super::{
     app::{App, Screen},
     theme::Theme,
 };
-use ratatui::{Frame, layout::Rect, widgets::Paragraph};
+use ratatui::{
+    Frame,
+    layout::Rect,
+    widgets::{Block, Borders, Clear, Paragraph},
+};
 use std::time::Duration;
 
 pub fn stale(age: Duration) -> bool {
@@ -43,6 +47,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             Paragraph::new(message).centered().style(theme.warning()),
             Rect::new(area.x, area.y + area.height / 2, area.width, 1),
         );
+        if app.confirm_quit {
+            quit_dialog(frame, theme);
+        }
         return;
     }
     let screen = app
@@ -75,6 +82,33 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             Rect::new(area.x, area.y + 2, area.width, 1),
         );
     }
+    if app.confirm_quit {
+        quit_dialog(frame, theme);
+    }
+}
+
+fn quit_dialog(frame: &mut Frame<'_>, theme: Theme) {
+    let area = frame.area();
+    let width = area.width.min(56);
+    let height = area.height.min(7);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new("Leave the storage browser?\n\n[y] Quit    [n / Esc / Enter] Stay")
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Quit cleanrs? ")
+                    .border_style(theme.accent()),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        popup,
+    );
 }
 
 /// Truncate by terminal cell width, including wide Unicode filenames.
@@ -133,6 +167,7 @@ mod tests {
                     target_id: None,
                     flags: NodeFlags::DATALESS | NodeFlags::MOUNT_BOUNDARY,
                     incomplete: true,
+                    measured: false,
                 },
                 pending,
                 source: None,

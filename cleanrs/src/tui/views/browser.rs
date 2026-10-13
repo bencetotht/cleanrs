@@ -52,14 +52,19 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         }
         let complete = directory.rows.iter().filter(|row| !row.pending).count();
         format!(
-            "{spinner} scanning… {dirs} dirs · {entries} entries · {} · {complete}/{} children scanned",
+            "{spinner} loading / scanning… {dirs} dirs · {entries} entries · {} · {complete}/{} children scanned",
             crate::human_bytes(bytes),
             directory.rows.len()
         )
     } else {
         format!(
-            "idle · scanned {} · allocated {}{}",
-            super::freshness(directory.finished.elapsed()),
+            "idle · {} {} · allocated {}{}",
+            if directory.cached {
+                "cached scan"
+            } else {
+                "scanned"
+            },
+            super::freshness(directory.age()),
             crate::human_bytes(directory.total),
             if directory.coverage_error {
                 " · ⚠ incomplete coverage"
@@ -71,7 +76,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     frame.render_widget(
         Paragraph::new(activity).style(if directory.busy() {
             theme.accent()
-        } else if super::stale(directory.finished.elapsed()) {
+        } else if super::stale(directory.age()) {
             theme.warning()
         } else {
             theme.success()
@@ -111,11 +116,16 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         .position(|row| Some(&row.path) == directory.selected.as_ref());
     let name_width = areas[3].width.saturating_sub(68).max(12) as usize;
     let table_rows = rows.iter().map(|row| {
-        let unknown =
-            row.kind == NodeKind::Directory && row.source.is_none() && row.estimate.is_none();
+        let unknown = row.kind == NodeKind::Directory
+            && !row.summary.measured
+            && row.source.is_none()
+            && row.estimate.is_none();
         let size = if row.pending {
             format!("{spinner} …")
-        } else if row.kind == NodeKind::Directory && row.source.is_none() && row.estimate.is_none()
+        } else if row.kind == NodeKind::Directory
+            && !row.summary.measured
+            && row.source.is_none()
+            && row.estimate.is_none()
         {
             "unknown".into()
         } else {
@@ -220,8 +230,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
                 ),
                 theme.accent(),
             ));
-            let unavailable =
-                row.kind == NodeKind::Directory && row.source.is_none() && row.estimate.is_none();
+            let unavailable = row.kind == NodeKind::Directory
+                && !row.summary.measured
+                && row.source.is_none()
+                && row.estimate.is_none();
             lines.push(Line::raw(if unavailable {
                 format!(
                     "Allocated {} · Apparent {}",
@@ -260,6 +272,8 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
                         "Accounting pending: subtree still scanning"
                     } else if row.source.is_some() {
                         "Accounting pending…"
+                    } else if row.summary.measured {
+                        "Reclaimable unavailable · open folder or refresh for detailed accounting"
                     } else {
                         "Accounting unknown: subtree not traversed"
                     },

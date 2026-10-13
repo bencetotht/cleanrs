@@ -565,7 +565,9 @@ plan, revalidation, and journal pipeline the CLI uses.
 
 Two primary views over one shared scan, linked by `T`, followed by a linear
 cleanup flow. `Esc`/`q` always steps back exactly one screen; `q` on the
-browser quits (with a confirmation only if a cleanup is running).
+browser opens a quit confirmation. **Correction (2026-10-14):** the earlier
+design only required confirmation during cleanup; every browser quit now asks,
+while a running cleanup retains its stop-after-current-action prompt.
 
 ```
  Browser ──T──▶ Targets ──x──▶ Review ──y──▶ Run ──▶ Results
@@ -1253,6 +1255,65 @@ scrolling, Enter remaining inert, and `n` returning to selection. Only temporary
 workspace/HOME/state paths were used; the sessions and fixtures were removed.
 
 
+**TUI restart caching and quit confirmation (2026-10-14).**
+
+- Browser `q`/Esc and global Ctrl-c now open a centered quit confirmation.
+  `y` quits; Esc/Enter/`n` stays. Dialog keys never reach underlying selection,
+  navigation or cleanup handlers. Filter/range/help/back and run-stop semantics
+  retain their context; NO_COLOR and 80×24 layouts are covered.
+- Fixed parent re-scanning after arena eviction: keep the completed listing,
+  measured sizes, freshness and cursor, and clear its detailed Arc references
+  separately. A visible row source can open its folder even after alias eviction.
+  Coordinator inode maps now release immediately when all children complete.
+- `tui/cache.rs` implements a fixed-user-location, bounded binary fact cache
+  using pinned bincode 1.3.3. Snapshot records persist metadata, names and parent
+  indices; parent order, entry sizes, filenames, version, root identity/mtime,
+  timestamp, SHA-256 integrity and private ownership are validated on load. Files are 0600 in a
+  0700 local directory (cloud namespaces/dataless cache content are refused),
+  written through a same-directory temporary file and atomic
+  rename. Limits: 1 GiB aggregate, 1,024 entries, 256 MiB per entry, oldest saved
+  entries first. Complete child scans save before their completion reaches the
+  UI, so exiting an idle view does not lose finished work. Orphan temporary
+  writes from exited processes are removed on the next session.
+- New sessions restore exact scoped entries, or compose a folder from existing
+  child entries, preserving hardlink accounting and the oldest fact age. Cached age is retained as a duration offset so a reboot cannot
+  reset freshness. Small headers are checked before decoding large siblings on a partial miss. Cached
+  views are labelled; deeper mutations may remain stale until `r`, which always
+  scans fresh and invalidates overlaps. This is static restart caching, not the
+  full Phase 5 event-driven incremental index.
+- Cancellation/publication share a lock so a cancelled scan cannot resurrect
+  an invalidated entry. Cleanup cancels overlapping browser jobs and invalidates
+  disk facts before execution. Corrupt/missing entries fall back safely; write
+  failure warns in the browser and leaves session sizes available. Cached facts
+  never bypass the shared live review/execution checks or persist a verdict.
+
+**Correction to earlier post-M5 claims:** session-only caching did not satisfy
+restart reuse, and evicting entire inactive listings could cause parent rescans.
+Both are now addressed. The requested TUI follow-up implements the minimal
+restart cache; durable CLI indexing, FSEvents and background refresh remain
+Phase 5 work. Tests use only temporary workspaces, cache and HOME/state paths.
+
+Regression coverage proves independent worker/App restart reuse, per-child
+composition when going above the initial scope, parent navigation after arena
+eviction, fresh explicit refresh, malformed/truncated/version-mismatched and
+checksum-corrupt data fallback, root replacement, path/parent validation, private
+permissions, disk limits, dead-writer cleanup, cloud-cache refusal, write-failure
+warnings, 400-day age retention across reboot, and quit cancel/confirm behavior.
+A small warm debug fixture took 39.2 ms fresh versus 1.3 ms on restart; these
+illustrative timings are not a large-Developer workload benchmark. The regression
+checks cache provenance and avoids repeat browser worker requests deterministically.
+
+**Verification (2026-10-14):** fmt, clippy with `-D warnings`,
+`cargo test --workspace --all-targets` (**143 tests**), Rust 1.85 workspace/all-target
+check, and `git diff --check` pass. Sandboxed NO_COLOR tmux sessions at 110×30
+and 80×24 exercised exit confirmation/cancellation, actual process restart,
+restored totals and Backspace parent navigation with 16 projects/1,920 payload
+files (7.6 MiB allocated). The final checksummed cache restored the idle view
+in an illustrative 0.141 s; scope totals stayed identical and parent return
+showed no scan. Both sessions and all workspace/HOME/cache/state fixtures were
+removed. No real home/Developer scan or mutation was performed.
+
+
 ### Testing strategy
 
 - `App` state transitions tested directly with synthetic key/worker events
@@ -1373,7 +1434,8 @@ rules.
 
 - CLI tables, progress indicators, semantic colors, redirected output, and
   `NO_COLOR` behavior provide reusable presentation groundwork.
-- `index.rs` is an inert placeholder.
+- `index.rs` remains a CLI-index placeholder. The TUI now has a bounded static
+  restart cache (details above); incremental/event-driven indexing is pending.
 - **Correction (Phase 5A):** `tui` now exists; `index` and `schedule` remain
   unimplemented. The original Phase 5 status listed all three as unavailable.
 
@@ -1411,7 +1473,7 @@ moved to Phase 5A. Phase 5 extends that TUI with:
 - Machine-wide provider/action inventory grouped by severity.
 - Project-hygiene findings and explanations (data from Phase 4).
 - Fast startup from the index with visible freshness state and background
-  refresh, replacing Phase 5A's scan-on-launch.
+  refresh, extending the TUI's static restart cache.
 
 All execution continues through the shared pipeline extracted in Phase 5A; no
 TUI-only deletion shortcuts.

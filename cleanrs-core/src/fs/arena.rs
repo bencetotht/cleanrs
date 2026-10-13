@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use bitflags::bitflags;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Compact stable index into an [`Arena`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -21,7 +21,7 @@ impl NodeIndex {
 }
 
 /// Filesystem entry kind. Symlinks are entries and are never followed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeKind {
     File,
@@ -41,7 +41,7 @@ impl NodeKind {
 
 bitflags! {
     /// Safety and filesystem-state flags attached to a node.
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct NodeFlags: u16 {
         const DATALESS = 1 << 0;
         const FIRMLINK = 1 << 1;
@@ -52,7 +52,7 @@ bitflags! {
 }
 
 /// Dense node stored in a flat arena rather than an allocation-heavy tree.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Node {
     #[serde(skip)]
     pub(crate) parent: Option<NodeIndex>,

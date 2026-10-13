@@ -1,5 +1,6 @@
 //! Interactive browser and cleanup flow through the shared `pipeline`.
 mod app;
+mod cache;
 mod event;
 mod keymap;
 #[cfg(test)]
@@ -159,7 +160,7 @@ pub fn run(path: &Path, verbose: u8) -> Result<()> {
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
-    let workers = Workers::start();
+    let workers = Workers::start_with_cache(cache::DiskCache::for_environment(home.as_deref()));
     let input = Input::start();
     let mut app = App::new(path);
     app.home = home;
@@ -223,7 +224,12 @@ pub fn run(path: &Path, verbose: u8) -> Result<()> {
         match event {
             Event::Key(key) => {
                 app.status = None;
-                if let Some(action) = keymap.action(key, app.screen(), app.filtering) {
+                let action = if app.confirm_quit {
+                    keymap.quit_action(key)
+                } else {
+                    keymap.action(key, app.screen(), app.filtering)
+                };
+                if let Some(action) = action {
                     app.handle(action);
                 }
             }

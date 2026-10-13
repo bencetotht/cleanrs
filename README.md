@@ -331,12 +331,34 @@ asks to stop after the current action; `[`/`]` scroll provider output. Results
 separate removed allocation from provider reports, show the run ID, and point
 to `cleanrs history`. Returning to the browser refreshes affected directories.
 
-Session caches evict the oldest completed scans as whole arenas, including
-all descendant aliases and inactive listings that retain them. Browser arenas
-are capped at 250,000 nodes and 4,096 path aliases; listings at 32 folders and 250,000 inactive rows.
-Target detections are capped at eight scopes and 250,000 nodes in total.
-The visible folder/targets, reviewed plan, and in-flight work are working data
-and may exceed the cache limits; leaving oversized views releases their data.
+Completed browser scans persist across restarts in
+`$XDG_CACHE_HOME/cleanrs/tui-v1` (absolute paths only), or
+`~/.cache/cleanrs/tui-v1`. Reopening restores filesystem facts with their original
+age (including across reboots) and a “cached scan” label. Root identity/mtime checks detect replacements
+and top-level changes; changes deeper in a tree may stay cached until `r`.
+Refresh bypasses the disk cache, and cleanup invalidates overlapping entries.
+Partial scans are not saved. Corrupt/version-mismatched entries fall back to
+scanning; failed writes show a warning while retaining sizes in the session.
+The cache requires local, unsynced storage. It is owner-only, checksummed, writes
+atomically, and evicts oldest completed entries above
+1 GiB/1,024 entries (each entry is limited to 256 MiB). It never stores cleanup
+selections or permissions to delete.
+
+Memory caches keep up to 250,000 arena nodes/4,096 aliases, 32 visited listings
+and 250,000 inactive rows, plus eight target scopes/250,000 detection nodes.
+Evicting an arena releases its aliases and row references while keeping the
+parent's measured sizes and cursor, so returning to a visited parent does not
+rescan it. Worker accounting maps are released when their scan completes.
+Active views, reviewed plans and in-flight work may exceed memory cache limits.
+**Correction:** the previous cache was session-only, and arena eviction could
+also evict a visited parent's listing; restart persistence and independent
+listing retention are now implemented.
+
+`q`, Esc or Ctrl-c asks before leaving the browser. `y` quits; `n`, Esc or
+Enter stays. Esc still clears a filter, cancels a range, or returns from another
+screen before it becomes a quit request. During cleanup, the existing stop-after-
+current-action confirmation applies.
+
 Review groups show action counts, numbered operations, confidence and rebuild
 consequences above the permanent-deletion confirmation.
 
@@ -350,7 +372,7 @@ below that size. Diagnostics go to `~/.local/state/cleanrs/tui.log` (or
 
 | Screen | Main keys |
 |---|---|
-| All | `?` help; `q`/Esc back (quit in browser); Ctrl-c quit (ask to stop during a run) |
+| All | `?` help; `q`/Esc back (confirm quit in browser); Ctrl-c asks to quit (ask to stop during a run) |
 | Lists | `j`/`k` or arrows move; `gg`/`G` first/last; Ctrl-d/Ctrl-u half page; `/` filter; `n`/`N` matches; `s` sort |
 | Browser | `l`/Enter/right open; `h`/left/Backspace parent; `-` previous directory; `T` targets; `i` info; `r` rescan |
 | Targets | Space toggle; `v` range; Ctrl-a eligible; Ctrl-r invert; `u` clear; `1`/`2`/`3` presets; `m` machine scope; `r` re-detect; `x` review |

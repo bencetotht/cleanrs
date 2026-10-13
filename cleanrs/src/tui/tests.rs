@@ -129,6 +129,7 @@ fn fabricated(root: &Path) -> ReviewedPlan {
     let accounting = Arc::new(pipeline::SelectionAccounting::new(arena, true, &targets));
     ReviewedPlan {
         scan_finished: None,
+        scan_age_offset: Duration::ZERO,
         accounting,
         coverage_complete: true,
         providers: Vec::new(),
@@ -217,7 +218,13 @@ fn run_fixture(app: &mut App) {
     app.screens.push(Screen::Run);
 }
 fn press(app: &mut App, map: &mut Keymap, code: KeyCode, mods: KeyModifiers) {
-    if let Some(action) = map.action(KeyEvent::new(code, mods), app.screen(), app.filtering) {
+    let key = KeyEvent::new(code, mods);
+    let action = if app.confirm_quit {
+        map.quit_action(key)
+    } else {
+        map.action(key, app.screen(), app.filtering)
+    };
+    if let Some(action) = action {
         app.handle(action);
     }
 }
@@ -1655,5 +1662,141 @@ fn relative_project_paths_and_wrapped_review_end_are_visible() {
             })
         ),
         "explicit refresh must bypass the browser cache"
+    );
+}
+
+#[test]
+fn quit_dialog_is_visible_and_escape_enter_keep_the_browser() {
+    for colors in [false, true] {
+        let (_dir, mut app) = fixture();
+        app.screens.truncate(1);
+        app.drain_requests();
+        let mut map = Keymap::default();
+        press(&mut app, &mut map, KeyCode::Esc, KeyModifiers::NONE);
+        let text = rendered(&app, colors, 80, 24).0;
+        assert!(text.contains("Quit cleanrs?") && text.contains("[n / Esc / Enter] Stay"));
+        press(&mut app, &mut map, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.quit && !app.confirm_quit);
+        press(&mut app, &mut map, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, &mut map, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.quit && !app.confirm_quit);
+        assert!(app.drain_requests().is_empty());
+        press(&mut app, &mut map, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, &mut map, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.quit);
+    }
+}
+
+#[test]
+fn browser_cache_survives_restart_parent_navigation_and_explicit_refresh() {
+    use super::cache::DiskCache;
+    use std::time::Instant;
+    fn finish(app: &mut App, workers: &Workers) {
+        for request in app.drain_requests() {
+            workers.requests.send(request).unwrap();
+        }
+        while app.directory().busy() {
+            let event = workers
+                .events
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            app.on_worker(event);
+        }
+    }
+    let fixture = tempdir().unwrap();
+    let workspace = fixture.path().join("workspace");
+    let project = workspace.join("project");
+    std::fs::create_dir_all(project.join(".next/deep")).unwrap();
+    std::fs::create_dir(project.join("dist")).unwrap();
+    std::fs::write(project.join("package.json"), b"{}").unwrap();
+    let payload = project.join(".next/deep/payload");
+    std::fs::write(&payload, vec![7; 8192]).unwrap();
+    std::fs::hard_link(&payload, project.join("dist/shared")).unwrap();
+    let project = project.canonicalize().unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let cache = DiskCache::new(fixture.path().join("cache"));
+    let started = Instant::now();
+    let workers = Workers::start_with_cache(Some(cache.clone()));
+    let mut app = App::new(project.clone());
+    finish(&mut app, &workers);
+    let initial = started.elapsed();
+    let original_total = app.directory().total;
+    assert!(!app.directory().cached);
+    drop(workers);
+    // A new worker/App shares no in-memory arenas with the first session.
+    let started = Instant::now();
+    let workers = Workers::start_with_cache(Some(cache.clone()));
+    let mut reopened = App::new(project.clone());
+    finish(&mut reopened, &workers);
+    assert!(reopened.directory().cached);
+    assert_eq!(reopened.directory().total, original_total);
+    eprintln!(
+        "browser fixture: fresh {:?}; restart {:?}",
+        initial,
+        started.elapsed()
+    );
+    reopened.handle(Action::Parent);
+    finish(&mut reopened, &workers);
+    assert_eq!(reopened.current, workspace);
+    assert!(
+        reopened.directory().cached,
+        "previous browser root is reconstructed from its per-child cache entries"
+    );
+    assert_eq!(reopened.directory().total, original_total);
+    reopened.handle(Action::Open);
+    assert_eq!(reopened.current, project);
+    assert!(reopened.drain_requests().is_empty());
+    reopened.handle(Action::Parent);
+    assert!(
+        reopened.drain_requests().is_empty(),
+        "visited parent must never rescan"
+    );
+    std::fs::write(&payload, vec![7; 32768]).unwrap();
+    reopened.handle(Action::Rescan);
+    finish(&mut reopened, &workers);
+    assert!(!reopened.directory().cached);
+    assert!(reopened.directory().total > original_total);
+    assert!(reopened.status.is_none());
+    drop(workers);
+    // A corrupt cache entry must fall back to a fresh scan, preserving use of
+    // the browser rather than treating cached sizes as authoritative facts.
+    for entry in std::fs::read_dir(fixture.path().join("cache")).unwrap() {
+        std::fs::write(entry.unwrap().path(), b"corrupt").unwrap();
+    }
+    let workers = Workers::start_with_cache(Some(cache));
+    let mut recovered = App::new(project);
+    finish(&mut recovered, &workers);
+    assert!(!recovered.directory().cached);
+    assert!(recovered.directory().total > original_total);
+}
+
+#[test]
+fn cache_write_failure_keeps_sizes_and_reports_session_only_fallback() {
+    use super::cache::DiskCache;
+    let fixture = tempdir().unwrap();
+    let root = fixture.path().join("workspace");
+    std::fs::create_dir_all(root.join("child")).unwrap();
+    std::fs::write(root.join("child/payload"), vec![1; 8192]).unwrap();
+    let blocked = fixture.path().join("not-a-directory");
+    std::fs::write(&blocked, b"fixture").unwrap();
+    let workers = Workers::start_with_cache(Some(DiskCache::new(blocked)));
+    let mut app = App::new(root.canonicalize().unwrap());
+    for request in app.drain_requests() {
+        workers.requests.send(request).unwrap();
+    }
+    while app.directory().busy() {
+        app.on_worker(
+            workers
+                .events
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+        );
+    }
+    assert!(app.directory().total > 0);
+    let (message, error) = app.status.as_ref().unwrap();
+    assert!(
+        !error
+            && message.contains("Disk cache unavailable")
+            && message.contains("sizes kept for this session")
     );
 }

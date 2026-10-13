@@ -126,14 +126,11 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         } else if targets.baseline.is_none() {
             "idle · detection unavailable · press r to refresh".into()
         } else {
-            format!(
-                "idle · detected {}",
-                super::freshness(targets.finished.elapsed())
-            )
+            format!("idle · detected {}", super::freshness(targets.age()))
         })
         .style(if targets.planning {
             theme.accent()
-        } else if targets.baseline.is_none() || super::stale(targets.finished.elapsed()) {
+        } else if targets.baseline.is_none() || super::stale(targets.age()) {
             theme.warning()
         } else {
             theme.dim()

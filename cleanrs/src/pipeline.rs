@@ -110,6 +110,8 @@ pub(crate) trait ExecutionObserver {
 pub(crate) struct ReviewedPlan {
     #[serde(skip)]
     pub(crate) scan_finished: Option<std::time::Instant>,
+    #[serde(skip)]
+    pub(crate) scan_age_offset: std::time::Duration,
     pub(crate) coverage_complete: bool,
     pub(crate) providers: Vec<ProviderStatus>,
     pub(crate) selected_provider_actions: usize,
@@ -285,9 +287,11 @@ pub(crate) fn build_plan_from_scan(
     observer: Arc<dyn PlanObserver>,
     scan: ScanResult,
     finished: std::time::Instant,
+    age_offset: std::time::Duration,
 ) -> Result<ReviewedPlan> {
     let mut plan = build_plan(request, observer, None, Some(scan))?;
     plan.scan_finished = Some(finished);
+    plan.scan_age_offset = age_offset;
     Ok(plan)
 }
 
@@ -623,6 +627,7 @@ fn build_plan(
         .collect();
     let plan = ReviewedPlan {
         scan_finished: None,
+        scan_age_offset: std::time::Duration::ZERO,
         coverage_complete,
         providers: provider_inventory.statuses,
         selected_provider_actions: summary.provider_actions,

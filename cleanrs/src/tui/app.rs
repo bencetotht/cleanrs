@@ -5,7 +5,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::worker::{PlanPurpose, Request, Row, RunEvent, Snapshot, WorkerEvent, plan_request};
 use crate::pipeline::{ReviewedPlan, SelectionSummary};
@@ -91,10 +91,12 @@ pub struct Directory {
     pub total: u64,
     pub volume: String,
     pub finished: Instant,
+    pub age_offset: Duration,
     pub progress: HashMap<PathBuf, ScanProgress>,
     pub selected: Option<PathBuf>,
     pub cursor_moved: bool,
     pub coverage_error: bool,
+    pub cached: bool,
 }
 impl Directory {
     fn empty(revision: u64) -> Self {
@@ -105,11 +107,16 @@ impl Directory {
             total: 0,
             volume: "Free unknown · unknown".into(),
             finished: Instant::now(),
+            age_offset: Duration::ZERO,
             progress: HashMap::new(),
             selected: None,
             cursor_moved: false,
             coverage_error: false,
+            cached: false,
         }
+    }
+    pub fn age(&self) -> Duration {
+        self.age_offset.saturating_add(self.finished.elapsed())
     }
     pub fn busy(&self) -> bool {
         !self.listed || self.rows.iter().any(|row| row.pending)
@@ -136,6 +143,12 @@ pub struct Targets {
     pub focus_path: Option<PathBuf>,
     pub activity: String,
     pub finished: Instant,
+    pub age_offset: Duration,
+}
+impl Targets {
+    pub fn age(&self) -> Duration {
+        self.age_offset.saturating_add(self.finished.elapsed())
+    }
 }
 impl Default for Targets {
     fn default() -> Self {
@@ -156,6 +169,7 @@ impl Default for Targets {
             focus_path: None,
             activity: "detecting…".into(),
             finished: Instant::now(),
+            age_offset: Duration::ZERO,
         }
     }
 }
@@ -216,6 +230,7 @@ pub struct App {
     pub info: bool,
     pub status: Option<(String, bool)>,
     pub quit: bool,
+    pub confirm_quit: bool,
     pub tick: usize,
     pub page_rows: usize,
     pub page_width: u16,
@@ -246,6 +261,7 @@ impl App {
             info: false,
             status: None,
             quit: false,
+            confirm_quit: false,
             tick: 0,
             page_width: 80,
             page_rows: 20,
@@ -331,6 +347,19 @@ impl App {
 
     pub fn handle(&mut self, action: Action) {
         self.status = None;
+        if self.confirm_quit {
+            match action {
+                Action::Confirm => {
+                    self.quit = true;
+                    self.effects.push(Request::Quit);
+                }
+                Action::Cancel | Action::Back | Action::Quit | Action::Open => {
+                    self.confirm_quit = false
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.screen() == Screen::Help {
             let context = self
                 .screens
@@ -371,8 +400,7 @@ impl App {
             return;
         }
         if action == Action::Quit && self.screen() != Screen::Run {
-            self.quit = true;
-            self.effects.push(Request::Quit);
+            self.confirm_quit = true;
             return;
         }
         if action == Action::Help {
@@ -469,14 +497,10 @@ impl App {
                 if self.screens.len() > 1 {
                     self.screens.pop();
                 } else {
-                    self.quit = true;
-                    self.effects.push(Request::Quit);
+                    self.confirm_quit = true;
                 }
             }
-            Action::Quit => {
-                self.quit = true;
-                self.effects.push(Request::Quit);
-            }
+            Action::Quit => self.confirm_quit = true,
             _ => {}
         }
     }
@@ -494,29 +518,29 @@ impl App {
             if nodes <= CACHE_NODES && self.cache.len() <= CACHE_PATHS {
                 break;
             }
-            let Some(oldest) = snapshots.values().min_by_key(|s| s.finished).cloned() else {
+            let Some(oldest) = snapshots.values().max_by_key(|s| s.age()).cloned() else {
                 break;
             };
             self.cache.retain(|_, (s, _)| !Arc::ptr_eq(s, &oldest));
-            self.directories.retain(|path, d| {
-                path == &self.current
-                    || !d.rows.iter().any(|r| {
-                        r.source
-                            .as_ref()
-                            .is_some_and(|(s, _)| Arc::ptr_eq(s, &oldest))
-                    })
-            });
             self.revision += 1;
         }
         let retained: HashSet<_> = self.cache.values().map(|(s, _)| Arc::as_ptr(s)).collect();
-        self.directories.retain(|path, d| {
-            path == &self.current
-                || !d.rows.iter().any(|r| {
-                    r.source
-                        .as_ref()
-                        .is_some_and(|(s, _)| !retained.contains(&Arc::as_ptr(s)))
-                })
-        });
+        // Completed totals/cursor state cost very little. Evict detailed arenas
+        // independently; returning to a visited parent must not enqueue a scan.
+        for (path, directory) in &mut self.directories {
+            if path == &self.current {
+                continue;
+            }
+            for row in &mut directory.rows {
+                if row
+                    .source
+                    .as_ref()
+                    .is_some_and(|(s, _)| !retained.contains(&Arc::as_ptr(s)))
+                {
+                    row.source = None;
+                }
+            }
+        }
         // Directory listings also retain row sources; bound them independently.
         while self.directories.len() > CACHE_LISTINGS
             || self
@@ -531,7 +555,7 @@ impl App {
                 .directories
                 .iter()
                 .filter(|(p, _)| *p != &self.current)
-                .min_by_key(|(_, d)| d.finished)
+                .max_by_key(|(_, d)| d.age())
                 .map(|(p, _)| p.clone())
             else {
                 break;
@@ -554,7 +578,7 @@ impl App {
                 .targets_cache
                 .iter()
                 .filter(|(p, _)| !active_targets || Some(*p) != self.target_scope.as_ref())
-                .min_by_key(|(_, t)| t.finished)
+                .max_by_key(|(_, t)| t.age())
                 .map(|(p, _)| p.clone())
             else {
                 break;
@@ -579,7 +603,13 @@ impl App {
         self.reconcile_cursor();
     }
     fn ensure_current(&mut self) {
-        if let Some((snapshot, index)) = self.cache.get(&self.current) {
+        if let Some((snapshot, index)) = self.cache.get(&self.current).cloned().or_else(|| {
+            self.directories
+                .values()
+                .flat_map(|d| d.rows.iter())
+                .find(|r| r.path == self.current)
+                .and_then(|r| r.source.clone())
+        }) {
             let selected = self
                 .directories
                 .get(&self.current)
@@ -588,11 +618,12 @@ impl App {
                 self.current.clone(),
                 Directory {
                     revision: self.revision,
-                    rows: snapshot.rows(*index),
+                    rows: snapshot.rows(index),
                     listed: true,
                     total: snapshot.summaries[index.as_usize()].allocated,
                     volume: snapshot.volume.clone(),
                     finished: snapshot.finished,
+                    age_offset: snapshot.age_offset,
                     progress: HashMap::new(),
                     cursor_moved: self
                         .directories
@@ -600,6 +631,7 @@ impl App {
                         .is_some_and(|d| d.cursor_moved),
                     selected,
                     coverage_error: snapshot.summaries[index.as_usize()].incomplete,
+                    cached: snapshot.cached,
                 },
             );
         } else if !self.directories.contains_key(&self.current) {
@@ -649,7 +681,8 @@ impl App {
             return;
         }
         let (path, revision) = match &event {
-            WorkerEvent::Listed { path, revision, .. } => (path, revision),
+            WorkerEvent::Listed { path, revision, .. }
+            | WorkerEvent::Restored { path, revision, .. } => (path, revision),
             WorkerEvent::Progress {
                 parent, revision, ..
             }
@@ -657,6 +690,9 @@ impl App {
                 parent, revision, ..
             }
             | WorkerEvent::Explained {
+                parent, revision, ..
+            }
+            | WorkerEvent::CacheWarning {
                 parent, revision, ..
             }
             | WorkerEvent::Coverage { parent, revision }
@@ -673,6 +709,21 @@ impl App {
             return;
         }
         match event {
+            WorkerEvent::Restored { path, snapshot, .. } => {
+                let index = snapshot.scan.arena.root();
+                let directory = self.directories.get_mut(&path).unwrap();
+                directory.rows = snapshot.rows(index);
+                directory.listed = true;
+                directory.total = snapshot.summaries[0].allocated;
+                directory.finished = snapshot.finished;
+                directory.age_offset = snapshot.age_offset;
+                directory.volume = snapshot.volume.clone();
+                directory.cached = true;
+                directory.coverage_error = snapshot.summaries[0].incomplete;
+                for (path, index) in &snapshot.directories {
+                    self.cache.insert(path.clone(), (snapshot.clone(), *index));
+                }
+            }
             WorkerEvent::Listed {
                 path,
                 rows,
@@ -686,6 +737,8 @@ impl App {
                 directory.volume = volume;
                 directory.listed = true;
                 directory.finished = Instant::now();
+                directory.age_offset = Duration::ZERO;
+                directory.cached = false;
             }
             WorkerEvent::Progress {
                 parent,
@@ -716,7 +769,11 @@ impl App {
                     row.estimate = None;
                 }
                 directory.total = total;
-                directory.finished = snapshot.finished;
+                if snapshot.age() > directory.age() {
+                    directory.finished = snapshot.finished;
+                    directory.age_offset = snapshot.age_offset;
+                }
+                directory.cached |= snapshot.cached;
                 // Completed counters remain in the activity sum until all jobs
                 // finish. For tiny jobs no observer tick arrives, so fill them.
                 directory.progress.insert(
@@ -754,6 +811,7 @@ impl App {
                     self.explaining = None;
                 }
             }
+            WorkerEvent::CacheWarning { message, .. } => self.status = Some((message, false)),
             WorkerEvent::Coverage { parent, .. } => {
                 let directory = self.directories.get_mut(&parent).unwrap();
                 directory.coverage_error = true;
@@ -1383,6 +1441,7 @@ impl App {
                             }
                             targets.baseline = Some(plan.clone());
                             targets.finished = plan.scan_finished.unwrap_or_else(Instant::now);
+                            targets.age_offset = plan.scan_age_offset;
                         }
                         targets.summary = targets.baseline.as_ref().map(|baseline| {
                             baseline.accounting.summarize(
@@ -1649,6 +1708,9 @@ mod tests {
         app.handle(Action::Back);
         assert_eq!(app.screen(), Screen::Browser);
         app.handle(Action::Back);
+        assert!(app.confirm_quit);
+        assert!(!app.quit);
+        app.handle(Action::Confirm);
         assert!(app.quit);
         assert!(matches!(app.drain_requests().last(), Some(Request::Quit)));
     }
@@ -1729,6 +1791,8 @@ mod tests {
         });
         assert!(!app.busy());
         app.handle(Action::Quit);
+        assert!(app.confirm_quit);
+        app.handle(Action::Confirm);
         assert!(app.quit);
     }
 
@@ -1760,7 +1824,12 @@ mod tests {
         drop(source);
         app.trim_caches();
         assert!(app.cache.is_empty());
-        assert!(!app.directories.contains_key(&PathBuf::from("/inactive")));
+        assert!(app.directories.contains_key(&PathBuf::from("/inactive")));
+        assert!(
+            app.directories[&PathBuf::from("/inactive")].rows[0]
+                .source
+                .is_none()
+        );
         assert!(
             weak.upgrade().is_none(),
             "eviction must release the shared arena"
@@ -1777,5 +1846,89 @@ mod tests {
         assert_eq!(app.directories.len(), CACHE_LISTINGS);
         assert_eq!(app.targets_cache.len(), CACHE_TARGET_SCOPES);
         assert!(app.directories.contains_key(&app.current));
+    }
+    #[test]
+    fn returning_to_parent_keeps_sizes_after_whole_arena_eviction() {
+        let mut app = App::new("/fixture".into());
+        app.drain_requests();
+        app.on_worker(listed(
+            "/fixture",
+            vec![row("/fixture", "large", NodeKind::Directory, 42, true)],
+        ));
+        let source = snapshot("/fixture/large", 42);
+        app.on_worker(WorkerEvent::ChildFinished {
+            parent: "/fixture".into(),
+            path: "/fixture/large".into(),
+            revision: 0,
+            snapshot: source.clone(),
+            total: 42,
+        });
+        for n in 0..=CACHE_PATHS {
+            app.cache.insert(
+                PathBuf::from(format!("/alias/{n}")),
+                (source.clone(), source.scan.arena.root()),
+            );
+        }
+        app.trim_caches();
+        app.drain_requests();
+        app.handle(Action::Open);
+        assert_eq!(app.current, PathBuf::from("/fixture/large"));
+        assert!(
+            app.drain_requests().is_empty(),
+            "visible row source can open an evicted arena"
+        );
+        app.handle(Action::Parent);
+        assert_eq!(app.current, PathBuf::from("/fixture"));
+        assert!(
+            app.drain_requests().is_empty(),
+            "returning to a completed parent must not scan"
+        );
+        assert_eq!(app.directory().total, 42);
+        assert!(app.directory().rows[0].summary.measured);
+        assert!(app.directory().rows[0].source.is_none());
+    }
+
+    #[test]
+    fn quit_prompt_cancels_without_navigation_and_requires_y() {
+        let mut app = fixture();
+        app.drain_requests();
+        app.handle(Action::Back);
+        assert!(app.confirm_quit && !app.quit);
+        app.handle(Action::Move(1));
+        app.handle(Action::Back);
+        assert!(!app.confirm_quit && !app.quit);
+        assert!(app.drain_requests().is_empty());
+        app.handle(Action::Quit);
+        app.handle(Action::Open); // Enter stays, rather than accepting a default exit.
+        assert!(!app.confirm_quit && !app.quit);
+        app.handle(Action::Back);
+        app.handle(Action::Confirm);
+        assert!(app.quit);
+        assert!(matches!(app.drain_requests().as_slice(), [Request::Quit]));
+    }
+    #[test]
+    fn restored_age_survives_reboot_without_subtracting_from_instant() {
+        let mut app = App::new("/fixture".into());
+        app.drain_requests();
+        app.on_worker(listed(
+            "/fixture",
+            vec![row("/fixture", "old", NodeKind::Directory, 42, true)],
+        ));
+        let mut source = snapshot("/fixture/old", 42);
+        let age = Duration::from_secs(400 * 86400);
+        let snapshot = Arc::get_mut(&mut source).unwrap();
+        snapshot.age_offset = age;
+        snapshot.cached = true;
+        app.on_worker(WorkerEvent::ChildFinished {
+            parent: "/fixture".into(),
+            path: "/fixture/old".into(),
+            revision: 0,
+            snapshot: source,
+            total: 42,
+        });
+        assert!(app.directory().age() >= age);
+        app.handle(Action::Open);
+        assert!(app.directory().age() >= age);
+        assert!(app.directory().cached);
     }
 }

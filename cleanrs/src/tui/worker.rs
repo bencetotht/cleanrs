@@ -6,8 +6,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use super::cache::DiskCache;
 use crate::pipeline::{
     self, ExecutionEvent, ExecutionObserver, PlanEvent, PlanObserver, PlanRequest, ReviewedPlan,
 };
@@ -96,6 +97,7 @@ pub struct Summary {
     pub target_id: Option<String>,
     pub flags: NodeFlags,
     pub incomplete: bool,
+    pub measured: bool,
 }
 
 /// One owned arena is shared by all cached descendants, rather than copied.
@@ -105,7 +107,9 @@ pub struct Snapshot {
     pub summaries: Vec<Summary>,
     pub directories: HashMap<PathBuf, NodeIndex>,
     pub finished: Instant,
+    pub age_offset: Duration,
     pub volume: String,
+    pub cached: bool,
 }
 
 impl Snapshot {
@@ -126,6 +130,7 @@ impl Snapshot {
             let node = &arena.nodes[position];
             let path = arena.path(index);
             let summary = &mut summaries[position];
+            summary.measured = true;
             summary.flags |= node.flags;
             summary.incomplete |= errors.contains(&path);
             if node.kind.is_file_like() {
@@ -194,8 +199,15 @@ impl Snapshot {
             summaries,
             directories,
             finished: Instant::now(),
+            age_offset: Duration::ZERO,
             volume,
+            cached: false,
         }
+    }
+
+    /// Cached age may predate the current machine's monotonic clock (reboot).
+    pub fn age(&self) -> Duration {
+        self.age_offset.saturating_add(self.finished.elapsed())
     }
 
     pub fn rows(self: &Arc<Self>, root: NodeIndex) -> Vec<Row> {
@@ -366,6 +378,11 @@ pub enum WorkerEvent {
         run_id: String,
         event: RunEvent,
     },
+    Restored {
+        path: PathBuf,
+        revision: u64,
+        snapshot: Arc<Snapshot>,
+    },
     Listed {
         path: PathBuf,
         revision: u64,
@@ -392,6 +409,11 @@ pub enum WorkerEvent {
         path: PathBuf,
         estimate: ReclaimEstimate,
     },
+    CacheWarning {
+        parent: PathBuf,
+        revision: u64,
+        message: String,
+    },
     Coverage {
         parent: PathBuf,
         revision: u64,
@@ -410,6 +432,8 @@ struct ScanJob {
     path: PathBuf,
     cancellation: Arc<AtomicBool>,
     volume: String,
+    cache: Option<DiskCache>,
+    allow_cache: bool,
 }
 enum Job {
     Scan(ScanJob),
@@ -425,6 +449,7 @@ struct Finished {
     result: Result<Arc<Snapshot>, String>,
 }
 struct DirectoryJob {
+    remaining: usize,
     revision: u64,
     inodes: HashMap<Inode, u64>,
     cancellation: Arc<AtomicBool>,
@@ -438,12 +463,16 @@ pub struct Workers {
     handle: Option<JoinHandle<()>>,
 }
 impl Workers {
+    #[cfg(test)]
     pub fn start() -> Self {
+        Self::start_with_cache(None)
+    }
+    pub fn start_with_cache(cache: Option<DiskCache>) -> Self {
         let (requests, input) = crossbeam_channel::unbounded();
         // Backpressure bounds streamed provider output before it reaches the
         // App's last-200-line pane. No output path can grow an unbounded queue.
         let (output, events) = crossbeam_channel::bounded(256);
-        let handle = std::thread::spawn(move || coordinate(input, output));
+        let handle = std::thread::spawn(move || coordinate(input, output, cache));
         Self {
             requests,
             events,
@@ -460,10 +489,12 @@ impl Drop for Workers {
     }
 }
 
-fn coordinate(input: Receiver<Request>, output: Sender<WorkerEvent>) {
+fn coordinate(input: Receiver<Request>, output: Sender<WorkerEvent>, cache: Option<DiskCache>) {
     let (cleanup, cleanup_input) = crossbeam_channel::unbounded();
     let cleanup_output = output.clone();
-    let cleanup_handle = std::thread::spawn(move || cleanup_jobs(cleanup_input, cleanup_output));
+    let cleanup_cache = cache.clone();
+    let cleanup_handle =
+        std::thread::spawn(move || cleanup_jobs(cleanup_input, cleanup_output, cleanup_cache));
     let (jobs, queue) = crossbeam_channel::bounded::<Job>(2);
     let (finished_tx, finished) = crossbeam_channel::unbounded::<Finished>();
     let handles: Vec<_> = (0..2)
@@ -544,12 +575,20 @@ fn coordinate(input: Receiver<Request>, output: Sender<WorkerEvent>) {
         crossbeam_channel::select! {
             recv(input) -> request => {
                 match request {
-                    Ok(Request::Browse { path, revision }) | Ok(Request::Rescan { path, revision }) => {
+                    Ok(request @ (Request::Browse { .. } | Request::Rescan { .. })) => {
+                        let refresh = matches!(request, Request::Rescan { .. });
+                        let (path, revision) = match request { Request::Browse { path, revision } | Request::Rescan { path, revision } => (path, revision), _ => unreachable!() };
+
                         // A newer revision cancels overlapping ancestor jobs too:
                         // otherwise their old arena could resurrect stale data.
                         let overlapping: Vec<_> = directories.iter().filter(|(p, d)| d.revision < revision && (p.starts_with(&path) || path.starts_with(p))).map(|(p, _)| p.clone()).collect();
                         for p in overlapping {
                             if let Some(job) = directories.remove(&p) { job.cancellation.store(true, Ordering::Release); }
+                        }
+                        if refresh {
+                            if let Some(cache) = &cache {
+                                if let Err(error) = cache.invalidate(&path) { tracing::warn!(%error, "cannot invalidate browser disk cache"); }
+                            }
                         }
                         // Normal navigation uses the same revision and does not
                         // cancel work; move queued jobs for the visible scope up.
@@ -561,16 +600,47 @@ fn coordinate(input: Receiver<Request>, output: Sender<WorkerEvent>) {
                         prioritized.append(&mut rest);
                         pending = prioritized;
                         if directories.get(&path).is_some_and(|d| d.revision == revision) { continue; }
+                        if !refresh {
+                            if let Some(cache) = &cache {
+                                match cache.load_tree(&path) {
+                                    Ok(Some((scan, age))) => {
+                                        let restored_at = Instant::now();
+                                        let mut snapshot = Snapshot::new(scan, volume_label(&path));
+                                        snapshot.finished = restored_at;
+                                        snapshot.age_offset = age;
+                                        snapshot.cached = true;
+                                        let _ = output.send(WorkerEvent::Restored { path, revision, snapshot: Arc::new(snapshot) });
+                                        continue;
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => tracing::warn!(%error, "cannot restore cached browser scope"),
+                                }
+                            }
+                        }
                         match list_children(&path, revision, &output) {
-                            Ok((directory, child_jobs)) => {
-                                directories.insert(path, directory);
+                            Ok((directory, mut child_jobs)) => {
+                                for job in &mut child_jobs { job.cache = cache.clone(); job.allow_cache = !refresh; }
+                                if directory.remaining > 0 { directories.insert(path, directory); }
                                 for job in child_jobs.into_iter().rev() { pending.push_front(Job::Scan(job)); }
                             }
                             Err(error) => report_io_error(&output, path, revision, error),
                         }
                     }
                     Ok(Request::Explain { path, revision, snapshot, index }) => pending.push_front(Job::Explain { parent: path, revision, snapshot, index }),
-                    Ok(request @ (Request::Plan { .. } | Request::Execute { .. })) => { let _ = cleanup.send(request); }
+                    Ok(request @ Request::Plan { .. }) => { let _ = cleanup.send(request); }
+                    Ok(request @ Request::Execute { .. }) => {
+                        // Freeze browser facts overlapping mutation before cache
+                        // invalidation. Their cancelled writers cannot publish old
+                        // arenas after the cleanup worker removes those entries.
+                        if let Request::Execute { plan, .. } = &request {
+                            let paths: Vec<_> = plan.actions.iter().filter_map(|a| a.target.path.as_ref()).collect();
+                            let affected: Vec<_> = directories.keys().filter(|p| paths.iter().any(|a| p.starts_with(a) || a.starts_with(p))).cloned().collect();
+                            for path in affected {
+                                if let Some(job) = directories.remove(&path) { job.cancellation.store(true, Ordering::Release); }
+                            }
+                        }
+                        let _ = cleanup.send(request);
+                    }
                     Ok(Request::Quit) | Err(_) => break,
                 }
             }
@@ -585,10 +655,12 @@ fn coordinate(input: Receiver<Request>, output: Sender<WorkerEvent>) {
                                 if node.kind.is_file_like() { directory.inodes.insert((node.device, node.inode), node.allocated_size); }
                             }
                             let total = directory.inodes.values().copied().sum();
-                            let _ = output.send(WorkerEvent::ChildFinished { parent: job.parent, revision: job.revision, path: job.path, snapshot, total });
+                            let _ = output.send(WorkerEvent::ChildFinished { parent: job.parent.clone(), revision: job.revision, path: job.path, snapshot, total });
                         }
-                        Err(message) => report_error(&output, job.parent, job.revision, Some(job.path), message),
+                        Err(message) => report_error(&output, job.parent.clone(), job.revision, Some(job.path), message),
                     }
+                    directory.remaining = directory.remaining.saturating_sub(1);
+                    if directory.remaining == 0 { directories.remove(&job.parent); }
                 }
             }
         }
@@ -607,7 +679,7 @@ fn coordinate(input: Receiver<Request>, output: Sender<WorkerEvent>) {
 /// Serialize planning/execution on a dedicated worker. Coalesce queued plans
 /// before scanning, but never discard an execution request or interrupt an
 /// action in progress. Selection changes never enter this queue.
-fn cleanup_jobs(input: Receiver<Request>, output: Sender<WorkerEvent>) {
+fn cleanup_jobs(input: Receiver<Request>, output: Sender<WorkerEvent>, cache: Option<DiskCache>) {
     let mut pending = VecDeque::new();
     while let Some(mut request) = pending.pop_front().or_else(|| input.recv().ok()) {
         if let Request::Plan { request: plan, .. } = &request {
@@ -645,17 +717,20 @@ fn cleanup_jobs(input: Receiver<Request>, output: Sender<WorkerEvent>) {
                             .expect("review requires cached detection"),
                     )
                 } else {
-                    let finished = browser_scan
+                    let (finished, age_offset) = browser_scan
                         .as_ref()
-                        .and_then(|s| s.sources.iter().map(|(s, _)| s.finished).min())
-                        .unwrap_or_else(Instant::now);
+                        .and_then(|s| s.sources.iter().max_by_key(|(s, _)| s.age()))
+                        .map_or_else(
+                            || (Instant::now(), Duration::ZERO),
+                            |(s, _)| (s.finished, s.age_offset),
+                        );
                     match browser_scan
                         .map(|scan| scan.assemble(&request.path))
                         .transpose()
                     {
-                        Ok(Some(Some(scan))) => {
-                            pipeline::build_plan_from_scan(*request, observer, scan, finished)
-                        }
+                        Ok(Some(Some(scan))) => pipeline::build_plan_from_scan(
+                            *request, observer, scan, finished, age_offset,
+                        ),
                         Ok(_) => pipeline::build_reviewed_plan(*request, observer),
                         Err(error) => Err(anyhow::Error::new(error).context(format!(
                             "failed to build cleanup plan in {}",
@@ -680,6 +755,13 @@ fn cleanup_jobs(input: Receiver<Request>, output: Sender<WorkerEvent>) {
                     output: output.clone(),
                     run_id: plan.run_id.clone(),
                 };
+                if let Some(cache) = &cache {
+                    for path in plan.actions.iter().filter_map(|a| a.target.path.as_ref()) {
+                        if let Err(error) = cache.invalidate(path) {
+                            tracing::warn!(%error, "cannot invalidate cleaned browser cache");
+                        }
+                    }
+                }
                 let result =
                     pipeline::journal_for_environment(home.as_deref()).and_then(|journal| {
                         // Interactive confirmation is explicit in App; retain the
@@ -914,6 +996,8 @@ fn list_children(
                 path: child,
                 cancellation: Arc::clone(&cancellation),
                 volume: volume.clone(),
+                cache: None,
+                allow_cache: true,
             });
         }
     }
@@ -936,6 +1020,7 @@ fn list_children(
     });
     Ok((
         DirectoryJob {
+            remaining: jobs.len(),
             revision,
             inodes,
             cancellation,
@@ -988,6 +1073,24 @@ fn scan_child(job: &ScanJob, output: &Sender<WorkerEvent>) -> Result<Arc<Snapsho
     if job.cancellation.load(Ordering::Acquire) {
         return Err("scan cancelled".into());
     }
+    if job.allow_cache {
+        if let Some(cache) = &job.cache {
+            match cache.load_tree(&job.path) {
+                Ok(Some((scan, age))) => {
+                    let restored_at = Instant::now();
+                    let mut snapshot = Snapshot::new(scan, job.volume.clone());
+                    snapshot.finished = restored_at;
+                    snapshot.age_offset = age;
+                    snapshot.cached = true;
+                    return Ok(Arc::new(snapshot));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, path = %job.path.display(), "browser cache miss; scanning fresh")
+                }
+            }
+        }
+    }
     let observer = Arc::new(Observer {
         output: output.clone(),
         parent: job.parent.clone(),
@@ -1001,6 +1104,16 @@ fn scan_child(job: &ScanJob, output: &Sender<WorkerEvent>) -> Result<Arc<Snapsho
     })
     .scan_with_observer_cancellable(&job.path, observer, Some(Arc::clone(&job.cancellation)))
     .map_err(|e| e.to_string())?;
+    if let Some(cache) = &job.cache {
+        if let Err(error) = cache.save_if(&scan, || !job.cancellation.load(Ordering::Acquire)) {
+            tracing::warn!(%error, "cannot save browser disk cache");
+            let _ = output.send(WorkerEvent::CacheWarning {
+                parent: job.parent.clone(),
+                revision: job.revision,
+                message: format!("Disk cache unavailable: {error} · sizes kept for this session"),
+            });
+        }
+    }
     Ok(Arc::new(Snapshot::new(scan, job.volume.clone())))
 }
 
@@ -1201,6 +1314,8 @@ mod tests {
             revision: 0,
             volume: "unknown".into(),
             cancellation: Arc::new(AtomicBool::new(true)),
+            cache: None,
+            allow_cache: false,
         };
         let (tx, rx) = crossbeam_channel::unbounded();
         assert!(scan_child(&job, &tx).unwrap_err().contains("cancelled"));
@@ -1295,9 +1410,11 @@ mod tests {
             Arc::new(NoScan),
             scan,
             finished,
+            Duration::from_secs(400 * 86400),
         )
         .unwrap();
         assert_eq!(plan.scan_finished, Some(finished));
+        assert_eq!(plan.scan_age_offset, Duration::from_secs(400 * 86400));
         assert_eq!(plan.targets.len(), actual.len());
         std::fs::create_dir(root.join("project/new-directory")).unwrap();
         assert!(

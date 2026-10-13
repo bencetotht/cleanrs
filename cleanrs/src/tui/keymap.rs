@@ -95,7 +95,7 @@ pub static BINDINGS: &[Binding] = &[
         &[Char('h'), Left, Backspace],
         M::NONE,
         "h / ← / Backspace",
-        "Parent directory; scans on demand",
+        "Parent directory; reuse visited sizes",
         Some("h up"),
         false,
         Action::Parent
@@ -311,7 +311,7 @@ pub static BINDINGS: &[Binding] = &[
         &[Char('q'), Esc],
         M::NONE,
         "q / Esc",
-        "Back / close help; quit from browser",
+        "Back / close help; confirm quit from browser",
         Some("q quit"),
         true,
         Action::Back
@@ -320,7 +320,7 @@ pub static BINDINGS: &[Binding] = &[
         &[Char('c')],
         M::CONTROL,
         "Ctrl-c",
-        "Quit",
+        "Confirm quit",
         None,
         true,
         Action::Quit
@@ -408,6 +408,16 @@ pub struct Keymap {
     pending_g: bool,
 }
 impl Keymap {
+    /// A quit prompt never forwards navigation/cleanup keys to the underlying view.
+    pub fn quit_action(&mut self, key: KeyEvent) -> Option<Action> {
+        self.pending_g = false;
+        match key.code {
+            Char('y') if (key.modifiers - M::SHIFT).is_empty() => Some(Action::Confirm),
+            Char('n' | 'q') | Esc | Enter => Some(Action::Cancel),
+            Char('c') if key.modifiers == M::CONTROL => Some(Action::Cancel),
+            _ => None,
+        }
+    }
     pub fn action(&mut self, key: KeyEvent, screen: Screen, filtering: bool) -> Option<Action> {
         let modifiers = key.modifiers - M::SHIFT;
         if filtering && !(key.code == Char('c') && modifiers == M::CONTROL) {

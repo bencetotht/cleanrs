@@ -1103,6 +1103,25 @@ in-flight work may exceed cache limits, and are released when no longer needed.
 **Correction to the initial Phase 5A behavior:** detection/review no longer
 unconditionally rescan the full scope, and session caches are no longer unbounded.
 
+
+**Correction to the post-M5 session-cache description:** completed browser
+filesystem facts now persist across TUI restarts in the fixed user cache location
+(`$XDG_CACHE_HOME/cleanrs/tui-v1`, absolute only, or `~/.cache/cleanrs/tui-v1`).
+The owner-only, atomic, checksummed, versioned binary cache is bounded at 1 GiB/1,024 entries
+and 256 MiB per entry. It stores metadata/parent indices/names, never cleanup
+verdicts or executable plans. Restored facts retain their age and a cached label;
+root identity/mtime changes and invalid formats fall back to scanning. Age is
+kept separately from the monotonic clock so rebooting cannot reset freshness. It is a
+static snapshot cache: deeper changes require explicit refresh until Phase 5's
+incremental invalidation is implemented. `r` bypasses cached facts; mutation
+cancels overlapping browser jobs and invalidates their disk entries before
+execution. Cleanup review/execution continue to revalidate live paths.
+Arena eviction now releases detailed row references independently of completed
+parent listings, preserving measured sizes on return. Workers release temporary
+inode maps when complete. Quit from the browser asks for `y`; Esc, Enter or `n`
+keeps the session open. Back from other screens and cleanup stop behavior remain
+context-sensitive.
+
 Every final TUI tick is manual explicit naming: history’s `[manual]` means
 “policy-eligible, picked by hand”, while `[manual: <reason>]` records an override.
 Browser and detection ages use s/m/h and warn after ten minutes with a refresh
