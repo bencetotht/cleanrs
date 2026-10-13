@@ -55,8 +55,14 @@ installed versions, so cleanrs initially classifies that mixed action as
 | 1 | Fast read-only scanner and diagnostics | **Useful MVP implemented; performance and UX work remains** |
 | 2 | Developer-storage inventory and cleanup plans | **Complete** |
 | 3 | Cleanup execution and lightweight history | **Complete** |
-| 4 | Project hygiene and stale-project intelligence | **Next priority** |
-| 5 | Index, scheduling, and ratatui daily-driver UI | **Terminal groundwork only** |
+| 5A | Interactive TUI: explore, select, clean (pulled forward from Phase 5) | **Next priority** |
+| 4 | Project hygiene and stale-project intelligence | **Queued after 5A** |
+| 5 | Index, scheduling, and remaining ratatui daily-driver work | **Terminal groundwork only** |
+
+**Correction (2026-10-13):** Phase 4 was previously the next priority. The
+interactive TUI was split out of Phase 5 as Phase 5A and moved ahead of it;
+the reasons are recorded in the Phase 5A decision record. Phase numbers are
+kept stable so existing references remain valid.
 | 6 | Extensibility and optional portability | **Deferred** |
 
 Phases define dependency order, but small supporting improvements may land when
@@ -500,6 +506,376 @@ separate accounting enhancement.
 
 ---
 
+## Phase 5A — Interactive TUI: explore, select, clean (pulled forward)
+
+**Goal:** one keyboard-driven terminal window in which the user can find where
+storage goes, inspect the cleanup targets inside a chosen directory, select
+exactly the items to remove, and run the cleanup — through the same reviewed
+plan, revalidation, and journal pipeline the CLI uses.
+
+### Decision record (2026-10-13)
+
+- **Why pulled forward.** Using `scan`, `targets`, and `clean` against a real
+  `~/Developer` tree (≈108 GiB, 178 detected targets) showed that the CLI
+  answers each question correctly but is painful to navigate: the user has to
+  re-run commands with different paths and depths, and cannot pick individual
+  items from a plan. `--only`/`--exclude` filter by *target ID* (for example
+  `node.modules`), not by candidate path, so “clean only 3 of the top 5” is
+  currently impossible from any interface.
+- **Correction to the phase order.** Earlier versions of this plan placed the
+  ratatui interface inside Phase 5, after Phase 4 project hygiene and after the
+  incremental index. The TUI itself does not depend on either: it consumes the
+  Phase 1 scanner and the Phase 2/3 plan/execution pipeline, both complete.
+  VISION.md §12 already ordered the TUI directly after `clean --apply` (step 7)
+  and before the index (step 8), so this change realigns the plan with the
+  vision rather than departing from it. Index-backed startup, the machine
+  overview, and project-hygiene panes remain Phase 5 work (see below).
+- **Settled product decisions** (agreed with the author):
+  1. **Manual ticking is explicit naming.** If the user ticks an item, it is
+     planned and executed even when the current severity level or staleness
+     policy would skip it. Such items are highlighted in the targets list and
+     listed in a separate, warned group on the review screen (“not eligible by
+     default — manually selected, will be deleted”). Safety refusals
+     (`CandidateSafety::Refused`, cloud/dataless content, out-of-scope
+     targets, path-invariant failures) can **never** be ticked.
+  2. **No arbitrary deletion from the browser.** There is no gdu-style `d` key.
+     cleanrs deletes recognized, explained cleanup targets only; the browser is
+     for locating storage.
+  3. **Targets are scoped to the chosen directory by default.** Machine-wide
+     providers (Cargo registry, npm/pnpm/Bun caches, Homebrew, Docker, …) are
+     hidden unless toggled on with a key.
+  4. **Entry point is `cleanrs tui [PATH]`**, defaulting to the working
+     directory like `scan` (never implicitly the home directory). Launching the
+     TUI from a bare `cleanrs` invocation is a desirable follow-up once the TUI
+     is stable; it is out of scope for this phase.
+
+### Non-goals for this phase
+
+- No TUI-only mutation path or deletion shortcut. Every mutation goes through
+  the shared plan → preflight/revalidate → execute → journal pipeline.
+- No arbitrary file/directory deletion and no Trash mode (`--trash` stays
+  deferred; see Phase 3).
+- No persistent index or FSEvents refresh; every launch scans. Freshness is
+  shown instead (Phase 5 adds index-backed startup).
+- No scheduling, no project-hygiene/Git panes (Phase 4 adds the data; Phase 5
+  adds the pane), no container overview dashboard.
+- No mouse support in the first version (keyboard first; mouse may follow).
+
+### Interaction model
+
+Two primary views over one shared scan, linked by `T`, followed by a linear
+cleanup flow. `Esc`/`q` always steps back exactly one screen; `q` on the
+browser quits (with a confirmation only if a cleanup is running).
+
+```
+ Browser ──T──▶ Targets ──x──▶ Review ──y──▶ Run ──▶ Results
+ where is the     what can go      exactly what     live       what was
+ space going?     in this folder?  will happen      progress   removed
+    ◀──────────────── Esc / q steps back one screen ────────────────
+```
+
+#### 1. Browser view (gdu/yazi-style)
+
+```
+ cleanrs  ~/Developer/Projects                          Free 41.2 GiB · APFS
+ ⠹ scanning… 18,204 dirs · 412k entries · 61.3 GiB
+──────────────────────────────────────────────────────────────────────────────
+  25.5 GiB ██████████████████  33%  matekerettsegi/           ◆ 3 targets
+▶ 12.7 GiB █████████           16%  finance/                  ◆ 5 targets
+   8.4 GiB ██████              11%  datinf/                   ◆ 2 targets
+   5.5 GiB ████                 7%  erettsegi-site/           ◆ 4 targets
+   ⠹ …                              hosthing/                 scanning
+     312 MiB ▏                       notes.sqlite
+──────────────────────────────────────────────────────────────────────────────
+ j/k move  l open  h up  T targets  i info  s sort  / filter  ? help  q quit
+```
+
+- **Header:** current path, free space and filesystem of the containing
+  volume (from existing `doctor` facts where cheap; `unknown` otherwise), and
+  the activity/status line (see “Always show what is happening”).
+- **Rows:** allocated size (default metric, same as `scan`), a proportional
+  bar, percentage of the current directory, name (directories end in `/`),
+  and badges:
+  - `◆ N targets` — recognized cleanup-target markers somewhere below
+    (cheap name/marker match against the registry’s workspace detectors during
+    the scan; the authoritative list comes from `T`);
+  - dim warning badges for incomplete coverage (unreadable subtree), mount
+    boundaries, and dataless/cloud entries. Cloud content is shown but marked,
+    never offered for cleanup.
+- **Progressive sizing.** A directory’s size requires its whole subtree, so
+  sizes cannot be computed lazily “on expand”. Instead the root’s immediate
+  children are scanned as independent background jobs (bounded concurrency,
+  reusing `Scanner::scan_with_observer` per child). Rows appear immediately
+  with a spinner and fill in as each child job completes; the parent total
+  grows live. Because each job returns the child’s full arena subtree,
+  descending into a scanned directory is instant. Leaving a directory does
+  **not** discard results; cancelling is only for an explicit rescan or quit.
+  A later optimization may stream partial arena results out of a single scan
+  (see Phase 1 performance work); per-child jobs are the first implementation.
+- **Info panel (`i`):** allocated, apparent, immediately-private lower bound,
+  reclaimability interval and confidence, and the concrete reason for any
+  uncertainty (clone, hardlink, snapshot, fallback) — the TUI form of
+  `scan --explain`.
+- **Sort (`s`):** cycles size → name → modification age. Filter (`/`) narrows
+  the visible rows by substring; `n`/`N` jump between matches.
+
+#### 2. Targets view (`T`)
+
+`T` runs target detection scoped to the highlighted directory (or the current
+directory when a file is highlighted) — the same detection as
+`cleanrs targets PATH --workspace-only`, plus machine-wide providers only when
+toggled on.
+
+```
+ Targets in ~/Developer/Projects/finance               level: safe   12 found
+ ✓ detected workspace targets  ⠹ cargo metadata 3/5 manifests
+──────────────────────────────────────────────────────────────────────────────
+  [x]  5.0–5.1 GiB  polygon-market-maker  cargo.target  71d   eligible
+  [x]  1.4 GiB      dashboard             node.next     35d   eligible
+  [ ]  2.1 GiB      web                   node.next      6d   not stale (14d)
+  [!]  0.1–2.1 GiB  simplemailer          node.modules  25d   needs standard
+   ✗   unknown      bridge                cargo.target   —    refused: outside scope
+──────────────────────────────────────────────────────────────────────────────
+ ~/Developer/Projects/finance/polygon-bots/polygon-market-maker/target
+ delete directory · built 71d ago · removes allocated tree · rebuild: cargo build
+──────────────────────────────────────────────────────────────────────────────
+ Selected 2 · 6.4–6.5 GiB            space toggle  v range  1/2/3 level  x clean
+```
+
+- **Initial selection** equals what the active level (default `safe`) would
+  plan — i.e. the CLI dry-run result. The user edits from there.
+- **Row states:** `[x]` selected by level, `[ ]` not selected, `[!]` manually
+  selected although the level/staleness policy would skip it (yellow), `✗`
+  refused and untickable (red, reason shown). Refused rows stay visible so the
+  user understands why something large is not offered.
+- **Detail pane:** full path or exact executable + argv, operation kind
+  (delete directory / delete children / provider command), age vs. threshold,
+  selection reason or skip reason, rebuild cost, recoverability, and the
+  reclaimable interval with confidence.
+- **Footer total** is the selected plan’s reclaimable interval computed by the
+  same code as the CLI plan summary — never a sum of per-file private sizes,
+  never a bare point value when uncertainty exists. Provider-reported
+  estimates are shown separately, as in the CLI.
+- **Level presets** `1`/`2`/`3` reset the selection to `safe`/`standard`/
+  `aggressive`. Manual ticks are discarded by a preset (the header says so).
+- **Scope toggle** `m` adds/removes machine-wide providers; the header shows
+  `scope: folder` or `scope: folder + machine`.
+- Re-entering `T` on the same directory reuses the result and shows its age;
+  `r` re-detects.
+
+#### 3. Review screen (`x`)
+
+A modal listing exactly what will happen, grouped:
+
+1. **Selected by level** — normal rows.
+2. **Manually selected, not eligible by default** — yellow header and warning:
+   “These items would be skipped at level `safe` (reason shown per row). You
+   selected them explicitly; they will be deleted.”
+3. **Explicit-only / user data manually selected** — red header with the
+   strongest warning. Allowed because ticking is explicit naming, never
+   reachable through a level or preset.
+
+Footer: item count, reclaimable interval, provider estimates, “Permanent
+deletion — not moved to Trash”. Confirmation key is `y`; `Enter` does **not**
+confirm, and `n`/`Esc` returns to the targets view with the selection intact.
+Root execution is refused exactly as in the CLI.
+
+#### 4. Run screen
+
+- Overall progress gauge (actions completed / total) plus per-action status
+  lines: pending, running (spinner), done (removed allocation or provider
+  reported), failed (reason), aborted (revalidation mismatch — “changed since
+  scan”), skipped.
+- Scrollable output pane streaming provider stdout/stderr (bounded, the same
+  summaries the journal keeps).
+- `q` during a run asks for confirmation and stops **between** actions; an
+  action in progress is never interrupted mid-deletion.
+
+#### 5. Results screen
+
+Removed allocation, provider-reported figures, failures, aborts, and skips —
+labelled exactly as in `history`. Affected browser directories are marked
+stale and rescanned automatically so the sizes the user returns to are true.
+
+### Keymap (vim/yazi conventions)
+
+| Context | Key | Action |
+|---|---|---|
+| Global | `?` | Help overlay listing every binding for the current view |
+| Global | `q` / `Esc` | Back one screen; quit from the browser |
+| Global | `Ctrl-c` | Quit (confirmation while a cleanup is running) |
+| Move | `j`/`k`, `↓`/`↑` | Next/previous row |
+| Move | `gg` / `G` | First/last row |
+| Move | `Ctrl-d` / `Ctrl-u` | Half page down/up |
+| Browser | `l` / `Enter` / `→` | Open directory |
+| Browser | `h` / `←` / `Backspace` | Parent directory |
+| Browser | `-` | Previous directory (history jump) |
+| Browser | `T` | Targets for highlighted directory (or current) |
+| Browser | `i` | Info/explain panel |
+| Browser | `r` | Rescan current directory |
+| Lists | `/`, `n`, `N` | Filter, next/previous match |
+| Lists | `s` | Cycle sort |
+| Targets | `Space` | Toggle highlighted item and move down |
+| Targets | `v` | Visual range selection (yazi) |
+| Targets | `Ctrl-a` | Select all *eligible* items (never refused ones) |
+| Targets | `Ctrl-r` | Invert selection (refused items unaffected) |
+| Targets | `u` / `Esc` in visual | Clear selection / leave visual mode |
+| Targets | `1` / `2` / `3` | Reset selection to safe / standard / aggressive |
+| Targets | `m` | Toggle machine-wide providers |
+| Targets | `x` | Review and clean |
+| Review | `y` | Confirm and run; `n`/`Esc` cancels |
+
+Bindings live in one keymap table so the help overlay, footer hints, and
+tests derive from the same source.
+
+### Always show what is happening
+
+- Every view has a one-line activity bar with a spinner and real counters,
+  mirroring the CLI progress bars: directories/entries/bytes while scanning,
+  detection phase and `cargo metadata N/M manifests` while finding targets,
+  `action i/N` while cleaning. Idle state says `idle` plus data freshness
+  (`scanned 4m ago`).
+- Long operations never block input: the UI thread only renders and handles
+  keys; all filesystem, provider, and execution work runs on worker threads.
+- Errors surface as a dismissable status message (red) and are also logged via
+  `tracing` to a file (never to the TUI’s own terminal).
+
+### Color semantics
+
+Shared with the CLI `terminal.rs` vocabulary and disabled by `NO_COLOR`
+(symbols such as `[x]`, `[!]`, `✗`, `◆` keep meaning without color):
+
+| Color | Meaning |
+|---|---|
+| Green | selected / eligible / succeeded |
+| Yellow | blocked by level or staleness, manual override, warnings |
+| Red | refused, failed, aborted, explicit-only warnings |
+| Cyan | paths, headers, focused elements |
+| Dim | unknown sizes, `0 B`, incomplete coverage hints, help hints |
+
+The palette stays minimal: one accent color, no backgrounds except the focused
+row highlight.
+
+### Architecture
+
+**Crates/dependencies.** `ratatui` + `crossterm` (VISION.md §14). Choose the
+newest releases compatible with the workspace’s Rust 1.85 MSRV and pin with a
+comment if necessary, as already done for `globset` and `comfy-table`. Worker
+communication uses the existing `crossbeam-channel` dependency; no async
+runtime, consistent with the scanner.
+
+**Module layout** (inside the `cleanrs` binary crate, no new crate):
+
+```
+cleanrs/src/tui/
+  mod.rs        entry point: TTY check, terminal setup/restore, panic hook
+  app.rs        App state machine (screens, selection, focus) — no I/O
+  event.rs      unified Event enum: Key, Tick, Worker(WorkerEvent)
+  keymap.rs     binding table → Action enum; feeds help + footer
+  worker.rs     background jobs: child scans, target detection, execution
+  theme.rs      color/symbol semantics, NO_COLOR handling
+  views/        browser.rs, targets.rs, review.rs, run.rs, results.rs, help.rs
+```
+
+**Event loop.** `crossbeam_channel::select!` over terminal input (read on a
+dedicated thread), worker events, and a render tick (~10–15 Hz while busy,
+idle otherwise). `App::update(Action | WorkerEvent)` is a pure state
+transition; rendering reads state only. This keeps the logic testable without a
+terminal.
+
+**Terminal hygiene.** Alternate screen + raw mode, restored on normal exit,
+error, and panic (panic hook). Non-TTY invocation fails with a clear error
+(Phase 5 criterion).
+
+### Prerequisite refactors (land first, CLI-visible where useful)
+
+1. **Extract the shared cleanup pipeline from `main.rs`.** Today
+   `run_clean`, `ReviewedPlan`, `enforce_apply_boundary`,
+   `apply_reviewed_plan`, `validate_direct_preflight`, `revalidate_provider`,
+   and journal helpers live in the binary and print directly. Move the
+   non-presentational parts into a reusable layer (a `pipeline`/`plan` module
+   in `cleanrs-core`, or a shared binary module if registry/trust coupling makes
+   core inappropriate) that:
+   - builds a `ReviewedPlan` from scope + registry + level + selection;
+   - executes it, emitting `ExecutionEvent`s (action started, output line,
+     action finished with `ActionResult`, run finished) to an observer;
+   - writes the identical journal records.
+   The CLI becomes one observer (indicatif + streamed output), the TUI another.
+   Existing CLI tests must pass unchanged.
+2. **Per-candidate selection in plans.** Extend planning so a selection can be
+   expressed per candidate (stable candidate identity: canonical path +
+   device/inode for paths, provider identity + argv for commands), not only per
+   target ID. Represent the outcome explicitly, e.g.
+   `PlanSelection::Selected { source: Level | Manual }` and a manual-override
+   record carrying the skip reason it overrode. Refusals remain
+   non-overridable in code, not just in the UI.
+3. **Journal the selection source.** History records whether each action was
+   selected by level or manually (and what it overrode), so `history` can
+   explain why an ineligible-by-default item ran.
+4. **CLI parity:** add `clean --select PATH` (repeatable) with the same
+   semantics as a manual tick, and show manual overrides in the dry-run table.
+   This also delivers per-item selection to non-TUI users.
+5. **Scanner cancellation.** A cancellation token checked between directories
+   so rescans and quit stop work promptly; cancelled scans report incomplete
+   coverage rather than partial totals presented as complete.
+6. **Scoped detection reuse (optional, measured).** Let target detection reuse
+   arena facts already gathered by the browser scan instead of rescanning the
+   subtree. Only land if it measurably reduces `T` latency without changing
+   results.
+
+### Milestones
+
+| # | Delivers | Exit criteria |
+|---|---|---|
+| M0 | Refactors 1–5 above | CLI behaviour and tests unchanged; `clean --select` works in fixtures; manual-override recorded in journal |
+| M1 | `cleanrs tui [PATH]` skeleton | Alternate screen, keymap, help overlay, clean restore on panic, non-TTY error |
+| M2 | Browser | Progressive per-child scanning with live totals, navigation, sort, filter, info panel, coverage/cloud badges |
+| M3 | Targets view | Scoped detection with progress, row states, detail pane, selection keys, presets, scope toggle, interval totals |
+| M4 | Review + run + results | Grouped review with override warnings, `y`-only confirmation, streamed execution via shared pipeline, results, affected-dir rescan |
+| M5 | Polish | Freshness labels, error messages, `NO_COLOR`, narrow-terminal layout (≥80 cols), docs (README/VISION/man page) |
+
+### Testing strategy
+
+- `App` state transitions tested directly with synthetic key/worker events
+  (selection rules, refused rows untickable, presets, visual mode, back-stack).
+- Rendering tested with ratatui’s `TestBackend` buffer assertions for each
+  view, with and without color.
+- Pipeline equivalence: the same fixture + selection produces the same
+  `ReviewedPlan` and the same journal records from the CLI and TUI paths.
+- Execution tests only in unique temporary sandboxes with the existing
+  provider stub; never the real home directory, never `--apply` outside a
+  sandbox.
+
+### Practical completion criteria
+
+- [ ] `cleanrs tui [PATH]` opens on the working directory by default and never
+      implicitly on the home directory; non-TTY invocation fails clearly.
+- [ ] Browser shows sizes progressively with visible scan activity and lets the
+      user navigate before the scan finishes.
+- [ ] `T` lists the directory’s targets with the same IDs, states, and
+      intervals as `cleanrs targets PATH --workspace-only`.
+- [ ] Items can be toggled individually, by range, all/none/invert, and by
+      level preset; refused items cannot be selected by any key.
+- [ ] Manually selected ineligible items are executed, are highlighted in the
+      list and in a separate warned group on the review screen, and are
+      journalled as manual selections.
+- [ ] Execution requires an explicit `y`, runs through the shared pipeline with
+      full revalidation, shows live progress, and produces history identical to
+      an equivalent `clean --select … --apply` run.
+- [ ] Totals are intervals computed by the shared plan-summary code.
+- [ ] `NO_COLOR` and narrow terminals remain usable; every long operation shows
+      progress.
+
+### Follow-ups (not in this phase)
+
+- Bare `cleanrs` (no subcommand, on a TTY) launches the TUI.
+- History view inside the TUI.
+- Index-backed instant startup and background refresh (Phase 5).
+- Project-hygiene/Git evidence panes once Phase 4 provides the data.
+- Mouse support.
+
+---
+
 ## Phase 4 — Project hygiene and stale-project intelligence
 
 **Goal:** find storage that generic cache commands cannot understand because its
@@ -607,15 +983,18 @@ rules.
 
 ### Ratatui interface
 
+The browser, targets view, per-item selection, review, and execution screens
+moved to Phase 5A. Phase 5 extends that TUI with:
+
 - Overview of container/volume state, recognized developer storage, large
   unknown paths, and recent cleanup history.
-- Tree navigation with allocated/reclaimable metrics and coverage warnings.
-- Provider/action inventory grouped by severity.
-- Project-hygiene findings and explanations.
-- Plan review and explicit execution through the same Phase 2/3 pipeline; no
-  TUI-only deletion shortcuts.
+- Machine-wide provider/action inventory grouped by severity.
+- Project-hygiene findings and explanations (data from Phase 4).
 - Fast startup from the index with visible freshness state and background
-  refresh.
+  refresh, replacing Phase 5A's scan-on-launch.
+
+All execution continues through the shared pipeline extracted in Phase 5A; no
+TUI-only deletion shortcuts.
 
 ### Practical completion criteria
 
@@ -684,18 +1063,29 @@ seams but do not constitute supported Linux behavior.
 
 Work should continue in this order:
 
-1. Begin Phase 4 project hygiene using Phase 3's shared plan/execution/history
-   pipeline rather than adding a second mutation path.
-2. Strengthen Cargo shared-target ownership and project-activity evidence before
-   widening stale-project cleanup recommendations.
-3. Add repository state, worktree, lockfile, and process-activity evidence for
-   project-level decisions.
-4. In parallel with normal feature work, land the Phase 1 largest-file view,
+1. **Phase 5A M0:** extract the shared plan/execution/journal pipeline from
+   `main.rs`, add per-candidate selection with a recorded selection source,
+   ship `clean --select PATH`, and add scanner cancellation. CLI behaviour and
+   tests must remain unchanged.
+2. **Phase 5A M1–M5:** `cleanrs tui [PATH]` skeleton, browser with progressive
+   per-child scanning, scoped targets view with selection, review/run/results
+   through the shared pipeline, then polish and documentation.
+3. Investigate an observation from the 2026-10-13 real-tree dry run of
+   `~/Developer`: several `cargo.target` candidates `targets` reported as
+   `eligible` (71–125 days old) did not appear among the selected actions at
+   the `safe` or `standard` level. Confirm whether this is the intended
+   severity gate or a planning gap before the TUI presents the same selection.
+4. Begin Phase 4 project hygiene using the shared pipeline rather than adding a
+   second mutation path: Cargo shared-target ownership and project-activity
+   evidence first, then repository state, worktree, lockfile, and
+   process-activity evidence.
+5. In parallel with normal feature work, land the Phase 1 largest-file view,
    packed-record parser fixtures, and a checked-in performance baseline.
-5. Revisit Trash only as an explicit moved-not-reclaimed workflow, and add
+6. Revisit Trash only as an explicit moved-not-reclaimed workflow, and add
    observed APFS container-free-space evidence only when its measurement
    boundary is truthful and reproducible.
 
 Phases 0–3 now provide accounting, read-only inventory, immutable cleanup plans,
-guarded execution, persistent config trust, and lightweight history. Phase 4 is
-the next concrete feature boundary.
+guarded execution, persistent config trust, and lightweight history. Phase 5A
+(the interactive TUI) is the next concrete feature boundary, followed by
+Phase 4.

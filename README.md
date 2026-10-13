@@ -6,7 +6,8 @@ Storage usage analyzer and cleaner for developers, written in Rust. Fully transp
 > workspace/provider `targets` commands are joined by immutable cleanup plans,
 > guarded `clean --apply`, persistent command-config trust, and action-level
 > `history`. Direct deletion is descriptor-relative and provider commands are
-> revalidated before execution. Phase 4 project hygiene is next; deeper snapshot
+> revalidated before execution. The interactive `cleanrs tui` (Phase 5A) is next,
+> followed by Phase 4 project hygiene; deeper snapshot
 > and File Provider research remains deferred unless it enables a concrete
 > capability. See
 > [the findings](docs/findings-phase0.md), [VISION.md](VISION.md), and the
@@ -136,7 +137,7 @@ cleanrs targets [PATH]   List workspace targets and machine-wide provider action
 cleanrs clean [PATH]     Plan cleanup; --apply executes the reviewed plan
 cleanrs history          Action outcomes and evidence from applied runs
 cleanrs trust-config     Trust/list/revoke an explicit command config by hash
-cleanrs tui              Planned interactive browser
+cleanrs tui [PATH]       Next: browse sizes, pick targets, review and clean
 cleanrs schedule         Planned launchd maintenance
 cleanrs index            Planned cache control
 ```
