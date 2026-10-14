@@ -154,7 +154,9 @@ impl CleanupLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MarkerDetector {
     pub marker: &'static str,
+    pub markers: &'static [&'static str],
     pub directory: &'static str,
+    pub inner_marker: Option<&'static str>,
 }
 
 /// A built-in declarative workspace target.
@@ -167,6 +169,7 @@ pub struct TargetDefinition {
     pub rebuild_cost_override: Option<RebuildCost>,
     pub stale_after_days: u32,
     pub children_only: bool,
+    pub requires_gitignore: bool,
 }
 
 /// Identity captured while inspecting a provider. Future execution must prove
@@ -268,52 +271,494 @@ impl TargetDefinition {
 /// strictly below a detected project root.
 pub const BUILTIN_TARGETS: &[TargetDefinition] = &[
     TargetDefinition {
+        id: "project.build",
+        description: "gitignored generated build output",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[],
+            directory: "build",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+        requires_gitignore: true,
+    },
+    TargetDefinition {
+        id: "project.out",
+        description: "gitignored generated build output",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[],
+            directory: "out",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+        requires_gitignore: true,
+    },
+    TargetDefinition {
+        id: "project.coverage",
+        description: "gitignored generated build output",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[],
+            directory: "coverage",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+        requires_gitignore: true,
+    },
+    TargetDefinition {
+        id: "react-native.ios-build",
+        description: "gitignored generated build output",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[],
+            directory: "ios/build",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+        requires_gitignore: true,
+    },
+    TargetDefinition {
+        id: "react-native.android-build",
+        description: "gitignored generated build output",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[],
+            directory: "android/build",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+        requires_gitignore: true,
+    },
+    TargetDefinition {
+        id: "react-native.android-app-build",
+        description: "gitignored generated build output",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[],
+            directory: "android/app/build",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+        requires_gitignore: true,
+    },
+    TargetDefinition {
         id: "cargo.target",
         description: "Rust build output",
         detector: MarkerDetector {
-            marker: "Cargo.toml",
+            marker: "",
+            markers: &["Cargo.toml"],
             directory: "target",
+            inner_marker: None,
         },
         class: TargetClass::Cheap,
         rebuild_cost_override: Some(RebuildCost::High),
         stale_after_days: 14,
         children_only: false,
+        requires_gitignore: false,
     },
     TargetDefinition {
         id: "node.modules",
         description: "installed Node.js dependencies",
         detector: MarkerDetector {
-            marker: "package.json",
+            marker: "",
+            markers: &["package.json"],
             directory: "node_modules",
+            inner_marker: None,
         },
         class: TargetClass::Network,
         rebuild_cost_override: None,
         stale_after_days: 30,
         children_only: false,
+        requires_gitignore: false,
     },
     TargetDefinition {
         id: "node.next",
         description: "Next.js generated output",
         detector: MarkerDetector {
-            marker: "package.json",
+            marker: "",
+            markers: &["package.json"],
             directory: ".next",
+            inner_marker: None,
         },
         class: TargetClass::Cheap,
         rebuild_cost_override: None,
         stale_after_days: 14,
         children_only: false,
+        requires_gitignore: false,
     },
     TargetDefinition {
         id: "node.dist",
         description: "JavaScript distribution output",
         detector: MarkerDetector {
-            marker: "package.json",
+            marker: "",
+            markers: &["package.json"],
             directory: "dist",
+            inner_marker: None,
         },
         class: TargetClass::Cheap,
         rebuild_cost_override: None,
         stale_after_days: 30,
         children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "python.venv",
+        description: "Python virtual environment (may include manually installed packages)",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[],
+            directory: "",
+            inner_marker: Some("pyvenv.cfg"),
+        },
+        class: TargetClass::Network,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "python.bytecode",
+        description: "Python generated tool cache",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[],
+            directory: "__pycache__",
+            inner_marker: None,
+        },
+        class: TargetClass::Free,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "python.pytest",
+        description: "Python generated tool cache",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[],
+            directory: ".pytest_cache",
+            inner_marker: None,
+        },
+        class: TargetClass::Free,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "python.mypy",
+        description: "Python generated tool cache",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[],
+            directory: ".mypy_cache",
+            inner_marker: None,
+        },
+        class: TargetClass::Free,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "python.ruff",
+        description: "Python generated tool cache",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[],
+            directory: ".ruff_cache",
+            inner_marker: None,
+        },
+        class: TargetClass::Free,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "python.tox",
+        description: "Python test environment cache",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[],
+            directory: ".tox",
+            inner_marker: None,
+        },
+        class: TargetClass::Network,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "python.nox",
+        description: "Python test environment cache",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[],
+            directory: ".nox",
+            inner_marker: None,
+        },
+        class: TargetClass::Network,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "node.turbo",
+        description: "generated JS/TS framework cache",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &["package.json"],
+            directory: ".turbo",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "node.nuxt",
+        description: "generated JS/TS framework cache",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &["package.json"],
+            directory: ".nuxt",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "node.svelte-kit",
+        description: "generated JS/TS framework cache",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &["package.json"],
+            directory: ".svelte-kit",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "node.parcel",
+        description: "generated JS/TS framework cache",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &["package.json"],
+            directory: ".parcel-cache",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "node.angular",
+        description: "generated JS/TS framework cache",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &["package.json"],
+            directory: ".angular/cache",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "node.cache",
+        description: "generated JS/TS framework cache",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &["package.json"],
+            directory: "node_modules/.cache",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "expo.cache",
+        description: "Expo project-local generated state",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &["package.json"],
+            directory: ".expo",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "cocoapods.project-pods",
+        description: "project-local CocoaPods dependencies",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &["ios/Podfile"],
+            directory: "ios/Pods",
+            inner_marker: None,
+        },
+        class: TargetClass::Network,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "android.gradle",
+        description: "Android project-local Gradle state",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[
+                "android/build.gradle",
+                "android/build.gradle.kts",
+                "android/settings.gradle",
+                "android/settings.gradle.kts",
+            ],
+            directory: "android/.gradle",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "android.cxx",
+        description: "Android native build intermediates",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &["android/build.gradle", "android/build.gradle.kts"],
+            directory: "android/app/.cxx",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "gradle.cache",
+        description: "project-local Gradle state",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[
+                "settings.gradle",
+                "settings.gradle.kts",
+                "build.gradle",
+                "build.gradle.kts",
+            ],
+            directory: ".gradle",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "dart.tool",
+        description: "Dart/Flutter generated tool state",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &["pubspec.yaml"],
+            directory: ".dart_tool",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "zig.cache",
+        description: "Zig generated cache",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &["build.zig"],
+            directory: ".zig-cache",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "zig.cache-modern",
+        description: "Zig generated cache",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &["build.zig"],
+            directory: "zig-cache",
+            inner_marker: None,
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 14,
+        children_only: false,
+        requires_gitignore: false,
+    },
+    TargetDefinition {
+        id: "terraform.providers",
+        description: "Terraform downloaded providers and modules",
+        detector: MarkerDetector {
+            marker: "",
+            markers: &[],
+            directory: ".terraform",
+            inner_marker: None,
+        },
+        class: TargetClass::Network,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+        requires_gitignore: false,
     },
 ];
 
@@ -328,6 +773,10 @@ pub enum CandidateSafety {
 /// A detected and sized target candidate.
 #[derive(Debug, Clone, Serialize)]
 pub struct DetectedTarget {
+    pub gitignore: Option<GitIgnoreEvidence>,
+    /// Structured Cargo ownership from metadata inspection; incomplete shared
+    /// ownership is evidence only and never authorizes cleanup.
+    pub cargo_ownership: Option<CargoOwnership>,
     pub id: String,
     pub provider: ProviderIdentity,
     pub description: String,
@@ -349,6 +798,22 @@ pub struct DetectedTarget {
     pub exclusive_priority: u8,
     pub consequence: String,
     pub evidence: Vec<String>,
+}
+
+/// Evidence required for ambiguous folder names, rechecked before deletion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GitIgnoreEvidence {
+    pub repository: PathBuf,
+    pub relative_path: PathBuf,
+    pub pattern: String,
+}
+
+/// Owners observed during a bounded, explicit-root Cargo inspection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CargoOwnership {
+    pub target_directory: PathBuf,
+    pub observed_owners: Vec<PathBuf>,
+    pub complete: bool,
 }
 
 /// Structured policy explanation for presentation. The planner and UI share
@@ -742,6 +1207,95 @@ pub fn plan_cleanup_with_selection(
     Ok(planned)
 }
 
+/// Metadata-only path index for any-of, nested, and inner-marker detectors.
+/// Paths must be nonempty relative normal components; symlinks are never followed.
+pub struct DetectorIndex<'a> {
+    arena: &'a Arena,
+    children: HashMap<NodeIndex, HashMap<&'a str, NodeIndex>>,
+}
+impl<'a> DetectorIndex<'a> {
+    pub fn new(arena: &'a Arena) -> Self {
+        let children = (0..arena.nodes.len())
+            .map(NodeIndex::from_usize)
+            .filter(|i| arena.nodes[i.as_usize()].kind == NodeKind::Directory)
+            .map(|i| {
+                (
+                    i,
+                    arena
+                        .children(i)
+                        .map(|child| (arena.name(child), child))
+                        .collect(),
+                )
+            })
+            .collect();
+        Self { arena, children }
+    }
+    pub fn relative(&self, root: NodeIndex, path: &str) -> Option<NodeIndex> {
+        if !valid_detector_path(path) {
+            return None;
+        }
+        let mut current = root;
+        for component in Path::new(path).components() {
+            let name = component.as_os_str().to_str()?;
+            current = *self.children.get(&current)?.get(name)?;
+            if self.arena.nodes[current.as_usize()].kind == NodeKind::Symlink {
+                return None;
+            }
+        }
+        Some(current)
+    }
+    pub fn candidates(
+        &self,
+        markers: &[&str],
+        directory: &str,
+        inner: Option<&str>,
+    ) -> Vec<(NodeIndex, NodeIndex)> {
+        let mut matches = Vec::new();
+        for (&project, children) in &self.children {
+            if !markers.is_empty()
+                && !markers.iter().any(|marker| {
+                    self.relative(project, marker)
+                        .is_some_and(|i| self.arena.nodes[i.as_usize()].kind == NodeKind::File)
+                })
+            {
+                continue;
+            }
+            let candidates: Vec<_> = if directory.is_empty() && inner.is_some() {
+                children.values().copied().collect()
+            } else {
+                self.relative(project, directory).into_iter().collect()
+            };
+            for candidate in candidates {
+                if self.arena.nodes[candidate.as_usize()].kind != NodeKind::Directory {
+                    continue;
+                }
+                if inner.is_some_and(|marker| {
+                    !self
+                        .relative(candidate, marker)
+                        .is_some_and(|i| self.arena.nodes[i.as_usize()].kind == NodeKind::File)
+                }) {
+                    continue;
+                }
+                matches.push((project, candidate));
+            }
+        }
+        matches.sort_by_key(|(_, candidate)| self.arena.path(*candidate));
+        matches
+    }
+}
+
+#[must_use]
+pub fn valid_detector_path(value: &str) -> bool {
+    !value.is_empty()
+        && !Path::new(value).is_absolute()
+        && Path::new(value)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        && !value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+}
+
 /// Detect all selected built-in workspace targets from one explicit scan.
 #[must_use]
 pub fn detect_workspace_targets(
@@ -752,42 +1306,28 @@ pub fn detect_workspace_targets(
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
-    let mut children_by_name: HashMap<NodeIndex, HashMap<&str, NodeIndex>> = HashMap::new();
-    for index in (0..scan.arena.nodes.len()).map(NodeIndex::from_usize) {
-        if scan.arena.nodes[index.as_usize()].kind != NodeKind::Directory {
-            continue;
-        }
-        children_by_name.insert(
-            index,
-            scan.arena
-                .children(index)
-                .map(|child| (scan.arena.name(child), child))
-                .collect(),
-        );
-    }
+    let index = DetectorIndex::new(&scan.arena);
 
     // A stable path key prevents duplicate actions when overlapping definitions
     // resolve to the same artifact directory.
     let mut detected = BTreeMap::<PathBuf, DetectedTarget>::new();
     for definition in definitions {
-        for (&project, children) in &children_by_name {
-            if !children.contains_key(definition.detector.marker) {
-                continue;
-            }
-            let Some(&candidate) = children.get(definition.detector.directory) else {
-                continue;
-            };
-            if scan.arena.nodes[candidate.as_usize()].kind != NodeKind::Directory {
-                continue;
-            }
-
+        let mut markers = definition.detector.markers.to_vec();
+        if !definition.detector.marker.is_empty() {
+            markers.push(definition.detector.marker);
+        }
+        for (project, candidate) in index.candidates(
+            &markers,
+            definition.detector.directory,
+            definition.detector.inner_marker,
+        ) {
             let project_root = scan.arena.path(project);
             let path = scan.arena.path(candidate);
             let age_days = if definition.id == "cargo.target" {
                 cargo_activity_age_days(
                     &scan.arena,
                     candidate,
-                    children[definition.detector.marker],
+                    index.relative(project, "Cargo.toml").expect("Cargo marker"),
                     now,
                 )
             } else {
@@ -798,6 +1338,8 @@ pub fn detect_workspace_targets(
             detected
                 .entry(path.clone())
                 .or_insert_with(|| DetectedTarget {
+                    cargo_ownership: None,
+                    gitignore: None,
                     id: definition.id.into(),
                     provider: ProviderIdentity::workspace(),
                     description: definition.description.into(),
@@ -850,7 +1392,32 @@ pub fn detect_workspace_targets(
     // a package.json). Once an outer artifact directory is a candidate, every
     // candidate below it is part of the same prospective action and must not be
     // printed or counted again.
-    let mut candidates: Vec<_> = detected.into_values().collect();
+    let guarded: HashSet<_> = definitions
+        .iter()
+        .filter(|definition| definition.requires_gitignore)
+        .map(|definition| definition.id)
+        .collect();
+    let ambiguous_paths: Vec<_> = detected
+        .values()
+        .filter(|target| guarded.contains(target.id.as_str()))
+        .filter_map(|target| target.path.clone())
+        .collect();
+    let mut ignore_evidence = crate::projects::gitignore_evidence(scan, &ambiguous_paths, home);
+    let mut candidates: Vec<_> = detected
+        .into_values()
+        .filter_map(|mut target| {
+            if guarded.contains(target.id.as_str()) {
+                target.gitignore = ignore_evidence.remove(target.path.as_ref()?);
+                let evidence = target.gitignore.as_ref()?;
+                target.evidence.push(format!(
+                    "gitignored inside {}: {}",
+                    evidence.repository.display(),
+                    evidence.pattern
+                ));
+            }
+            Some(target)
+        })
+        .collect();
     candidates.sort_by(|left, right| {
         left.path
             .as_ref()
@@ -937,6 +1504,8 @@ pub fn detect_explicit_path_target(
         )
     };
     DetectedTarget {
+        cargo_ownership: None,
+        gitignore: None,
         id,
         provider: ProviderIdentity {
             id: "configuration".into(),
@@ -980,13 +1549,26 @@ fn workspace_consequence(definition: &TargetDefinition) -> &'static str {
         "cargo.target" => "Rust build output will be rebuilt on the next build",
         "node.modules" => "dependencies must be restored by the package manager",
         "node.next" => "Next.js output will be regenerated on the next build",
+        "python.venv" | "python.requirements-venv" => {
+            "Python environments may contain local installs or user data; review individually before permanent removal"
+        }
+        "gradle.build" | "gradle.kotlin-build" | "gradle.cache" | "gradle.kotlin-cache" => {
+            "Gradle will regenerate build/cache output; the next build may be expensive"
+        }
+        "xcode.project-build" => "Xcode project build output will require a rebuild",
         "node.dist" => "distribution output will be regenerated by its build",
         _ => "generated workspace output will need to be recreated",
     }
 }
 
-fn modified_age_days(arena: &Arena, index: NodeIndex, now: u64) -> Option<u64> {
-    let modified = arena.nodes[index.as_usize()].modified_unix_seconds;
+pub(crate) fn modified_age_days(arena: &Arena, index: NodeIndex, now: u64) -> Option<u64> {
+    // Directory mtime alone misses writes to an existing build artifact.
+    let mut stack = vec![index];
+    let mut modified = 0;
+    while let Some(index) = stack.pop() {
+        modified = modified.max(arena.nodes[index.as_usize()].modified_unix_seconds);
+        stack.extend(arena.children(index));
+    }
     u64::try_from(modified)
         .ok()
         .filter(|modified| *modified <= now)
@@ -1031,7 +1613,11 @@ fn validate_candidate(
             "artifact path is not strictly beneath its detected project root".into(),
         );
     }
-    if path.parent() != Some(project_root) {
+    if path.strip_prefix(project_root).ok().is_none_or(|relative| {
+        !relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    }) {
         return CandidateSafety::Refused(
             "artifact normalization escaped the detected project root".into(),
         );
@@ -1616,5 +2202,182 @@ mod tests {
                 .iter()
                 .all(|item| matches!(item.selection, PlanSelection::Skipped(_)))
         );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use crate::{ScanOptions, Scanner};
+    use std::fs;
+
+    #[test]
+    fn every_unambiguous_detector_has_fixture_and_candidate_cloud_dataless_guards() {
+        for definition in BUILTIN_TARGETS.iter().filter(|d| !d.requires_gitignore) {
+            let fixture = tempfile::tempdir().unwrap();
+            let project = fixture.path().join("project");
+            fs::create_dir_all(&project).unwrap();
+            let detector = definition.detector;
+            if let Some(marker) = detector
+                .markers
+                .first()
+                .copied()
+                .or_else(|| (!detector.marker.is_empty()).then_some(detector.marker))
+            {
+                let path = project.join(marker);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, "marker").unwrap();
+            }
+            let artifact = project.join(if detector.directory.is_empty() {
+                "custom-python-name"
+            } else {
+                detector.directory
+            });
+            fs::create_dir_all(&artifact).unwrap();
+            fs::write(artifact.join("generated"), "fixture").unwrap();
+            if let Some(marker) = detector.inner_marker {
+                fs::write(artifact.join(marker), "marker").unwrap();
+            }
+            let mut scan = Scanner::new(ScanOptions::default()).scan(&project).unwrap();
+            let targets = detect_workspace_targets(&scan, &[*definition], Some(fixture.path()));
+            assert_eq!(targets.len(), 1, "{}", definition.id);
+            assert_eq!(targets[0].path.as_ref(), Some(&artifact));
+            assert!(targets[0].manually_selectable(), "{}", definition.id);
+            let candidate = scan
+                .arena
+                .nodes
+                .iter()
+                .enumerate()
+                .find_map(|(i, _)| {
+                    (scan.arena.path(NodeIndex::from_usize(i)) == artifact).then_some(i)
+                })
+                .unwrap();
+            scan.arena.nodes[candidate]
+                .flags
+                .insert(NodeFlags::DATALESS);
+            assert!(
+                !detect_workspace_targets(&scan, &[*definition], Some(fixture.path()))[0]
+                    .manually_selectable(),
+                "{}",
+                definition.id
+            );
+            // The identical metadata tree is also refused when scoped under a
+            // synced provider path, independently of its placeholder flags.
+            let cloud_home = project.parent().unwrap();
+            let cloud_project = cloud_home.join("Library/CloudStorage/service/project");
+            fs::create_dir_all(cloud_project.parent().unwrap()).unwrap();
+            fs::rename(&project, &cloud_project).unwrap();
+            let cloud = Scanner::new(Default::default())
+                .scan(&cloud_project)
+                .unwrap();
+            assert!(
+                !detect_workspace_targets(&cloud, &[*definition], Some(cloud_home))[0]
+                    .manually_selectable(),
+                "{}",
+                definition.id
+            );
+        }
+    }
+    #[test]
+    fn expo_never_targets_source_roots_and_venv_collapses_nested_bytecode() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        for path in [
+            "ios/Pods",
+            "android/.gradle",
+            "android/app/.cxx",
+            "custom-env/lib/__pycache__",
+        ] {
+            fs::create_dir_all(root.join(path)).unwrap();
+        }
+        for path in [
+            "package.json",
+            "ios/Podfile",
+            "android/settings.gradle.kts",
+            "android/build.gradle",
+            "custom-env/pyvenv.cfg",
+        ] {
+            fs::write(root.join(path), "fixture").unwrap();
+        }
+        let scan = Scanner::new(Default::default()).scan(root).unwrap();
+        let targets = detect_workspace_targets(&scan, BUILTIN_TARGETS, None);
+        for relative in [
+            "ios/Pods",
+            "android/.gradle",
+            "android/app/.cxx",
+            "custom-env",
+        ] {
+            assert!(
+                targets
+                    .iter()
+                    .any(|t| t.path.as_ref() == Some(&root.join(relative))),
+                "{relative}"
+            );
+        }
+        for relative in ["ios", "android", "custom-env/lib/__pycache__"] {
+            assert!(
+                !targets
+                    .iter()
+                    .any(|t| t.path.as_ref() == Some(&root.join(relative))),
+                "{relative}"
+            );
+        }
+        let environment = targets.iter().find(|t| t.id == "python.venv").unwrap();
+        assert_eq!(environment.class, TargetClass::Network);
+        assert!(!CleanupLevel::Safe.selects(environment.properties, false));
+    }
+    #[test]
+    fn generic_names_require_gitignore_and_ignore_evidence_is_rechecked() {
+        let fixture = tempfile::tempdir().unwrap();
+        for path in [
+            "build",
+            "out",
+            "coverage",
+            "ios/build",
+            "android/build",
+            "android/app/build",
+        ] {
+            fs::create_dir_all(fixture.path().join(path)).unwrap();
+        }
+        let scan = Scanner::new(Default::default())
+            .scan(fixture.path())
+            .unwrap();
+        assert!(detect_workspace_targets(&scan, BUILTIN_TARGETS, None).is_empty());
+        let git = crate::providers::SystemProviderHost::project_inspection();
+        use crate::providers::ProviderHost;
+        let Some(executable) = git.resolve_executable("git").unwrap() else {
+            return;
+        };
+        let init = CommandSpec {
+            executable,
+            args: vec!["init".into(), fixture.path().display().to_string()],
+            environment: BTreeMap::new(),
+        };
+        assert_eq!(git.run_inspection(&init).unwrap().exit_code, Some(0));
+        fs::write(
+            fixture.path().join(".gitignore"),
+            "build/\nout/\ncoverage/\n",
+        )
+        .unwrap();
+        let scan = Scanner::new(Default::default())
+            .scan(fixture.path())
+            .unwrap();
+        let targets = detect_workspace_targets(&scan, BUILTIN_TARGETS, None);
+        assert_eq!(targets.len(), 6);
+        assert!(targets.iter().all(|t| t.gitignore.is_some()));
+        let target = &targets[0];
+        assert!(
+            crate::projects::revalidate_artifact_repository(target, fixture.path(), None, &git)
+                .is_ok()
+        );
+        fs::write(fixture.path().join(".gitignore"), "").unwrap();
+        assert!(
+            crate::projects::revalidate_artifact_repository(target, fixture.path(), None, &git)
+                .is_err()
+        );
+        let scan = Scanner::new(Default::default())
+            .scan(fixture.path())
+            .unwrap();
+        assert!(detect_workspace_targets(&scan, BUILTIN_TARGETS, None).is_empty());
     }
 }

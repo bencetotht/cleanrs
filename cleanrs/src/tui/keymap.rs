@@ -245,13 +245,13 @@ pub static BINDINGS: &[Binding] = &[
         Action::Preset(cleanrs_core::targets::CleanupLevel::Aggressive)
     ),
     binding!(
-        &[Char('m')],
+        &[Char('S')],
         M::NONE,
-        "m",
-        "Toggle machine-wide providers and re-detect",
-        Some("m scope"),
+        "S",
+        "System targets; providers only, separate scope",
+        Some("S system"),
         false,
-        Action::Machine
+        Action::SystemTargets
     ),
     binding!(
         &[Char('x')],
@@ -347,8 +347,10 @@ fn applies(action: &Action, screen: Screen) -> bool {
         | Action::Invert
         | Action::ClearSelection
         | Action::Preset(_)
-        | Action::Machine
         | Action::Review => screen == Screen::Targets,
+        Action::SystemTargets => {
+            matches!(screen, Screen::Browser | Screen::Targets | Screen::Results)
+        }
         Action::Confirm | Action::Cancel => matches!(screen, Screen::Review | Screen::Run),
         Action::OutputScroll(_) => screen == Screen::Run,
         _ => false,

@@ -34,12 +34,13 @@ pub fn plan_request(
     path: PathBuf,
     home: Option<PathBuf>,
     level: CleanupLevel,
-    machine: bool,
+    system: bool,
     selected: Option<HashSet<CandidateKey>>,
 ) -> PlanRequest {
     let manual = selected.is_some();
     PlanRequest {
         path,
+        system,
         home,
         level,
         explicitly_named_ids: Vec::new(),
@@ -47,7 +48,7 @@ pub fn plan_request(
         exclude: Vec::new(),
         ignore_staleness: false,
         workers: None,
-        workspace_only: !machine,
+        workspace_only: !system,
         cargo_stale_after: 14,
         config: None,
         no_builtin_targets: false,
@@ -123,6 +124,27 @@ impl Snapshot {
             .iter()
             .map(|error| error.path.clone())
             .collect();
+        // Badges use the same nested/alternative marker model as detection.
+        // Repository-dependent names require a reviewed Git proof, so avoid
+        // advertising them from this metadata-only browser snapshot.
+        let detector_index = cleanrs_core::targets::DetectorIndex::new(arena);
+        let mut hints = HashMap::new();
+        for target in BUILTIN_TARGETS
+            .iter()
+            .filter(|target| !target.requires_gitignore)
+        {
+            let mut markers = target.detector.markers.to_vec();
+            if !target.detector.marker.is_empty() {
+                markers.push(target.detector.marker);
+            }
+            for (_, candidate) in detector_index.candidates(
+                &markers,
+                target.detector.directory,
+                target.detector.inner_marker,
+            ) {
+                hints.entry(candidate).or_insert(target.id);
+            }
+        }
         // Scanner parents always precede children. Merge inode sets bottom-up
         // (small into large) to deduplicate hardlinks at every directory scope.
         for position in (0..arena.nodes.len()).rev() {
@@ -139,28 +161,8 @@ impl Snapshot {
             }
             if node.kind == NodeKind::Directory {
                 directories.insert(path, index);
-                let children: HashMap<_, _> = arena
-                    .children(index)
-                    .map(|i| (arena.name(i), arena.nodes[i.as_usize()].kind))
-                    .collect();
-                summary.target_id = arena.parent(index).and_then(|parent| {
-                    BUILTIN_TARGETS
-                        .iter()
-                        .find(|target| {
-                            arena.name(index) == target.detector.directory
-                                && arena
-                                    .children(parent)
-                                    .any(|child| arena.name(child) == target.detector.marker)
-                        })
-                        .map(|target| target.id.to_owned())
-                });
-                summary.targets += BUILTIN_TARGETS
-                    .iter()
-                    .filter(|target| {
-                        children.contains_key(target.detector.marker)
-                            && children.get(target.detector.directory) == Some(&NodeKind::Directory)
-                    })
-                    .count();
+                summary.target_id = hints.get(&index).map(|id| (*id).to_owned());
+                summary.targets += usize::from(summary.target_id.is_some());
             }
             summary.allocated = inodes[position].values().copied().sum();
             if let Some(parent) = arena.parent(index) {
@@ -803,6 +805,9 @@ impl PlanForwarder {
 impl PlanObserver for PlanForwarder {
     fn on_event(&self, event: PlanEvent) {
         self.send(match event {
+            PlanEvent::ProviderInspection { provider } => {
+                format!("inspecting system provider: {provider}…")
+            }
             PlanEvent::PhaseStarted { phase } => format!("{phase}…"),
             PlanEvent::PhaseFinished { phase, count } => format!("✓ {phase} · {count} found"),
             PlanEvent::CargoMetadata { completed, total } => {
@@ -1006,7 +1011,15 @@ fn list_children(
         if row.kind == NodeKind::Directory {
             row.summary.target_id = BUILTIN_TARGETS
                 .iter()
-                .find(|t| row.name == t.detector.directory && names.contains(t.detector.marker))
+                .find(|t| {
+                    !t.requires_gitignore
+                        && row.name == t.detector.directory
+                        && ((!t.detector.marker.is_empty() && names.contains(t.detector.marker))
+                            || t.detector
+                                .markers
+                                .iter()
+                                .any(|marker| names.contains(*marker)))
+                })
                 .map(|t| t.id.to_owned());
         }
     }

@@ -9,8 +9,8 @@ use cleanrs_core::accounting::estimate_subtree;
 use cleanrs_core::execution::command_argv;
 use cleanrs_core::fs::{Arena, NodeIndex, ScanResult, doctor};
 use cleanrs_core::providers::{
-    BUILTIN_PROVIDER_ACTION_IDS, ProviderStatus, SystemProviderHost, inspect_builtin_providers,
-    inspect_cargo_builds,
+    BUILTIN_PROVIDER_ACTION_IDS, ProviderStatus, SystemProviderHost,
+    inspect_builtin_providers_with_progress, inspect_cargo_builds,
 };
 use cleanrs_core::targets::{
     BUILTIN_TARGETS, CleanupLevel, DetectedTarget, PlannedOperation, PlannedTarget, SelectionMode,
@@ -65,6 +65,8 @@ enum Commands {
     Doctor(DoctorArgs),
     /// Detect and size cleanup targets without executing anything.
     Targets(TargetArgs),
+    /// Explain project activity, Git state, and ranked artifact recommendations.
+    Projects(TargetArgs),
     /// Plan cleanup, or execute the same reviewed plan with --apply.
     Clean(CleanArgs),
     /// Show cleanup runs and their action-level outcomes.
@@ -85,6 +87,9 @@ enum Commands {
 
 #[derive(Debug, clap::Args)]
 struct TargetArgs {
+    /// Inspect system providers only, without a folder scan or path argument.
+    #[arg(long, conflicts_with_all = ["path", "workspace_only"])]
+    system: bool,
     /// Explicit workspace scope to inspect. Defaults to the working directory.
     #[arg(default_value = ".")]
     path: PathBuf,
@@ -101,11 +106,11 @@ struct TargetArgs {
     #[arg(long, value_name = "ID")]
     exclude: Vec<String>,
 
-    /// Show at most N largest targets. Human output defaults to 25; JSON is unlimited.
+    /// Limit targets/projects to N items. Target tables default to 25; project reports and JSON are unlimited.
     #[arg(long, value_name = "N")]
     top: Option<usize>,
 
-    /// Hide targets whose reclaimable ceiling is below this size (for example 10MiB).
+    /// Minimum estimated storage size to display (for example 10MiB).
     #[arg(long, value_parser = parse_size, default_value = "0")]
     min_size: u64,
 
@@ -169,6 +174,9 @@ impl From<CleanupLevelArg> for CleanupLevel {
 
 #[derive(Debug, clap::Args)]
 struct CleanArgs {
+    /// Inspect system providers only, without a folder scan or path argument.
+    #[arg(long, conflicts_with_all = ["path", "workspace_only"])]
+    system: bool,
     /// Explicit workspace scope to inspect. Defaults to the working directory.
     #[arg(default_value = ".")]
     path: PathBuf,
@@ -377,7 +385,8 @@ fn main() -> Result<()> {
         Commands::Scan(args) => run_scan(args),
         Commands::Tui { .. } => unreachable!("TUI dispatched before terminal logging"),
         Commands::Doctor(args) => run_doctor(args),
-        Commands::Targets(args) => run_targets(args),
+        Commands::Targets(args) => run_targets(args, false),
+        Commands::Projects(args) => run_targets(args, true),
         Commands::Clean(args) => run_clean(args),
         Commands::History(args) => run_history(args),
         Commands::TrustConfig(args) => run_trust_config(args),
@@ -394,17 +403,20 @@ fn main() -> Result<()> {
 
 #[derive(Debug, Serialize)]
 struct TargetsOutput {
+    system: bool,
     scope: PathBuf,
     coverage_complete: bool,
     total_detected: usize,
     hidden: usize,
     default_limit_applied: bool,
     providers: Vec<ProviderStatus>,
+    projects: cleanrs_core::projects::ProjectInventory,
     targets: Vec<DetectedTarget>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct CleanOutput {
+    pub(crate) system: bool,
     pub(crate) scope: PathBuf,
     pub(crate) level: CleanupLevel,
     pub(crate) coverage_complete: bool,
@@ -415,12 +427,19 @@ pub(crate) struct CleanOutput {
     pub(crate) selected_provider_actions: usize,
     pub(crate) selected_unknown_actions: usize,
     pub(crate) providers: Vec<ProviderStatus>,
+    pub(crate) projects: cleanrs_core::projects::ProjectInventory,
     pub(crate) targets: Vec<PlannedTarget>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) results: Vec<AppliedActionOutput>,
 }
 
-fn run_targets(args: TargetArgs) -> Result<()> {
+fn run_targets(mut args: TargetArgs, projects_only: bool) -> Result<()> {
+    if projects_only {
+        if args.system {
+            bail!("projects requires a folder scope; use targets --system for providers");
+        }
+        args.workspace_only = true;
+    }
     if args.top == Some(0) {
         bail!("--top must be at least 1");
     }
@@ -483,7 +502,9 @@ fn run_targets(args: TargetArgs) -> Result<()> {
         &format!("targets in {}", args.path.display()),
         !args.json && stderr_is_terminal(),
     );
-    let scan = if let Some(indicator) = &progress {
+    let scan = if args.system {
+        Ok(pipeline::system_scan())
+    } else if let Some(indicator) = &progress {
         scanner.scan_with_observer(&args.path, indicator.clone())
     } else {
         scanner.scan(&args.path)
@@ -493,28 +514,50 @@ fn run_targets(args: TargetArgs) -> Result<()> {
     }
     let scan =
         scan.with_context(|| format!("failed to inspect targets in {}", args.path.display()))?;
-    let mut targets = detect_workspace_targets(&scan, &definitions, home.as_deref());
+    let mut targets = if args.system {
+        Vec::new()
+    } else {
+        detect_workspace_targets(&scan, &definitions, home.as_deref())
+    };
     targets.extend(
-        registry
-            .detect(&scan, home.as_deref(), &SystemProviderHost::default())
-            .into_iter()
-            .filter(|item| args.only.is_empty() || args.only.contains(&item.id))
-            .filter(|item| !args.exclude.contains(&item.id)),
+        (if args.system {
+            registry.detect_system(&SystemProviderHost::default())
+        } else {
+            registry.detect(&scan, home.as_deref(), &SystemProviderHost::default())
+        })
+        .into_iter()
+        .filter(|item| args.only.is_empty() || args.only.contains(&item.id))
+        .filter(|item| !args.exclude.contains(&item.id)),
     );
     let provider_ids = if args.no_builtin_targets || args.targets_only_cli {
         HashSet::new()
     } else {
         selected_provider_ids(&args.only, &args.exclude, &registry)
     };
+    let provider_progress = ScanProgressIndicator::create(
+        "system providers",
+        !args.json && stderr_is_terminal() && !args.workspace_only,
+    );
+    let inspect_progress = |provider: &str| {
+        if let Some(progress) = &provider_progress {
+            progress.message(&format!("Inspecting system provider {provider}"));
+        }
+    };
     let mut provider_inventory = if args.workspace_only || provider_ids.is_empty() {
         Default::default()
     } else {
-        inspect_builtin_providers(&SystemProviderHost::default(), &provider_ids)
+        inspect_builtin_providers_with_progress(
+            &SystemProviderHost::default(),
+            &provider_ids,
+            inspect_progress,
+        )
     };
-    if !args.no_builtin_targets
+    if !args.system
+        && !args.no_builtin_targets
         && !args.targets_only_cli
         && registry.permits("cargo.target")
         && !registry.targets.contains_key("cargo.target")
+        && !args.exclude.iter().any(|id| id == "cargo.target")
         && (args.only.is_empty() || args.only.iter().any(|id| id == "cargo.target"))
     {
         let cargo_inventory = inspect_cargo_builds(
@@ -545,8 +588,50 @@ fn run_targets(args: TargetArgs) -> Result<()> {
         targets.extend(cargo_inventory.items);
         provider_inventory.statuses.extend(cargo_inventory.statuses);
     }
+    if !args.workspace_only && !provider_ids.is_empty() {
+        let storage = cleanrs_core::system_targets::inspect(
+            &SystemProviderHost::default(),
+            &cleanrs_core::system_targets::SystemContext::from_environment(home.as_deref()),
+            &provider_ids,
+            inspect_progress,
+        );
+        provider_inventory.items.extend(storage.items);
+        provider_inventory.statuses.extend(storage.statuses);
+    }
+    if let Some(progress) = &provider_progress {
+        progress.finish();
+    }
     targets.extend(provider_inventory.items);
     targets = dedupe_inventory_paths(targets);
+    let project_progress = ScanProgressIndicator::create(
+        "project hygiene (bounded Git inspection)",
+        !args.json && stderr_is_terminal(),
+    );
+    let mut projects = if args.system {
+        cleanrs_core::projects::ProjectInventory::default()
+    } else {
+        cleanrs_core::projects::inspect_projects(
+            &scan,
+            &mut targets,
+            &registry.retention,
+            &SystemProviderHost::project_inspection(),
+            cleanrs_core::projects::InspectionLimits {
+                home: home.clone(),
+                ..Default::default()
+            },
+        )
+    };
+    if let Some(progress) = project_progress {
+        progress.finish();
+    }
+    if projects_only {
+        projects
+            .projects
+            .retain(|project| project.usage.sortable_bytes() >= args.min_size);
+        if let Some(top) = args.top {
+            projects.projects.truncate(top);
+        }
+    }
     targets.sort_by(|left, right| {
         std::cmp::Reverse(target_sort_size(left))
             .cmp(&std::cmp::Reverse(target_sort_size(right)))
@@ -561,15 +646,24 @@ fn run_targets(args: TargetArgs) -> Result<()> {
         targets.truncate(limit);
     }
     let output = TargetsOutput {
+        system: args.system,
         scope: scan.root.clone(),
         coverage_complete: scan.coverage_complete(),
         total_detected,
         hidden: total_detected.saturating_sub(targets.len()),
         default_limit_applied,
         providers: provider_inventory.statuses,
+        projects,
         targets,
     };
-    if args.json {
+    if projects_only {
+        if args.json {
+            serde_json::to_writer_pretty(io::stdout().lock(), &output.projects)?;
+            println!();
+        } else {
+            TerminalUi::detect().print_projects(&output.projects);
+        }
+    } else if args.json {
         serde_json::to_writer_pretty(io::stdout().lock(), &output)?;
         println!();
     } else {
@@ -604,7 +698,12 @@ fn run_clean(args: CleanArgs) -> Result<()> {
     );
     let plan = build_reviewed_plan(
         PlanRequest {
-            path: args.path.clone(),
+            system: args.system,
+            path: if args.system {
+                pipeline::system_scope()
+            } else {
+                args.path.clone()
+            },
             home: home.clone(),
             level: args.level.into(),
             explicitly_named_ids: args.only.clone(),
@@ -636,6 +735,7 @@ fn run_clean(args: CleanArgs) -> Result<()> {
     }
     let plan = plan?;
     let mut output = CleanOutput {
+        system: plan.system,
         scope: plan.scope.clone(),
         level: plan.level,
         coverage_complete: plan.coverage_complete,
@@ -646,6 +746,7 @@ fn run_clean(args: CleanArgs) -> Result<()> {
         selected_provider_actions: plan.selected_provider_actions,
         selected_unknown_actions: plan.selected_unknown_actions,
         providers: plan.providers.clone(),
+        projects: plan.projects.clone(),
         targets: plan.targets.clone(),
         results: Vec::new(),
     };

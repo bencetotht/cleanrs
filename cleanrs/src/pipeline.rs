@@ -18,7 +18,8 @@ use cleanrs_core::fs::{
 use cleanrs_core::journal::{Journal, JournalAction, JournalRun, default_journal_path};
 use cleanrs_core::providers::{
     BUILTIN_PROVIDER_ACTION_IDS, ProviderHost, ProviderStatus, SystemProviderHost,
-    inspect_builtin_providers, inspect_cargo_builds_with_progress,
+    inspect_builtin_providers, inspect_builtin_providers_with_progress,
+    inspect_cargo_builds_with_progress,
 };
 use cleanrs_core::targets::{
     Automation, BUILTIN_TARGETS, CandidateIdentity, CandidateKey, CleanupLevel, CommandSpec,
@@ -36,9 +37,10 @@ use std::sync::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PlanRequest {
     pub(crate) path: PathBuf,
+    pub(crate) system: bool,
     pub(crate) home: Option<PathBuf>,
     pub(crate) level: CleanupLevel,
     pub(crate) explicitly_named_ids: Vec<String>,
@@ -64,6 +66,7 @@ pub(crate) enum PlanEvent {
     PhaseStarted { phase: &'static str },
     PhaseFinished { phase: &'static str, count: usize },
     CargoMetadata { completed: usize, total: usize },
+    ProviderInspection { provider: String },
 }
 
 pub(crate) trait PlanObserver: Send + Sync {
@@ -108,12 +111,14 @@ pub(crate) trait ExecutionObserver {
 /// No action is rediscovered or widened after this value is constructed.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ReviewedPlan {
+    pub(crate) system: bool,
     #[serde(skip)]
     pub(crate) scan_finished: Option<std::time::Instant>,
     #[serde(skip)]
     pub(crate) scan_age_offset: std::time::Duration,
     pub(crate) coverage_complete: bool,
     pub(crate) providers: Vec<ProviderStatus>,
+    pub(crate) projects: cleanrs_core::projects::ProjectInventory,
     pub(crate) selected_provider_actions: usize,
     pub(crate) selected_unknown_actions: usize,
     pub(crate) run_id: String,
@@ -263,6 +268,65 @@ pub(crate) struct ReviewedAction {
     pub(crate) selection_source: SelectionSource,
     pub(crate) executable_identity: Option<ExecutableIdentity>,
     pub(crate) executable_identity_error: Option<String>,
+}
+
+/// System scope is a cache/journal identity, never a filesystem search path.
+pub(crate) fn system_scope() -> PathBuf {
+    PathBuf::from("[system]")
+}
+pub(crate) fn system_scan() -> ScanResult {
+    ScanResult {
+        root: system_scope(),
+        arena: Arena::new(system_scope()),
+        coverage_errors: vec![],
+        backend: "providers only".into(),
+        dataless_entries: 0,
+        mount_boundaries: 0,
+    }
+}
+
+/// Put independently inspected provider trees into one metadata arena. The
+/// existing union estimator then deduplicates hardlinks/clones across providers
+/// and folder scope, without summing per-file private sizes or row intervals.
+fn merge_accounting_scans(primary: Arena, scans: Vec<ScanResult>) -> Arena {
+    if scans.is_empty() {
+        return primary;
+    }
+    let mut merged = Arena::new("/");
+    let mut paths = HashMap::from([(PathBuf::from("/"), merged.root())]);
+    for source in std::iter::once(primary).chain(scans.into_iter().map(|s| s.arena)) {
+        let root_path = source.path(source.root());
+        if !root_path.is_absolute() {
+            continue;
+        }
+        let mut prefix = PathBuf::from("/");
+        let mut parent = merged.root();
+        for part in root_path
+            .components()
+            .filter(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            prefix.push(part.as_os_str());
+            parent = *paths.entry(prefix.clone()).or_insert_with(|| {
+                merged.push_child(parent, &part.as_os_str().to_string_lossy(), {
+                    let mut node = Node::default();
+                    node.kind = NodeKind::Directory;
+                    node
+                })
+            });
+        }
+        let mut pending = vec![(source.root(), parent)];
+        while let Some((from, to)) = pending.pop() {
+            merged.update_metadata(to, source.nodes[from.as_usize()].clone());
+            for child in source.children(from) {
+                let path = source.path(child);
+                let dest = *paths
+                    .entry(path)
+                    .or_insert_with(|| merged.push_child(to, source.name(child), Node::default()));
+                pending.push((child, dest));
+            }
+        }
+    }
+    merged
 }
 
 pub(crate) fn build_reviewed_plan(
@@ -440,10 +504,17 @@ fn build_plan(
         options.workers = workers;
     }
     let scanner = Scanner::new(options);
+    let detection_phase = if request.system {
+        "system configuration"
+    } else {
+        "workspace detection"
+    };
     observer.on_event(PlanEvent::PhaseStarted {
-        phase: "workspace detection",
+        phase: detection_phase,
     });
-    let scan = if let Some(scan) = cached_scan {
+    let scan = if request.system {
+        system_scan()
+    } else if let Some(scan) = cached_scan {
         scan
     } else if let Some(previous) = detection {
         scan_review_selection(
@@ -462,16 +533,23 @@ fn build_plan(
                 format!("failed to build cleanup plan in {}", request.path.display())
             })?
     };
-    let mut detected = detect_workspace_targets(&scan, &definitions, home.as_deref());
+    let mut detected = if request.system {
+        Vec::new()
+    } else {
+        detect_workspace_targets(&scan, &definitions, home.as_deref())
+    };
     detected.extend(
-        registry
-            .detect(&scan, home.as_deref(), &SystemProviderHost::default())
-            .into_iter()
-            .filter(|item| request.only.is_empty() || request.only.contains(&item.id))
-            .filter(|item| !request.exclude.contains(&item.id)),
+        (if request.system {
+            registry.detect_system(&SystemProviderHost::default())
+        } else {
+            registry.detect(&scan, home.as_deref(), &SystemProviderHost::default())
+        })
+        .into_iter()
+        .filter(|item| request.only.is_empty() || request.only.contains(&item.id))
+        .filter(|item| !request.exclude.contains(&item.id)),
     );
     observer.on_event(PlanEvent::PhaseFinished {
-        phase: "workspace detection",
+        phase: detection_phase,
         count: detected.len(),
     });
     observer.on_event(PlanEvent::PhaseStarted {
@@ -485,12 +563,37 @@ fn build_plan(
     let mut provider_inventory = if request.workspace_only || provider_ids.is_empty() {
         Default::default()
     } else {
-        inspect_builtin_providers(&SystemProviderHost::default(), &provider_ids)
+        inspect_builtin_providers_with_progress(
+            &SystemProviderHost::default(),
+            &provider_ids,
+            |provider| {
+                observer.on_event(PlanEvent::ProviderInspection {
+                    provider: provider.into(),
+                })
+            },
+        )
     };
-    if !request.no_builtin_targets
+    if !request.workspace_only && !provider_ids.is_empty() {
+        let storage = cleanrs_core::system_targets::inspect(
+            &SystemProviderHost::default(),
+            &cleanrs_core::system_targets::SystemContext::from_environment(home.as_deref()),
+            &provider_ids,
+            |provider| {
+                observer.on_event(PlanEvent::ProviderInspection {
+                    provider: provider.into(),
+                })
+            },
+        );
+        provider_inventory.items.extend(storage.items);
+        provider_inventory.statuses.extend(storage.statuses);
+        provider_inventory.scans.extend(storage.scans);
+    }
+    if !request.system
+        && !request.no_builtin_targets
         && !request.targets_only_cli
         && registry.permits("cargo.target")
         && !registry.targets.contains_key("cargo.target")
+        && !request.exclude.iter().any(|id| id == "cargo.target")
         && (request.only.is_empty() || request.only.iter().any(|id| id == "cargo.target"))
     {
         let cargo_inventory = inspect_cargo_builds_with_progress(
@@ -525,11 +628,35 @@ fn build_plan(
     let provider_count = provider_inventory.items.len();
     detected.extend(provider_inventory.items);
     detected = dedupe_inventory_paths(detected);
+    observer.on_event(PlanEvent::PhaseStarted {
+        phase: "project hygiene",
+    });
+    let projects = if request.system {
+        cleanrs_core::projects::ProjectInventory::default()
+    } else {
+        cleanrs_core::projects::inspect_projects(
+            &scan,
+            &mut detected,
+            &registry.retention,
+            &SystemProviderHost::project_inspection(),
+            cleanrs_core::projects::InspectionLimits {
+                review_only: detection.is_some(),
+                home: home.clone(),
+                ..Default::default()
+            },
+        )
+    };
+    observer.on_event(PlanEvent::PhaseFinished {
+        phase: "project hygiene",
+        count: projects.projects.len(),
+    });
     let level = request.level;
     observer.on_event(PlanEvent::PhaseFinished {
         phase: "provider inspection",
         count: provider_count,
     });
+    let coverage_complete = scan.coverage_complete();
+    let accounting_arena = merge_accounting_scans(scan.arena, provider_inventory.scans);
     let mut manual =
         resolve_manual_selections(&detected, &request.manual_selections, &request.select)?;
     if let Some(previous) = detection {
@@ -540,13 +667,13 @@ fn build_plan(
             .filter(|t| matches!(t.usage, UsageEstimate::Filesystem { .. }))
             .filter_map(|t| t.path.as_ref())
             .collect();
-        let identities: HashMap<_, _> = (0..scan.arena.nodes.len())
+        let identities: HashMap<_, _> = (0..accounting_arena.nodes.len())
             .map(NodeIndex::from_usize)
             .filter_map(|index| {
-                let path = scan.arena.path(index);
+                let path = accounting_arena.path(index);
                 paths
                     .contains(&path)
-                    .then(|| (path, node_identity(&scan.arena, index)))
+                    .then(|| (path, node_identity(&accounting_arena, index)))
             })
             .collect();
         let selectable: HashSet<_> = detected
@@ -595,9 +722,8 @@ fn build_plan(
         .iter()
         .filter(|target| matches!(target.selection, PlanSelection::Selected { .. }))
         .collect();
-    let coverage_complete = scan.coverage_complete();
     let accounting = Arc::new(SelectionAccounting::new(
-        scan.arena,
+        accounting_arena,
         coverage_complete,
         &targets,
     ));
@@ -626,10 +752,12 @@ fn build_plan(
         })
         .collect();
     let plan = ReviewedPlan {
+        system: request.system,
         scan_finished: None,
         scan_age_offset: std::time::Duration::ZERO,
         coverage_complete,
         providers: provider_inventory.statuses,
+        projects,
         selected_provider_actions: summary.provider_actions,
         selected_unknown_actions: summary.unknown_actions,
         run_id: new_run_id(),
@@ -782,6 +910,7 @@ pub(crate) fn execute_reviewed_plan(
         timestamp_unix_seconds: plan.created_unix_seconds,
         cleanrs_version: env!("CARGO_PKG_VERSION").into(),
         scope: plan.scope.clone(),
+        system: plan.system,
         level: format!("{:?}", plan.level).to_lowercase(),
         explicitly_named_ids: plan.explicitly_named_ids.clone(),
         outcome: "running".into(),
@@ -815,13 +944,22 @@ pub(crate) fn execute_reviewed_plan(
                 stderr_summary: None,
                 error: Some("stopped by user".into()),
             }
+        } else if let Err(reason) = cleanrs_core::projects::revalidate_artifact_repository(
+            &action.target,
+            &plan.scope,
+            home,
+            &SystemProviderHost::project_inspection(),
+        ) {
+            ActionResult::validation_abort(reason)
         } else {
             match &action.target.operation {
                 PlannedOperation::DirectDelete {
                     path,
                     children_only,
                     identity,
-                } => match validate_direct_preflight(path, *identity, home) {
+                } => match revalidate_provider(&action.target, home)
+                    .and_then(|()| validate_direct_preflight(path, *identity, home))
+                {
                     Ok(()) => execute_direct_delete(
                         path,
                         *children_only,
@@ -831,7 +969,30 @@ pub(crate) fn execute_reviewed_plan(
                     Err(reason) => ActionResult::validation_abort(reason),
                 },
                 PlannedOperation::Command { command } => {
-                    if let Err(reason) = revalidate_provider(&action.target) {
+                    let cargo_preflight = if action.target.path.is_some()
+                        && matches!(action.target.usage, UsageEstimate::Filesystem { .. })
+                    {
+                        action
+                            .target
+                            .path
+                            .as_deref()
+                            .ok_or_else(|| "filesystem action has no path".to_owned())
+                            .and_then(|path| {
+                                plan.accounting
+                                    .identity(&CandidateKey::from_target(&action.target))
+                                    .ok_or_else(|| {
+                                        "filesystem action identity unavailable".to_owned()
+                                    })
+                                    .and_then(|identity| {
+                                        validate_direct_preflight(path, identity, home)
+                                    })
+                            })
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(reason) =
+                        cargo_preflight.and_then(|()| revalidate_provider(&action.target, home))
+                    {
                         ActionResult::validation_abort(reason)
                     } else if let Some(error) = &action.executable_identity_error {
                         ActionResult::validation_abort(format!(
@@ -926,8 +1087,7 @@ fn validate_direct_preflight(
             return Err("cleanup target is a mount root".into());
         }
     }
-    let scan = Scanner::new(ScanOptions::default())
-        .scan(path)
+    let scan = cleanrs_core::system_targets::scan_storage_path(path)
         .map_err(|error| format!("final metadata preflight failed: {error}"))?;
     if !scan.coverage_complete() {
         return Err("final metadata preflight had incomplete coverage".into());
@@ -965,11 +1125,45 @@ fn ensure_no_symlink_ancestors(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn revalidate_provider(target: &DetectedTarget) -> Result<(), String> {
+fn revalidate_provider(target: &DetectedTarget, home: Option<&Path>) -> Result<(), String> {
     if matches!(target.provider.id.as_str(), "workspace" | "configuration") {
         return Ok(());
     }
+    if target.provider.id.starts_with("storage.") {
+        let inventory = cleanrs_core::system_targets::inspect(
+            &SystemProviderHost::default(),
+            &cleanrs_core::system_targets::SystemContext::from_environment(home),
+            &HashSet::from([target.id.clone()]),
+            |_| {},
+        );
+        let current = inventory
+            .items
+            .into_iter()
+            .find(|item| item.id == target.id && item.path == target.path)
+            .ok_or("system provider path/action is no longer available")?;
+        if current.provider != target.provider
+            || current.operation != target.operation
+            || !current.manually_selectable()
+        {
+            return Err(
+                "system provider identity, state, or exact operation changed after review".into(),
+            );
+        }
+        return Ok(());
+    }
     if target.provider.id == "cargo" {
+        let manifest = target
+            .project_root
+            .as_ref()
+            .ok_or("Cargo workspace missing")?
+            .join("Cargo.toml");
+        ensure_no_symlink_ancestors(&manifest)?;
+        let metadata = NativeFileSystem
+            .metadata(&manifest)
+            .map_err(|e| e.to_string())?;
+        if metadata.kind != NodeKind::File || metadata.flags.contains(NodeFlags::DATALESS) {
+            return Err("Cargo manifest is unsafe or dataless".into());
+        }
         let executable = target
             .provider
             .executable
@@ -987,19 +1181,39 @@ fn revalidate_provider(target: &DetectedTarget) -> Result<(), String> {
         {
             return Err("Cargo provider version changed after planning".into());
         }
+        cleanrs_core::providers::revalidate_cargo_build(target, &SystemProviderHost::default())?;
         return Ok(());
     }
     let selected = HashSet::from([target.id.clone()]);
-    let current = inspect_builtin_providers(&SystemProviderHost::default(), &selected)
+    let candidates: Vec<_> = inspect_builtin_providers(&SystemProviderHost::default(), &selected)
         .items
         .into_iter()
-        .find(|item| item.id == target.id)
-        .ok_or_else(|| "provider action is no longer available".to_owned())?;
-    if current.provider != target.provider {
-        return Err(format!(
-            "provider identity or context changed after planning (planned {:?}, current {:?})",
-            target.provider, current.provider
-        ));
+        .filter(|item| item.id == target.id)
+        .collect();
+    if candidates.is_empty() {
+        return Err("provider action is no longer available".into());
+    }
+    // Docker emits the same action ID for each local context. Revalidate the
+    // reviewed identity (including endpoint), never whichever context is first.
+    let current = candidates
+        .iter()
+        .find(|item| item.provider == target.provider)
+        .ok_or_else(|| {
+            format!(
+                "provider identity or context changed after planning (planned {:?}; no matching identity remains)",
+                target.provider
+            )
+        })?;
+    // A context can still exist while its daemon becomes unavailable. Identity
+    // equality alone must not authorize an action whose fresh inspection failed.
+    if let cleanrs_core::targets::CandidateSafety::Refused(reason) = &current.safety {
+        return Err(format!("provider inspection refused cleanup: {reason}"));
+    }
+    if matches!(current.operation, PlannedOperation::Informational) {
+        return Err("provider action no longer has a cleanup operation".into());
+    }
+    if current.operation != target.operation {
+        return Err("provider cleanup operation changed after planning".into());
     }
     Ok(())
 }
@@ -1028,6 +1242,7 @@ fn journal_action(target: &DetectedTarget, source: Option<&SelectionSource>) -> 
             UsageEstimate::Unknown { .. } => (None, None, None, None),
         };
     JournalAction {
+        evidence: target.evidence.clone(),
         target_id: target.id.clone(),
         provider_id: target.provider.id.clone(),
         path: target.path.clone(),
@@ -1199,6 +1414,7 @@ mod tests {
     fn request(scope: &Path) -> PlanRequest {
         PlanRequest {
             path: scope.into(),
+            system: false,
             home: Some(scope.into()),
             level: CleanupLevel::Safe,
             explicitly_named_ids: Vec::new(),
@@ -1413,5 +1629,111 @@ mod tests {
         assert_eq!(results[0].result.provider_reported, Some(2 * 1024 * 1024));
         assert_eq!(run.actions[0].selection_source, "manual");
         assert_eq!(run.actions[0].overridden_skip_reason, None);
+    }
+    #[test]
+    fn system_plan_ignores_nonexistent_folder_and_emits_no_workspace_phase() {
+        let fixture = tempdir().unwrap();
+        let mut request = request(&fixture.path().join("does-not-exist"));
+        request.home = Some(fixture.path().into());
+        request.system = true;
+        request.workspace_only = false;
+        let observer = Arc::new(RecordingPlanObserver::default());
+        let plan = build_reviewed_plan(request, observer.clone()).unwrap();
+        assert!(plan.system);
+        assert_eq!(plan.scope, system_scope());
+        assert!(plan.targets.is_empty());
+        assert!(
+            observer
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| !event.contains("workspace detection"))
+        );
+    }
+
+    #[test]
+    fn provider_scan_merge_preserves_links_and_deduplicates_overlapping_roots() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path();
+        fs::create_dir(root.join("a")).unwrap();
+        fs::create_dir(root.join("b")).unwrap();
+        fs::write(root.join("a/payload"), vec![0; 8192]).unwrap();
+        fs::hard_link(root.join("a/payload"), root.join("b/payload")).unwrap();
+        let scans = ["a", "b", "a"].map(|relative| {
+            Scanner::new(Default::default())
+                .scan(&root.join(relative))
+                .unwrap()
+        });
+        let merged = merge_accounting_scans(system_scan().arena, scans.into());
+        let roots: Vec<_> = (0..merged.nodes.len())
+            .map(NodeIndex::from_usize)
+            .filter(|index| [root.join("a"), root.join("b")].contains(&merged.path(*index)))
+            .collect();
+        assert_eq!(roots.len(), 2);
+        let estimate = estimate_subtrees(&merged, &roots, true);
+        let full = Scanner::new(Default::default()).scan(root).unwrap();
+        assert_eq!(
+            estimate,
+            estimate_subtrees(&full.arena, &[full.arena.root()], true)
+        );
+        assert_eq!(
+            merged
+                .nodes
+                .iter()
+                .filter(|node| node.kind == NodeKind::File)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn selected_generic_build_review_retains_ignore_proof_and_refuses_admin_symlinks() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().join("project");
+        fs::create_dir_all(root.join("build")).unwrap();
+        fs::write(root.join("build/payload"), b"generated").unwrap();
+        fs::write(root.join(".gitignore"), "build/\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut request = request(&root);
+        request.home = Some(fixture.path().join("home"));
+        request.only = vec!["project.build".into()];
+        let previous =
+            build_reviewed_plan(request.clone(), Arc::new(RecordingPlanObserver::default()))
+                .unwrap();
+        assert_eq!(previous.targets.len(), 1);
+        request
+            .manual_selections
+            .insert(previous.targets[0].candidate_key.clone());
+        request.selection_mode = SelectionMode::ManualOnly;
+        let reviewed = build_tui_reviewed_plan(
+            request.clone(),
+            Arc::new(RecordingPlanObserver::default()),
+            &previous,
+        )
+        .unwrap();
+        assert_eq!(reviewed.actions.len(), 1);
+        assert!(reviewed.actions[0].target.gitignore.is_some());
+        #[cfg(unix)]
+        {
+            let config = root.join(".git/config");
+            let outside = fixture.path().join("untrusted-config");
+            fs::rename(&config, &outside).unwrap();
+            std::os::unix::fs::symlink(&outside, &config).unwrap();
+            let reviewed = build_tui_reviewed_plan(
+                request,
+                Arc::new(RecordingPlanObserver::default()),
+                &previous,
+            )
+            .unwrap();
+            assert!(reviewed.actions.is_empty());
+        }
     }
 }

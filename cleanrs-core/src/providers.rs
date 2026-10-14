@@ -23,6 +23,59 @@ use crate::targets::{
     cargo_activity_age_days, subtree_sizes, validate_scanned_candidate,
 };
 
+/// Confirm that Cargo still resolves the same workspace-local build directory.
+/// A config/environment change may otherwise redirect a previously reviewed clean.
+pub fn revalidate_cargo_build(
+    target: &DetectedTarget,
+    host: &dyn ProviderHost,
+) -> Result<(), String> {
+    let ownership = target
+        .cargo_ownership
+        .as_ref()
+        .ok_or("Cargo ownership evidence missing")?;
+    let root = target
+        .project_root
+        .as_ref()
+        .ok_or("Cargo workspace missing")?;
+    if !ownership.complete
+        || ownership.observed_owners != [root.clone()]
+        || ownership.target_directory != root.join("target")
+    {
+        return Err("Cargo shared/custom ownership cannot authorize execution".into());
+    }
+    let executable = target
+        .provider
+        .executable
+        .clone()
+        .ok_or("Cargo executable missing")?;
+    let command = CommandSpec {
+        executable,
+        args: vec![
+            "metadata".into(),
+            "--no-deps".into(),
+            "--format-version".into(),
+            "1".into(),
+            "--frozen".into(),
+            "--manifest-path".into(),
+            root.join("Cargo.toml").display().to_string(),
+        ],
+        environment: BTreeMap::new(),
+    };
+    let output = host.run_inspection(&command).map_err(|e| e.to_string())?;
+    if output.exit_code != Some(0) {
+        return Err("Cargo metadata unavailable during revalidation".into());
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&output.stdout).map_err(|e| e.to_string())?;
+    if value["workspace_root"].as_str().map(Path::new) != Some(root.as_path())
+        || value["target_directory"].as_str().map(Path::new)
+            != Some(ownership.target_directory.as_path())
+    {
+        return Err("Cargo workspace or target directory changed after review".into());
+    }
+    Ok(())
+}
+
 /// Stable IDs exposed by the built-in Homebrew provider.
 pub const HOMEBREW_ACTION_IDS: &[&str] = &[
     "homebrew.cleanup",
@@ -32,6 +85,26 @@ pub const HOMEBREW_ACTION_IDS: &[&str] = &[
 
 /// Every built-in provider action ID accepted by `--only` and `--exclude`.
 pub const BUILTIN_PROVIDER_ACTION_IDS: &[&str] = &[
+    "gradle.caches",
+    "gradle.wrapper",
+    "gradle.daemon-logs",
+    "android.system-images",
+    "android.build-tools",
+    "android.avds",
+    "metro.cache",
+    "expo.global-cache",
+    "watchman.watches",
+    "go.build-cache",
+    "go.module-cache",
+    "maven.repository",
+    "playwright.browsers",
+    "puppeteer.browsers",
+    "node-gyp.headers",
+    "swiftpm.repositories",
+    "typescript.cache",
+    "vmware.bundles",
+    "claude.cowork",
+    "wallpaper.cache",
     "homebrew.cleanup",
     "homebrew.cleanup.scrub",
     "homebrew.autoremove",
@@ -77,6 +150,8 @@ pub struct ProviderStatus {
 /// Combined provider findings and detection diagnostics.
 #[derive(Debug, Default, Serialize)]
 pub struct ProviderInventory {
+    #[serde(skip)]
+    pub scans: Vec<ScanResult>,
     pub items: Vec<DetectedTarget>,
     pub statuses: Vec<ProviderStatus>,
 }
@@ -122,6 +197,7 @@ pub trait ProviderHost {
 #[derive(Debug, Clone)]
 pub struct SystemProviderHost {
     timeout: Duration,
+    poll_interval: Duration,
     max_output_bytes: usize,
 }
 
@@ -129,6 +205,18 @@ impl Default for SystemProviderHost {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_millis(10),
+            max_output_bytes: 4 * 1024 * 1024,
+        }
+    }
+}
+
+impl SystemProviderHost {
+    /// Short bounded commands for bulk project inspection.
+    pub fn project_inspection() -> Self {
+        Self {
+            timeout: Duration::from_secs(2),
+            poll_interval: Duration::from_millis(2),
             max_output_bytes: 4 * 1024 * 1024,
         }
     }
@@ -140,7 +228,12 @@ impl ProviderHost for SystemProviderHost {
     }
 
     fn run_inspection(&self, command: &CommandSpec) -> Result<CommandOutput, ProviderError> {
-        run_bounded(command, self.timeout, self.max_output_bytes)
+        run_bounded(
+            command,
+            self.timeout,
+            self.max_output_bytes,
+            self.poll_interval,
+        )
     }
 }
 
@@ -165,6 +258,14 @@ pub trait Provider {
 pub fn inspect_builtin_providers(
     host: &dyn ProviderHost,
     selected_ids: &HashSet<String>,
+) -> ProviderInventory {
+    inspect_builtin_providers_with_progress(host, selected_ids, |_| {})
+}
+
+pub fn inspect_builtin_providers_with_progress(
+    host: &dyn ProviderHost,
+    selected_ids: &HashSet<String>,
+    mut progress: impl FnMut(&str),
 ) -> ProviderInventory {
     let providers: Vec<&dyn Provider> = vec![
         &HomebrewProvider,
@@ -193,6 +294,7 @@ pub fn inspect_builtin_providers(
         {
             continue;
         }
+        progress(provider.id());
         match provider.detect(host) {
             Ok(None) => inventory.statuses.push(ProviderStatus {
                 id: provider.id().into(),
@@ -276,6 +378,10 @@ pub fn inspect_cargo_builds_with_progress(
     let mut manifests: Vec<_> = (0..scan.arena.nodes.len())
         .map(NodeIndex::from_usize)
         .filter(|index| scan.arena.name(*index) == "Cargo.toml")
+        .filter(|index| scan.arena.nodes[index.as_usize()].kind == NodeKind::File)
+        .filter(|index| {
+            validate_scanned_candidate(&scan.arena, *index, home) == CandidateSafety::Eligible
+        })
         .map(|index| (index, scan.arena.path(index)))
         .filter(|(_, path)| {
             !path.components().any(|component| {
@@ -329,7 +435,15 @@ pub fn inspect_cargo_builds_with_progress(
         };
         groups
             .entry(target_dir)
-            .and_modify(|(_, _, owners)| {
+            .and_modify(|(first_root, newest_manifest, owners)| {
+                if workspace_root < *first_root {
+                    *first_root = workspace_root.clone();
+                }
+                if scan.arena.nodes[manifest_index.as_usize()].modified_unix_seconds
+                    > scan.arena.nodes[newest_manifest.as_usize()].modified_unix_seconds
+                {
+                    *newest_manifest = manifest_index;
+                }
                 if !owners.contains(&workspace_root) {
                     owners.push(workspace_root.clone());
                 }
@@ -339,7 +453,8 @@ pub fn inspect_cargo_builds_with_progress(
 
     progress(total, total);
 
-    for (target_dir, (workspace_root, manifest_index, owners)) in groups {
+    for (target_dir, (workspace_root, manifest_index, mut owners)) in groups {
+        owners.sort();
         let target_index = (0..scan.arena.nodes.len())
             .map(NodeIndex::from_usize)
             .find(|index| scan.arena.path(*index) == target_dir);
@@ -380,6 +495,12 @@ pub fn inspect_cargo_builds_with_progress(
         let mut properties = TargetClass::Cheap.properties();
         properties.rebuild_cost = Some(RebuildCost::High);
         inventory.items.push(DetectedTarget {
+            gitignore: None,
+            cargo_ownership: Some(crate::targets::CargoOwnership {
+                target_directory: target_dir.clone(),
+                observed_owners: owners.clone(),
+                complete: local_default && owners.len() == 1 && scan.coverage_complete(),
+            }),
             id: "cargo.target".into(),
             provider: identity.clone(),
             description: "Rust workspace build output".into(),
@@ -1603,6 +1724,8 @@ fn provider_item(
     evidence: Vec<String>,
 ) -> DetectedTarget {
     DetectedTarget {
+        cargo_ownership: None,
+        gitignore: None,
         id: id.into(),
         provider: identity.clone(),
         description: description.into(),
@@ -1777,8 +1900,18 @@ fn run_bounded(
     specification: &CommandSpec,
     timeout: Duration,
     max_output_bytes: usize,
+    poll_interval: Duration,
 ) -> Result<CommandOutput, ProviderError> {
     let mut command = Command::new(&specification.executable);
+    if specification.environment.contains_key("GIT_NO_LAZY_FETCH") {
+        // Ambient Git variables must not redirect inspection to another repo,
+        // inject config, or cause writes through an alternate index.
+        for (name, _) in env::vars_os() {
+            if name.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(name);
+            }
+        }
+    }
     command
         .args(&specification.args)
         .envs(&specification.environment)
@@ -1803,7 +1936,7 @@ fn run_bounded(
                 timeout.as_secs()
             )));
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(poll_interval);
     };
     let stdout = stdout_reader
         .join()
@@ -1958,6 +2091,128 @@ mod tests {
             .find(|action| action.id == "docker.volumes")
             .unwrap();
         assert_eq!(volumes.class, TargetClass::Irreplaceable);
+    }
+
+    struct SharedCargoFixtureHost {
+        target: PathBuf,
+    }
+    impl ProviderHost for SharedCargoFixtureHost {
+        fn resolve_executable(&self, name: &str) -> Result<Option<PathBuf>, ProviderError> {
+            Ok((name == "cargo").then(|| PathBuf::from("/fixture/cargo")))
+        }
+        fn run_inspection(&self, command: &CommandSpec) -> Result<CommandOutput, ProviderError> {
+            let stdout = if command.args == ["--version"] {
+                "cargo fixture".into()
+            } else {
+                let manifest = Path::new(command.args.last().unwrap());
+                serde_json::json!({"workspace_root": manifest.parent().unwrap(), "target_directory": self.target}).to_string()
+            };
+            Ok(CommandOutput {
+                exit_code: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        }
+    }
+    #[test]
+    fn shared_cargo_ownership_is_structured_counted_once_and_cannot_disrupt_active_owner() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        for name in ["a", "b"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join("Cargo.toml"), "fixture").unwrap();
+        }
+        let target = root.join("a/target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("output"), "fixture").unwrap();
+        let mut scan = crate::Scanner::new(Default::default()).scan(&root).unwrap();
+        for node in &mut scan.arena.nodes {
+            node.modified_unix_seconds = 1;
+        }
+        let active_manifest = (0..scan.arena.nodes.len())
+            .map(NodeIndex::from_usize)
+            .find(|i| scan.arena.path(*i) == root.join("b/Cargo.toml"))
+            .unwrap();
+        scan.arena.nodes[active_manifest.as_usize()].modified_unix_seconds = now_seconds() as i64;
+        let host = SharedCargoFixtureHost {
+            target: target.clone(),
+        };
+        let mut inventory = inspect_cargo_builds(&scan, &host, None, 14);
+        assert_eq!(inventory.items.len(), 1);
+        let ownership = inventory.items[0].cargo_ownership.as_ref().unwrap();
+        assert_eq!(ownership.observed_owners, [root.join("a"), root.join("b")]);
+        assert!(!ownership.complete);
+        assert_eq!(
+            inventory.items[0].stale,
+            Some(false),
+            "the newest owner manifest must count"
+        );
+        let projects = crate::projects::inspect_projects(
+            &scan,
+            &mut inventory.items,
+            &[],
+            &host,
+            Default::default(),
+        );
+        assert!(!inventory.items[0].manually_selectable());
+        assert_eq!(
+            projects
+                .projects
+                .iter()
+                .map(|p| p.artifacts.len())
+                .sum::<usize>(),
+            1
+        );
+        assert!(
+            projects
+                .projects
+                .iter()
+                .any(|p| p.root == root.join("b") && p.shared_artifacts == [target.clone()])
+        );
+        assert!(revalidate_cargo_build(&inventory.items[0], &host).is_err());
+    }
+
+    #[test]
+    fn cargo_revalidation_refuses_changed_target_resolution() {
+        let root = PathBuf::from("/fixture/workspace");
+        let mut arena = Arena::new(&root);
+        arena.push_child(
+            arena.root(),
+            "Cargo.toml",
+            Node {
+                kind: NodeKind::File,
+                modified_unix_seconds: 1,
+                ..Default::default()
+            },
+        );
+        arena.push_child(
+            arena.root(),
+            "target",
+            Node {
+                kind: NodeKind::Directory,
+                modified_unix_seconds: 1,
+                ..Default::default()
+            },
+        );
+        let scan = ScanResult {
+            root: root.clone(),
+            arena,
+            coverage_errors: vec![],
+            backend: "fixture".into(),
+            dataless_entries: 0,
+            mount_boundaries: 0,
+        };
+        let host = CargoFixtureHost {
+            root: root.clone(),
+            target: root.join("target"),
+        };
+        let inventory = inspect_cargo_builds(&scan, &host, None, 14);
+        assert!(revalidate_cargo_build(&inventory.items[0], &host).is_ok());
+        let changed = CargoFixtureHost {
+            root: root.clone(),
+            target: root.join("custom-target"),
+        };
+        assert!(revalidate_cargo_build(&inventory.items[0], &changed).is_err());
     }
 
     struct CargoFixtureHost {

@@ -16,6 +16,12 @@ use ratatui::{
 };
 use std::time::Duration;
 
+/// All busy views advance from the event-loop tick, even while workers are quiet.
+pub fn spinner(tick: usize) -> &'static str {
+    const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    FRAMES[tick % FRAMES.len()]
+}
+
 pub fn stale(age: Duration) -> bool {
     age > Duration::from_secs(600)
 }

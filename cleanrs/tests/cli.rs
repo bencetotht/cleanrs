@@ -5,6 +5,33 @@ use std::process::Command;
 
 use tempfile::tempdir;
 
+// Resolve fixture tools before tests narrow PATH to stub provider directories.
+// macOS uses /usr/bin and /bin; NixOS deliberately does not provide those paths.
+fn test_tool(name: &str) -> String {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("fixture tool {name} missing from PATH"))
+        .display()
+        .to_string()
+}
+
+fn rewrite_fixture_tools(path: &std::path::Path) {
+    let mut text = fs::read_to_string(path).unwrap();
+    for tool in ["rmdir", "touch", "false", "rm", "mv", "mkdir"] {
+        for prefix in ["/usr/bin/", "/bin/"] {
+            text = text.replace(
+                &format!("{prefix}{tool}"),
+                &format!("__CLEANRS_FIXTURE_{tool}__"),
+            );
+        }
+    }
+    for tool in ["rmdir", "touch", "false", "rm", "mv", "mkdir"] {
+        text = text.replace(&format!("__CLEANRS_FIXTURE_{tool}__"), &test_tool(tool));
+    }
+    fs::write(path, text).unwrap();
+}
+
 #[test]
 fn scan_json_is_machine_readable_and_defaults_to_allocated() {
     let fixture = tempdir().unwrap();
@@ -517,6 +544,7 @@ esac
     .unwrap();
     let mut permissions = fs::metadata(&cargo).unwrap().permissions();
     permissions.set_mode(0o755);
+    rewrite_fixture_tools(&cargo);
     fs::set_permissions(&cargo, permissions).unwrap();
     bin
 }
@@ -553,6 +581,7 @@ fi
     .unwrap();
     let mut permissions = fs::metadata(&brew).unwrap().permissions();
     permissions.set_mode(0o755);
+    rewrite_fixture_tools(&brew);
     fs::set_permissions(&brew, permissions).unwrap();
     bin
 }
@@ -678,6 +707,7 @@ fi
         ),
     )
     .unwrap();
+    rewrite_fixture_tools(&brew);
     fs::set_permissions(&brew, fs::Permissions::from_mode(0o755)).unwrap();
     let state = fixture.path().join("state");
     let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
@@ -748,6 +778,7 @@ fi
         ),
     )
     .unwrap();
+    rewrite_fixture_tools(&brew);
     fs::set_permissions(&brew, fs::Permissions::from_mode(0o755)).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
         .args([
@@ -776,6 +807,124 @@ fi
             .unwrap()
             .contains("identity or context changed")
     );
+}
+
+// Each run uses a stub Docker executable and an explicit temporary root. The
+// first context is deliberately unavailable: it must not substitute for the
+// reviewed OrbStack context, and no real Docker daemon is contacted.
+#[test]
+#[cfg(unix)]
+fn docker_cleanup_revalidates_the_reviewed_context_and_live_inspection() {
+    for action in ["docker.images", "docker.build-cache"] {
+        for mode in [
+            "stable",
+            "reordered",
+            "endpoint-changed",
+            "missing",
+            "unavailable",
+            "version-changed",
+        ] {
+            let fixture = tempdir().unwrap();
+            let bin = fixture.path().join("bin");
+            fs::create_dir(&bin).unwrap();
+            let docker = bin.join("docker");
+            let script = r#"#!/bin/sh
+count=0
+if [ -f "$HOME/context-count" ]; then read count < "$HOME/context-count"; fi
+if [ "$1" = "version" ]; then
+  if [ "$FIXTURE_MODE" = "version-changed" ] && [ "$count" -gt 0 ]; then
+    echo '30.0.0'
+  else
+    echo '29.4.0'
+  fi
+elif [ "$1" = "context" ] && [ "$2" = "ls" ]; then
+  count=$((count + 1))
+  echo "$count" > "$HOME/context-count"
+  default='{"Name":"default","DockerEndpoint":"unix:///fixture/default.sock"}'
+  orb='{"Name":"orbstack","DockerEndpoint":"unix:///fixture/orbstack.sock"}'
+  if [ "$count" -gt 1 ] && [ "$FIXTURE_MODE" = "endpoint-changed" ]; then
+    orb='{"Name":"orbstack","DockerEndpoint":"unix:///fixture/replaced.sock"}'
+  fi
+  if [ "$count" -gt 1 ] && [ "$FIXTURE_MODE" = "reordered" ]; then
+    echo "$orb"
+    echo "$default"
+  else
+    echo "$default"
+    if [ "$count" -eq 1 ] || [ "$FIXTURE_MODE" != "missing" ]; then echo "$orb"; fi
+  fi
+elif [ "$1" = "--context" ] && [ "$3" = "system" ]; then
+  if [ "$2" = "default" ]; then echo 'default daemon unavailable' >&2; exit 1; fi
+  if [ "$count" -gt 1 ] && [ "$FIXTURE_MODE" = "unavailable" ]; then
+    echo 'reviewed daemon unavailable' >&2
+    exit 1
+  fi
+  echo '{"Type":"Images","Reclaimable":"12MB (100%)"}'
+  echo '{"Type":"Build Cache","Reclaimable":"8MB (100%)"}'
+elif [ "$1" = "--context" ] && [ "$2" = "orbstack" ]; then
+  echo "$*" >> "$HOME/applied-argv"
+  echo 'Total reclaimed space: 1MB'
+else
+  exit 2
+fi
+"#;
+            fs::write(&docker, script).unwrap();
+            fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+                .args([
+                    "clean",
+                    fixture.path().to_str().unwrap(),
+                    "--only",
+                    action,
+                    "--level",
+                    "aggressive",
+                    "--apply",
+                    "--yes",
+                    "--json",
+                ])
+                .env("PATH", &bin)
+                .env("HOME", fixture.path())
+                .env("XDG_STATE_HOME", fixture.path().join("state"))
+                .env("FIXTURE_MODE", mode)
+                .output()
+                .unwrap();
+            let json: serde_json::Value =
+                serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+                    panic!(
+                        "{action}/{mode}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                });
+            assert_eq!(
+                json["results"].as_array().unwrap().len(),
+                1,
+                "{action}/{mode}: {json}"
+            );
+            let applied = fixture.path().join("applied-argv");
+            if matches!(mode, "stable" | "reordered") {
+                assert!(output.status.success(), "{action}/{mode}: {json}");
+                assert_eq!(json["results"][0]["result"]["status"], "success");
+                let expected = if action == "docker.images" {
+                    "--context orbstack image prune --all --force --filter until=336h\n"
+                } else {
+                    "--context orbstack builder prune --force --filter until=336h\n"
+                };
+                assert_eq!(fs::read_to_string(applied).unwrap(), expected);
+            } else {
+                assert!(!output.status.success(), "{action}/{mode}");
+                assert_eq!(json["results"][0]["result"]["status"], "validation_abort");
+                assert!(
+                    !applied.exists(),
+                    "{action}/{mode}: cleanup must not execute"
+                );
+                let error = json["results"][0]["result"]["error"].as_str().unwrap();
+                if mode == "unavailable" {
+                    assert!(error.contains("reviewed daemon unavailable"), "{error}");
+                } else {
+                    assert!(error.contains("identity or context changed"), "{error}");
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -1047,11 +1196,8 @@ reclaim = { method = "run", argv = ["printf", "never executed"] }
 fn cli_command_target_preserves_json_argv_without_executing_it() {
     let fixture = tempdir().unwrap();
     let marker = fixture.path().join("must-not-exist");
-    let argv = serde_json::to_string(&vec![
-        "/usr/bin/touch".to_string(),
-        marker.display().to_string(),
-    ])
-    .unwrap();
+    let argv =
+        serde_json::to_string(&vec![test_tool("touch"), marker.display().to_string()]).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
         .args([
             "targets",
@@ -1191,11 +1337,8 @@ fn ad_hoc_argv_executes_without_a_shell_and_appears_in_history() {
     let fixture = tempdir().unwrap();
     let marker = fixture.path().join("command-ran");
     let state = fixture.path().join("state");
-    let argv = serde_json::to_string(&vec![
-        "/usr/bin/touch".to_string(),
-        marker.display().to_string(),
-    ])
-    .unwrap();
+    let argv =
+        serde_json::to_string(&vec![test_tool("touch"), marker.display().to_string()]).unwrap();
     let apply = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
         .args([
             "clean",
@@ -1232,7 +1375,7 @@ fn ad_hoc_argv_executes_without_a_shell_and_appears_in_history() {
         "snapshots must collapse by run ID"
     );
     assert_eq!(json[0]["actions"][0]["status"], "success");
-    assert_eq!(json[0]["actions"][0]["argv"][0], "/usr/bin/touch");
+    assert_eq!(json[0]["actions"][0]["argv"][0], test_tool("touch"));
 }
 
 #[test]
@@ -1240,12 +1383,9 @@ fn partial_command_failure_continues_and_is_journalled() {
     let fixture = tempdir().unwrap();
     let marker = fixture.path().join("second-command-ran");
     let state = fixture.path().join("state");
-    let failing = serde_json::to_string(&vec!["/usr/bin/false"]).unwrap();
-    let succeeding = serde_json::to_string(&vec![
-        "/usr/bin/touch".to_string(),
-        marker.display().to_string(),
-    ])
-    .unwrap();
+    let failing = serde_json::to_string(&vec![test_tool("false")]).unwrap();
+    let succeeding =
+        serde_json::to_string(&vec![test_tool("touch"), marker.display().to_string()]).unwrap();
     let apply = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
         .args([
             "clean",
@@ -1299,6 +1439,7 @@ fn filesystem_replacement_abort_is_partial_and_journalled() {
         ),
     )
     .unwrap();
+    rewrite_fixture_tools(&replacer);
     fs::set_permissions(&replacer, fs::Permissions::from_mode(0o755)).unwrap();
     let config = scope.join("targets.toml");
     fs::write(
@@ -1405,6 +1546,7 @@ reclaim = {{ method = "run", argv = ["/usr/bin/touch", {:?}] }}
         ),
     )
     .unwrap();
+    rewrite_fixture_tools(&config);
     let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
         .args([
             "clean",
@@ -1673,4 +1815,252 @@ fn tui_rejects_non_tty_before_touching_terminal_modes() {
         output.stdout.is_empty(),
         "must not enter the alternate screen"
     );
+}
+
+#[test]
+fn projects_reports_artifacts_and_evidence_without_executing_or_loading_cwd_policy() {
+    let fixture = tempdir().unwrap();
+    let project = fixture.path().join("project");
+    fs::create_dir_all(project.join(".next")).unwrap();
+    fs::create_dir(project.join(".venv")).unwrap();
+    fs::write(project.join(".venv/pyvenv.cfg"), "home = /fixture/python").unwrap();
+    fs::write(project.join("package.json"), "{}").unwrap();
+    fs::write(project.join("pyproject.toml"), "[project]").unwrap();
+    fs::write(project.join(".next/output"), "generated").unwrap();
+    fs::write(
+        project.join("targets.toml"),
+        "this is invalid and must never load",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args(["projects", ".", "--json"])
+        .current_dir(&project)
+        .env("HOME", fixture.path().join("home"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["projects"].as_array().unwrap().len(), 1);
+    let artifacts = json["projects"][0]["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 2);
+    assert!(
+        artifacts
+            .iter()
+            .all(|a| a["target"]["usage"]["reclaimable"]["confidence"].is_string())
+    );
+    assert!(
+        artifacts
+            .iter()
+            .any(|a| a["ecosystem"] == "python" && a["recommended"] == false)
+    );
+    assert!(project.join(".next/output").exists());
+    let human = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args(["projects", project.to_str().unwrap()])
+        .env("HOME", fixture.path().join("home"))
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        human.contains("ACTIVITY")
+            && human.contains("ATTRIBUTED")
+            && human.contains("consequence:")
+    );
+    assert!(!human.contains('\u{1b}'));
+}
+
+#[test]
+fn project_retention_is_shared_by_targets_and_clean_and_keep_survives_ignore_staleness() {
+    let fixture = tempdir().unwrap();
+    let project = fixture.path().join("project");
+    fs::create_dir_all(project.join(".next")).unwrap();
+    fs::write(project.join("package.json"), "{}").unwrap();
+    fs::write(project.join(".next/output"), "generated").unwrap();
+    let config = fixture.path().join("policy.toml");
+    fs::write(
+        &config,
+        format!(
+            "[[retention]]\npath = {:?}\nartifact_days = 0\ndormant_days = 180\nkeep = true\n",
+            project.display().to_string()
+        ),
+    )
+    .unwrap();
+    let command = |subcommand: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cleanrs"));
+        cmd.arg(subcommand)
+            .arg(&project)
+            .arg("--workspace-only")
+            .arg("--config")
+            .arg(&config)
+            .arg("--json")
+            .env("HOME", fixture.path().join("home"));
+        cmd
+    };
+    let targets = command("targets").output().unwrap();
+    assert!(
+        targets.status.success(),
+        "{}",
+        String::from_utf8_lossy(&targets.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&targets.stdout).unwrap();
+    assert_eq!(json["projects"]["projects"][0]["protected"], true);
+    assert_eq!(json["targets"][0]["stale_after_days"], 0);
+    let clean = command("clean")
+        .arg("--ignore-staleness")
+        .arg("--level")
+        .arg("aggressive")
+        .output()
+        .unwrap();
+    assert!(clean.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    assert_eq!(json["selected_targets"], 0);
+    let manual = command("clean")
+        .arg("--select")
+        .arg(project.join(".next"))
+        .output()
+        .unwrap();
+    assert!(manual.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&manual.stdout).unwrap();
+    assert_eq!(json["selected_targets"], 1);
+    assert_eq!(json["targets"][0]["selection"]["source"]["kind"], "manual");
+    assert!(project.join(".next/output").exists());
+}
+
+#[test]
+fn retention_rejects_relative_paths_parent_traversal_and_unknown_fields() {
+    let fixture = tempdir().unwrap();
+    let config = fixture.path().join("policy.toml");
+    for text in [
+        "[[retention]]\npath = 'relative'\nartifact_days = 14\n",
+        "[[retention]]\npath = '/tmp/../'\nartifact_days = 14\n",
+        "[[retention]]\npath = '/tmp'\nartifact_days = 14\nunknown = true\n",
+    ] {
+        fs::write(&config, text).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+            .arg("projects")
+            .arg(fixture.path())
+            .arg("--config")
+            .arg(&config)
+            .arg("--json")
+            .env("HOME", fixture.path().join("home"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted invalid policy: {text}");
+    }
+}
+
+#[test]
+fn system_scope_skips_workspace_targets_and_rejects_paths_or_workspace_only() {
+    let fixture = tempdir().unwrap();
+    let home = fixture.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(fixture.path().join("package.json"), "{}").unwrap();
+    fs::create_dir(fixture.path().join("node_modules")).unwrap();
+    for subcommand in ["targets", "clean"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+            .args([subcommand, "--system", "--only", "node.modules", "--json"])
+            .current_dir(fixture.path())
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["system"], true);
+        assert_eq!(json["scope"], "[system]");
+        assert!(json["targets"].as_array().unwrap().is_empty());
+        assert!(output.stderr.is_empty());
+        for conflict in [".", "--workspace-only"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+                .args([subcommand, "--system", conflict])
+                .current_dir(fixture.path())
+                .env("HOME", &home)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn system_go_action_applies_only_to_its_sandbox_and_journals_system_scope() {
+    let fixture = tempdir().unwrap();
+    let home = fixture.path().join("home");
+    let bin = fixture.path().join("bin");
+    let cache = home.join("go-build");
+    fs::create_dir_all(&cache).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(cache.join("payload"), b"cache").unwrap();
+    fs::write(home.join("preserved"), b"user data").unwrap();
+    let go = bin.join("go");
+    fs::write(
+        &go,
+        format!(
+            r#"#!/bin/sh
+case "$1" in
+  env) printf '%s\n' '{{"GOCACHE":"{}","GOMODCACHE":"{}"}}' ;;
+  version) printf '%s\n' 'go version fixture' ;;
+  clean)
+    test "$2" = '-cache' || exit 1
+    test "$GOCACHE" = '{}' || exit 1
+    test "$GOTOOLCHAIN" = 'local' || exit 1
+    /bin/rm -f "$GOCACHE/payload" ;;
+  *) exit 1 ;;
+esac
+"#,
+            cache.display(),
+            home.join("go-modules").display(),
+            cache.display()
+        ),
+    )
+    .unwrap();
+    rewrite_fixture_tools(&go);
+    fs::set_permissions(&go, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args([
+            "clean",
+            "--system",
+            "--only",
+            "go.build-cache",
+            "--apply",
+            "--yes",
+            "--json",
+        ])
+        .current_dir(fixture.path())
+        .env("HOME", &home)
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!cache.join("payload").exists());
+    assert!(home.join("preserved").exists());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["system"], true);
+    assert_eq!(json["selected_targets"], 1);
+    let history = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args(["history", "--json"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(history.status.success());
+    let history: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
+    let runs = history.as_array().unwrap();
+    assert_eq!(runs[0]["system"], true);
+    assert_eq!(runs[0]["scope"], "[system]");
+    assert_eq!(runs[0]["actions"][0]["target_id"], "go.build-cache");
 }

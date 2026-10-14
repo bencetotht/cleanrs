@@ -51,7 +51,7 @@ pub enum Action {
     Invert,
     ClearSelection,
     Preset(CleanupLevel),
-    Machine,
+    SystemTargets,
     Review,
     Confirm,
     Cancel,
@@ -128,7 +128,7 @@ impl Directory {
 /// using every tick as an explicit manual choice. Cached facts cannot execute.
 pub struct Targets {
     pub level: CleanupLevel,
-    pub machine: bool,
+    pub system: bool,
     pub baseline: Option<Arc<ReviewedPlan>>,
     pub selected: HashSet<CandidateKey>,
     pub summary: Option<SelectionSummary>,
@@ -154,7 +154,7 @@ impl Default for Targets {
     fn default() -> Self {
         Self {
             level: CleanupLevel::Safe,
-            machine: false,
+            system: false,
             baseline: None,
             selected: HashSet::new(),
             summary: None,
@@ -209,7 +209,13 @@ const CACHE_PATHS: usize = 4_096;
 const CACHE_LISTINGS: usize = 32;
 const CACHE_TARGET_SCOPES: usize = 8;
 
+struct TargetReturn {
+    scope: Option<PathBuf>,
+    run: Option<Run>,
+}
+
 pub struct App {
+    target_returns: Vec<TargetReturn>,
     pub current: PathBuf,
     pub home: Option<PathBuf>,
     pub target_scope: Option<PathBuf>,
@@ -243,6 +249,7 @@ impl App {
         let mut app = Self {
             current: root,
             home: None,
+            target_returns: Vec::new(),
             target_scope: None,
             targets_cache: HashMap::new(),
             reviewed: None,
@@ -401,6 +408,15 @@ impl App {
         }
         if action == Action::Quit && self.screen() != Screen::Run {
             self.confirm_quit = true;
+            return;
+        }
+        if action == Action::SystemTargets
+            && matches!(
+                self.screen(),
+                Screen::Browser | Screen::Targets | Screen::Results
+            )
+        {
+            self.open_system_targets();
             return;
         }
         if action == Action::Help {
@@ -934,6 +950,10 @@ impl App {
                 r.kind == cleanrs_core::fs::NodeKind::Directory && r.summary.target_id.is_none()
             })
             .map_or_else(|| self.current.clone(), |r| r.path.clone());
+        self.target_returns.push(TargetReturn {
+            scope: self.target_scope.clone(),
+            run: None,
+        });
         self.target_scope = Some(scope.clone());
         self.filtering = false;
         self.screens.push(Screen::Targets);
@@ -944,6 +964,52 @@ impl App {
         self.targets_mut().focus_path = focus_path;
         self.focus_target_path();
         self.reconcile_target_cursor();
+    }
+    fn open_system_targets(&mut self) {
+        if self.screen() == Screen::Targets && self.targets().is_some_and(|t| t.system) {
+            return;
+        }
+        let saved_run = if self.screen() == Screen::Results {
+            self.run.take()
+        } else {
+            None
+        };
+        self.target_returns.push(TargetReturn {
+            scope: self.target_scope.clone(),
+            run: saved_run,
+        });
+        let scope = crate::pipeline::system_scope();
+        self.target_scope = Some(scope.clone());
+        self.filtering = false;
+        self.screens.push(Screen::Targets);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.targets_cache.entry(scope) {
+            entry.insert(Targets {
+                system: true,
+                ..Default::default()
+            });
+            self.request_plan(PlanPurpose::Detect);
+        }
+        self.reconcile_target_cursor();
+    }
+    fn restore_target_context(&mut self) {
+        if let Some(previous) = self.target_returns.pop() {
+            self.target_scope = previous.scope;
+            if let Some(run) = previous.run {
+                self.run = Some(run);
+            }
+            if self.screen() == Screen::Targets {
+                let scope = self.target_scope.clone().expect("returning targets scope");
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    self.targets_cache.entry(scope.clone())
+                {
+                    entry.insert(Targets {
+                        system: scope == crate::pipeline::system_scope(),
+                        ..Default::default()
+                    });
+                    self.request_plan(PlanPurpose::Detect);
+                }
+            }
+        }
     }
     fn focus_target_path(&mut self) {
         let targets = self.targets_mut();
@@ -963,7 +1029,8 @@ impl App {
         let generation = self.generation;
         let scope = self.target_scope.clone().unwrap();
         let home = self.home.clone();
-        let browser_scan = (purpose == PlanPurpose::Detect
+        let browser_scan = (!self.targets().is_some_and(|targets| targets.system)
+            && purpose == PlanPurpose::Detect
             && self.targets().is_some_and(|t| t.generation == 0))
         .then(|| {
             let sources = if let Some((snapshot, index)) =
@@ -1007,7 +1074,7 @@ impl App {
             scope,
             home,
             targets.level,
-            targets.machine,
+            targets.system,
             (purpose != PlanPurpose::Detect).then(|| targets.selected.clone()),
         );
         let detection = targets.baseline.clone();
@@ -1172,10 +1239,6 @@ impl App {
                     self.status =
                         Some(("level preset applied; manual ticks discarded".into(), false));
                 }
-                Action::Machine => {
-                    self.targets_mut().machine = !self.targets().unwrap().machine;
-                    self.reset_detection(true);
-                }
                 Action::Rescan => self.reset_detection(true),
                 Action::Review => {
                     if self.targets().unwrap().selected.is_empty() {
@@ -1211,6 +1274,7 @@ impl App {
                         self.targets_mut().visual = None;
                     } else {
                         self.screens.pop();
+                        self.restore_target_context();
                         self.filtering = false;
                         self.trim_caches();
                     }
@@ -1274,10 +1338,24 @@ impl App {
             }
             Screen::Results => match action {
                 Action::Back | Action::Quit => {
-                    self.screens.truncate(1);
-                    self.reviewed = None;
+                    let system = self.run.as_ref().is_some_and(|run| run.plan.system);
                     self.return_after_run();
+                    self.reviewed = None;
                     self.run = None;
+                    if system {
+                        while self
+                            .screens
+                            .last()
+                            .is_some_and(|screen| *screen != Screen::Targets)
+                        {
+                            self.screens.pop();
+                        }
+                        self.screens.pop();
+                        self.restore_target_context();
+                    } else {
+                        self.screens.truncate(1);
+                        self.target_returns.clear();
+                    }
                 }
                 Action::Move(d) => {
                     let run = self.run.as_mut().unwrap();
