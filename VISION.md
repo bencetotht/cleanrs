@@ -4,6 +4,8 @@
 > accounting foundations, read-only inventory/planning, guarded cleanup
 > execution, persistent command-config trust, lightweight history, interactive cleanup,
 > and project/Git/worktree hygiene with retention and artifact recommendations.
+> Phase 4B adds portable provider sizing and individually reviewed cleanup;
+> live macOS validation and unsupported-capability gates remain open.
 > Empirical results and unresolved gates are tracked in
 > [docs/findings-phase0.md](docs/findings-phase0.md). This file remains the
 > reference for what cleanrs is, why it exists, and how it should be built.
@@ -504,17 +506,17 @@ refused actions still have no executable capability.
 | Homebrew | `brew cleanup --dry-run`; `brew autoremove --dry-run` | Implemented as distinct routine cleanup, scrub, and autoremove actions. Cleanup is run with implicit autoremove disabled; routine and scrub are mutually exclusive. |
 | Docker build cache | `docker builder prune --filter until=336h` | Implemented per local Unix-socket context, with context and endpoint pinned. Provider-reported engine bytes do not imply host sparse-image reclamation. |
 | Docker images / stopped containers | object-specific Docker prune commands | Implemented as separate actions; image cleanup is aggressive and never folded into build-cache cleanup. |
-| Docker volumes | currently informational; separate anonymous/named cleanup planned in Phase 4B | **Correction (2026-10-14):** the earlier blanket ban on volume cleanup is superseded. Unused anonymous volumes get a confirmed native prune action, separate from explicitly selected unused named volumes. Named volumes remain `user_data`; no level selects them. Only volumes referenced by no running or stopped container qualify. |
+| Docker volumes | exact native removal of reviewed unused local volumes | **Correction (2026-10-15):** anonymous cleanup uses exact names rather than the previously planned broad prune, which could sweep newly orphaned volumes. Named volumes remain `user_data` and require individual selection; a provider ID cannot select all names. Running/stopped references, endpoint and creation identity are revalidated. |
 | Nix | `nix-collect-garbage` | Implemented with plain GC at standard and `-d` at aggressive because the latter also destroys old generations and rollback capability. |
 | Cargo | frozen `cargo metadata` plus workspace-pinned `cargo clean` | Implemented for explicit scan roots. Workspace members collapse by resolved target directory; custom/shared or out-of-scope directories are shown but refused until ownership is complete. |
-| Xcode | known developer paths plus `xcrun simctl delete unavailable` | Implemented with whole-cache DerivedData explicit-ID-only because rebuild cost can be high, archives/device support/simulator data protected or informational, and unavailable simulators separate. |
+| Xcode | measured known paths plus per-device native simulator removal | DerivedData is explicit-ID-only because rebuild cost can be high; archives/device support/simulator storage remain protected or informational. **Correction (2026-10-15):** unavailable devices are individually selected user data and removed by UUID, not a bulk unavailable sweep. |
 | OrbStack | Docker context inventory plus OrbStack machine inventory | Docker actions are pinned to the OrbStack context; Linux machine disks remain informational user data. Never delete OrbStack backing files directly. |
 | Docker Desktop | Docker CLI pinned to the Docker Desktop context; Desktop-supported reset/uninstall flows for decommissioning | A currently inactive context can still contain named volumes and container writable layers. “Stale installation” is not proof that its VM disk is disposable. |
 | pnpm | `pnpm store path`, `pnpm store prune` | Implemented as a network-restored standard action. Experimental cache commands are not assumed. |
-| npm / npx | `npm config get cache`, `npm cache verify` | Cache verification/GC is implemented. The separate npx cache is informational because the installed capability is not stable enough to plan. |
-| Yarn / Bun | native cache-clean commands | Implemented as separate network-restored actions. Yarn detection deliberately does not invoke a Corepack shim that could download a tool merely to answer `--version`; Bun clone sharing remains a reclamation caveat. |
-| Python managers | uv prune/clean, pip purge, Poetry cache, Conda dry-run/clean | Implemented with cache actions separate from Poetry/Conda environments, which remain informational user data. |
-| Cargo / rustup shared state | registry/git cache and installed toolchain inventory | Informational until stable granular native cleanup and individual toolchain selection are available. |
+| npm / npx | `npm config get cache`, `npm cache verify`, capability-checked `cache npx rm` | **Correction (2026-10-15):** installed npm help can authorize separate npx cleanup. Content-cache GC yield stays unknown; full npx removal has a measured interval and pinned cache root. |
+| Yarn / Bun | version-aware native cache-clean commands | **Correction (2026-10-15):** Yarn version/location inspection now runs with Corepack network/project selection disabled. Classic cache-root cleanup and modern global-mirror cleanup have different measured scopes. Bun failure detail and fallback inventory remain visible; failed inspection never authorizes guessed cleanup. |
+| Python managers | uv prune/clean, pip purge, Poetry PyPI cache, Conda dry-run/clean | Measured allocation is separate from partial cleanup yield. **Correction (2026-10-15):** Conda preserves extracted packages to protect symlinked environments; individual inactive/non-base environments can be removed after explicit review. Global Poetry environments remain inventory without verified owning projects. |
+| Cargo / rustup shared state | measured registry/Git caches and individual toolchains | **Correction (2026-10-15):** individual non-default/non-active/non-overridden toolchains can be reviewed for native uninstall. Provider-wide naming never selects them all. Cargo shared-cache cleanup remains informational without validated stable granular GC. |
 | CocoaPods | `pod cache clean --all` | Implemented as a network-restored standard action. |
 | VMware Fusion | Inspect `.vmwarevm` bundles; direct the user to Fusion's snapshot and disk-cleanup operations | A bundle is user data. Never delete `.vmdk`, snapshot, suspend, or lock files individually. Snapshot consolidation can require substantial temporary free space. |
 | Claude Cowork VM | Inspect Claude's `vm_bundles` as an application-owned VM | The bundle may contain persistent Cowork/session state and there is no documented stable cleanup API. Report it separately; any reset/removal starts as explicit-target-only and requires Claude to be stopped plus a provider-version capability check. |
@@ -525,7 +527,7 @@ Phase 4A adds the following implemented system inventory:
 
 | Provider | Operation / scope | Boundary |
 |---|---|---|
-| Gradle | configured caches, wrapper distributions and daemon storage | Network caches; confirmed cleanup only with successful daemon-state inspection. |
+| Gradle | configured caches, installed wrapper distributions and daemon storage | Network caches; confirmed cleanup only with successful daemon-state inspection across discovered installations. Project gradlew scripts are never run, and missing distributions are never downloaded. |
 | Android SDK | SDK-pinned installed-package inventory and native uninstall | Images/build tools expensive; AVD state informational user data. |
 | Metro / Expo / Watchman | exact temporary cache names, `.expo/cache`, native watch reset | Never target TMPDIR or Expo credentials; Watchman is confirmed, with unknown disk recovery. |
 | Go | `go clean -cache` / `go clean -modcache` with pinned cache paths | Cheap build cache separate from network module cache; inspection cannot auto-download a toolchain. |
@@ -545,6 +547,16 @@ user data. Wallpaper is also informational: no observed macOS version or validat
 generated-cache schema/quiescence/regeneration evidence has been supplied. The
 §7.3 size is historical motivation, not verified reclaimable cache or permission
 to delete the extension tree. No macOS SDK claim was verified on this Linux host.
+
+**Phase 4B implementation boundary (2026-10-15):** provider storage measurements
+are separate from native cleanup yield. Cached arenas are reused and merged for
+set accounting; inspection/apply validate local paths, cloud/dataless state and
+root identities. Global commands execute from `/`, never the caller's repository.
+CocoaPods cache-root resolution supports environment settings and bounded scalar
+user configuration; inventory avoids initializing its native cache. The portable
+implementation has Linux fixture coverage. Live macOS tool behavior, APFS outcomes,
+VM lifecycle operations and wallpaper regeneration remain validation gates; this
+change introduces no newly verified macOS SDK claim.
 
 ### 7.1 Providers are an interface, not a command string
 

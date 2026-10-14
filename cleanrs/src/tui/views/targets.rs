@@ -217,7 +217,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
                 .unwrap_or_else(|| target.provider.id.clone());
             Row::new(vec![
                 Cell::from(mark).style(style),
-                Cell::from(crate::terminal::usage_display(&target.usage).0).style(
+                Cell::from(crate::terminal::target_usage_display(target).0).style(
                     if target.usage.sortable_bytes() == 0 {
                         theme.dim()
                     } else {
@@ -316,10 +316,19 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
                         cleanrs_core::targets::Recoverability::UserData => "user data",
                     }
                 )),
+                Line::from(format!(
+                    "Occupied {} · {}",
+                    crate::terminal::occupied_display(target),
+                    target
+                        .provider
+                        .context
+                        .as_deref()
+                        .unwrap_or("local storage")
+                )),
                 Line::from(target.consequence.clone()),
                 Line::from(format!(
                     "Reclaimable {} · confidence {confidence}",
-                    crate::terminal::usage_display(&target.usage).0
+                    crate::terminal::target_usage_display(target).0
                 )),
             ])
             .wrap(Wrap { trim: false }),

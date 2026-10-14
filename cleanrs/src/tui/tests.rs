@@ -42,6 +42,7 @@ fn estimate() -> ReclaimEstimate {
 }
 fn candidate(root: &Path, name: &str, class: TargetClass) -> DetectedTarget {
     DetectedTarget {
+        storage: Vec::new(),
         cargo_ownership: None,
         gitignore: None,
         id: name.into(),

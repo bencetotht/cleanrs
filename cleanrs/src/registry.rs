@@ -471,6 +471,7 @@ fn command_item(
         argv.remove(0);
     }
     DetectedTarget {
+        storage: Vec::new(),
         cargo_ownership: None,
         gitignore: None,
         id: target.id.clone(),
