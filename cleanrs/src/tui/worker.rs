@@ -1133,17 +1133,20 @@ fn volume_label(path: &Path) -> String {
         let stats = unsafe { stats.assume_init() };
         #[allow(clippy::unnecessary_cast)]
         let free = (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64);
-        let mut kind = "unknown".to_owned();
         #[cfg(target_os = "macos")]
-        {
+        let kind = {
             let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
             if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } == 0 {
                 let stats = unsafe { stats.assume_init() };
-                kind = unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }
+                unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }
                     .to_string_lossy()
-                    .to_uppercase();
+                    .to_uppercase()
+            } else {
+                "unknown".to_owned()
             }
-        }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let kind = "unknown";
         format!("Free {} · {kind}", crate::human_bytes(free))
     }
     #[cfg(not(unix))]

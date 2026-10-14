@@ -701,10 +701,10 @@ impl App {
             } => (parent, revision),
             _ => unreachable!("cleanup events handled separately"),
         };
-        if !self
+        if self
             .directories
             .get(path)
-            .is_some_and(|directory| directory.revision == *revision)
+            .is_none_or(|directory| directory.revision != *revision)
         {
             return;
         }

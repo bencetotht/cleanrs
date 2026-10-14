@@ -1314,6 +1314,21 @@ showed no scan. Both sessions and all workspace/HOME/cache/state fixtures were
 removed. No real home/Developer scan or mutation was performed.
 
 
+**PR #16 CI correction (2026-10-14).** Both Ubuntu workflow runs stopped
+at Clippy because the browser header's filesystem label was mutable only on
+macOS. The label now comes from immutable platform-specific bindings, retaining
+the macOS lookup and unknown fallback. Rust 1.95 Clippy also required simplifying
+the stale-worker-event guard; missing directories and mismatched revisions still
+discard events. These corrections qualify the earlier local verification claims:
+they did not establish a passing Linux CI run for the PR head.
+
+**Verification:** Rust 1.95 formatting and workspace/all-target Clippy with
+`-D warnings` pass. All 54 application and 45 core unit tests pass, along with
+36 CLI integration tests. The remaining six CLI tests require conventional
+`/usr/bin/touch`, `/usr/bin/false`, or `/bin/rm` paths absent on the local NixOS
+host; the unchanged Ubuntu CI fixtures provide their full-suite verification.
+Rust 1.85 compatibility is checked by the existing CI MSRV job.
+
 ### Testing strategy
 
 - `App` state transitions tested directly with synthetic key/worker events
