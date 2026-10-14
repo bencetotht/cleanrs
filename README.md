@@ -2,15 +2,16 @@
 
 Storage usage analyzer and cleaner for developers, written in Rust. Fully transparent.
 
-> **Status: Phases 0–3 implemented.** The read-only `scan`, `doctor`, and
+> **Status: Phases 0–4 (including 4A) and Phase 5A implemented.** The read-only `scan`, `doctor`, and
 > workspace/provider `targets` commands are joined by immutable cleanup plans,
 > guarded `clean --apply`, persistent command-config trust, and action-level
 > `history`. Direct deletion is descriptor-relative and provider commands are
 > revalidated before execution. `cleanrs tui` now supports progressive sizes,
 > navigation, accounting details, scoped target selection, and reviewed cleanup
-> through the same guarded pipeline. Phase 5A polish comes next, followed by
-> Phase 4 project hygiene; deeper snapshot
-> and File Provider research remains deferred unless it enables a concrete
+> through the same guarded pipeline. `cleanrs projects` adds Git/worktree state,
+> activity evidence, retention rules and artifact recommendations. Phase 5
+> indexing, scheduling and the remaining TUI overview work come next. Deeper
+> snapshot and File Provider research remain deferred unless they enable a concrete
 > capability. See
 > [the findings](docs/findings-phase0.md), [VISION.md](VISION.md), and the
 > explicit progress boundary in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
@@ -137,6 +138,7 @@ establish, before anything is built on top of it.
 cleanrs scan [PATH]      One-shot analysis (--json, --reclaimable, --explain)
 cleanrs doctor           Reconcile container state; report the unexplained gap
 cleanrs targets [PATH]   List workspace targets and machine-wide provider actions
+cleanrs projects [PATH]  Explain project/Git activity and artifact recommendations
 cleanrs clean [PATH]     Plan cleanup; --select PATH picks items; --apply executes
 cleanrs history          Action outcomes and evidence from applied runs
 cleanrs trust-config     Trust/list/revoke an explicit command config by hash
@@ -199,6 +201,7 @@ cargo build --release
 ./target/release/cleanrs doctor
 ./target/release/cleanrs doctor --scan .
 ./target/release/cleanrs targets .
+./target/release/cleanrs projects .
 ./target/release/cleanrs clean . --level standard
 ./target/release/cleanrs history
 ```
@@ -240,7 +243,7 @@ The provider inventory also covers Nix; pnpm, npm/npx, Yarn, and Bun; uv, pip,
 Poetry, and Conda; Cargo and rustup; CocoaPods; Docker and OrbStack; and Xcode.
 Each action has its own stable ID, severity, consequence, provider identity,
 and exact argv when a supported native action exists. Unsupported or stateful
-objects—npm's separate npx cache, Python environments, Rust toolchains and
+objects—npm's separate npx cache, manager-owned Python environments, Rust toolchains and
 shared Cargo caches, OrbStack machines, Docker volumes, Xcode archives/device
 support/simulator data—remain informational. Whole-cache Xcode DerivedData is
 generated but high-cost and enters a plan only when its stable ID is named.
@@ -296,6 +299,102 @@ override. Every final TUI tick, including a preset pick, is journalled as manual
 usage and labels the remainder as unattributed. Without `--scan`, it stays cheap
 and reports the path attribution as unknown rather than inventing a number.
 
+### Project hygiene
+
+`cleanrs projects PATH` is read-only. It ranks project/worktree findings by
+inactivity evidence and potential artifact cleanup, showing attributed storage,
+Git state, evidence, reclaimable intervals/confidence, exact proposed actions
+and rebuild consequences. `--json` provides the full report; `--top N` and
+`--min-size SIZE` filter projects. The same evidence enriches `targets` and
+`clean` plans, including the TUI's shared planning pipeline.
+
+Git inspection disables fsmonitor and repository content filters and refuses
+external config includes/partial clones. Filtered repositories may appear dirty
+conservatively. It distinguishes dirty/untracked work, missing remotes/upstreams,
+unpushed commits, behind/diverged branches and synchronization against local
+remote refs. It never fetches. Source/manifest/dependency-lockfile timestamps,
+recent commits, newest build output and sibling worktree activity contribute
+to the explanation. Dormancy defaults to 90 days; Cargo's 14-day artifact
+threshold does not mean that the repository is abandoned. Old, clean or pushed
+source is never permission to delete a repository, and project reports do not
+create repository-deletion actions.
+
+Generated artifacts can be cleaned while dirty or unpushed source stays intact.
+Tracked files inside an artifact directory refuse cleanup, and the check runs
+again before execution. Shared/custom Cargo directories retain observed owners,
+are counted once, and remain refused while complete ownership is unproven.
+Cargo metadata resolution and target safety are revalidated before its native
+cleanup command. Node dependencies, Cargo output, Gradle build/cache output,
+gitignored project/mobile build output and Python environments are attributed
+separately. An environment is recognized by `pyvenv.cfg` under any name and is
+`network` class: excluded from `safe`, with a warning about manually installed
+packages. Generic `build`, `out`, `coverage` and mobile build paths require Git-
+ignore evidence, which is recorded and rechecked before cleanup.
+
+Retention policy lives in the existing user or explicitly named TOML config:
+
+```toml
+[[retention]]
+path = "~/Developer"
+artifact_days = 30
+dormant_days = 120
+
+[[retention]]
+path = "~/Developer/expensive-rust-project"
+project_only = true
+artifact_days = 180
+dormant_days = 365
+keep = true
+```
+
+Exact project rules override root rules; otherwise the most-specific root wins.
+`keep` prevents selection by a level even with `--ignore-staleness`; an explicit
+`--select PATH` still requires review. Policy is never discovered from the
+working directory. Reports and history retain the policy/ownership evidence.
+
+Inspection is sequential and bounded to 128 repositories/768 Git commands,
+with a 15-second budget checked between commands and a 2-second timeout/4 MiB
+output limit per command. Unsafe metadata, out-of-scope repositories/worktrees,
+failures and exhausted budgets are visible as uncertainty. Unknown repository
+inspection refuses artifact cleanup; out-of-scope sibling worktrees prevent a
+dormancy conclusion. No live-process state is inferred from lockfile age.
+See [the fixture benchmark](docs/benchmarks-phase4.md) for measured costs.
+
+**Correction:** the earlier status still described Phase 5A polish and Phase 4
+as upcoming. Phases 4/4A and 5A are now implemented; Phase 5 is next. Wallpaper cleanup
+stays disabled pending observed macOS version/layout and regeneration validation.
+
+### Expanded target coverage and system scope
+
+```sh
+cleanrs targets --system --all          # providers only; no folder traversal
+cleanrs clean --system                  # dry-run system plan
+cleanrs clean --system --only go.build-cache  # native Go build-cache action
+cleanrs targets . --workspace-only --all # folder artifacts only
+```
+
+`--system` rejects a path and `--workspace-only`; normal filters, levels and
+selection apply. System inspection measures known provider cache trees for
+honest intervals; it does not scan the working directory or search the home.
+The TUI always separates folder and system scope.
+
+Folder coverage includes Python caches/environments, JS framework caches,
+Expo/mobile build caches and Pods, Gradle, Dart, Zig and Terraform. It never
+targets the `ios/` or `android/` source roots. New system inventory covers Gradle,
+Android SDK/AVDs, Metro/Expo/Watchman, Go, Maven, Playwright/Puppeteer, node-gyp,
+SwiftPM, TypeScript, VMware and Cowork. AVDs/VM bundles remain informational.
+Maven repositories with local unpublished installations are protected.
+
+Wallpaper discovery looks for `extension-com.apple.wallpaper.extension.image`
+inside the wallpaper agent container and records the installed macOS version.
+**Deletion is disabled:** neither the recalled partial path nor a matching
+version string validates generated contents, safe quiescing or regeneration.
+See the open validation gate in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
+
+Custom folder detectors accept `markers = ["build.gradle", "settings.gradle.kts"]`
+with `dir = "android/.gradle"`, or `inner_marker = "pyvenv.cfg"` for any environment
+name. Paths are normal relative components; mixed detector forms are rejected.
+
 ### Interactive cleanup
 
 `cleanrs tui [PATH]` requires a terminal and starts in the working directory
@@ -308,8 +407,9 @@ folder and focuses that target.
 In targets, Space toggles an item and moves down; `v` starts a range (move,
 then `v` or Space to select it; Esc cancels). Ctrl-a adds level-eligible items,
 Ctrl-r inverts selectable items, and `u` clears ticks. `1`/`2`/`3` reset to
-safe/standard/aggressive, discarding manual ticks. `m` includes machine-wide
-providers; `r` re-detects. Re-detection retains choices for surviving selectable
+safe/standard/aggressive, discarding manual ticks. `S` opens a separate system
+Targets view from Browser, Targets or Results; `r` re-detects the current scope.
+Folder and system lists stay separate. Esc returns to the originating screen. Re-detection retains choices for surviving selectable
 candidates. Returning with `q`/Esc keeps the cached selection and detection age until that
 scope is evicted from the bounded session cache. The project-path column is
 relative to the targets scope; the detail pane keeps the exact operation.
@@ -375,7 +475,8 @@ below that size. Diagnostics go to `~/.local/state/cleanrs/tui.log` (or
 | All | `?` help; `q`/Esc back (confirm quit in browser); Ctrl-c asks to quit (ask to stop during a run) |
 | Lists | `j`/`k` or arrows move; `gg`/`G` first/last; Ctrl-d/Ctrl-u half page; `/` filter; `n`/`N` matches; `s` sort |
 | Browser | `l`/Enter/right open; `h`/left/Backspace parent; `-` previous directory; `T` targets; `i` info; `r` rescan |
-| Targets | Space toggle; `v` range; Ctrl-a eligible; Ctrl-r invert; `u` clear; `1`/`2`/`3` presets; `m` machine scope; `r` re-detect; `x` review |
+| Browser / Targets / Results | `S` system targets; Esc returns to origin |
+| Targets | Space toggle; `v` range; Ctrl-a eligible; Ctrl-r invert; `u` clear; `1`/`2`/`3` presets; `r` re-detect; `x` review |
 | Review | `y` confirm; `n`/Esc cancel; Enter does not confirm |
 | Run | `q`/Esc/Ctrl-c ask to stop; `y`/`n` answer; `[`/`]` scroll provider output |
 | Results | `j`/`k`, `gg`/`G`, Ctrl-d/Ctrl-u scroll; `q`/Esc returns to refreshed browser |

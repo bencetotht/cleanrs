@@ -7,7 +7,9 @@ pub mod execution;
 pub mod fs;
 pub mod index;
 pub mod journal;
+pub mod projects;
 pub mod providers;
+pub mod system_targets;
 pub mod targets;
 
 pub use accounting::{Confidence, ReclaimEstimate};

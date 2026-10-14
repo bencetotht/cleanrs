@@ -1501,23 +1501,71 @@ commands preferred over direct deletion, argv arrays only:
 - Remove `m` and the `machine` flag from the folder Targets view; update the
   help overlay, README keymap table, and VISION/README wording together.
 
+### Implementation and validation (2026-10-14)
+
+- `targets.rs` now shares a metadata-only detector index with custom TOML
+  detectors and browser badges: alternative markers, nested normal relative
+  paths, and inner markers. Invalid or contradictory forms fail validation.
+  All tier-1 targets above are implemented, with candidate-level cloud/dataless
+  refusal and nested collapsing. Generic tier-2 paths now use Phase 4 Git proof.
+- `system_targets.rs` inventories exact provider paths; it never recursively
+  searches the home directory. Provider-owned cache trees are measured for
+  interval/set accounting; system mode skips the unrelated folder scan entirely.
+  Gradle caches/wrappers/daemon storage, Android SDK packages/AVDs, Metro files
+  and directories, Expo cache, Watchman, Go, Maven, Playwright/Puppeteer,
+  node-gyp, SwiftPM and TypeScript are covered. Native Go, SDK, Watchman and
+  supported SwiftPM commands retain pinned paths/identities and are re-inspected
+  before execution. Missing capabilities or unknown daemon state stay informational.
+  Maven repositories containing `maven-metadata-local.xml` are preserved because
+  unpublished local artifacts cannot be restored by downloading dependencies.
+- VMware bundles and the exact Claude Cowork bundle are informational user data.
+  Wallpaper discovery uses the user-recalled identifier
+  `extension-com.apple.wallpaper.extension.image` under
+  `~/Library/Containers/com.apple.wallpaper.agent/`, with bounded depth/entries,
+  no symlink traversal or placeholder enumeration, and installed `sw_vers`
+  evidence. **Open validation gate:** the supplied path contains `...` and no
+  observed macOS version/schema was supplied. There is no verified generated-
+  cache layout or quiescence/regeneration evidence, so wallpaper deletion stays
+  disabled for every version. Finding this extension does not prove its contents
+  are disposable. No installed macOS SDK exists on this Linux verification host.
+- CLI `targets --system` and `clean --system` reject explicit paths and
+  `--workspace-only`, retain filters/selections/levels, and inspect providers only.
+  `system: true` plus `[system]` identify scope in JSON/history; old journal records
+  default to folder scope. Existing combined CLI invocation remains compatible.
+- TUI `S` opens a separate session-cached system Targets view from Browser,
+  Targets or Results. Per-provider activity, `r` refresh, preserved manual ticks,
+  review/run/results and origin restoration share the folder pipeline. Folder
+  requests use workspace-only mode; `m` is removed. Provider scans are merged for
+  union accounting and filesystem native commands receive fresh path preflight.
+- Temporary fixtures cover every tier-1 detector and its cloud/dataless refusal,
+  nested Expo/venv cases, Git-ignore changes, all new providers, protected state,
+  missing capabilities, CLI scope conflicts, and TUI cache/modal/return behavior.
+  `cargo test --workspace`: 181 tests passed (61 binary, 47 CLI, 73 core).
+  `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all
+  --check`, and `git diff --check` passed. System Go execution/history is
+  verified through a stub tool against an explicit temporary sandbox. Selection-
+  scoped generic-build review tests preserve ignore evidence and refuse changed
+  admin symlinks; merged provider arenas preserve hardlinks and overlapping roots.
+  The earlier Phase 4 fixture benchmark remains a pre-4A baseline, not a new
+  performance claim for expanded system inventory.
+
 ### Practical completion criteria
 
-- [ ] Detector model supports any-of markers, nested relative paths, and inner
+- [x] Detector model supports any-of markers, nested relative paths, and inner
       markers; config parsing rejects incomplete/contradictory forms.
-- [ ] Each tier-1 detector has a fixture test, including nested collapsing
+- [x] Each tier-1 detector has a fixture test, including nested collapsing
       (`__pycache__` in `.venv`) and a dataless/cloud refusal case.
-- [ ] Expo fixtures prove `ios/` and `android/` are never candidates while
+- [x] Expo fixtures prove `ios/` and `android/` are never candidates while
       `ios/Pods` and `android/.gradle` are.
-- [ ] `targets --system` / `clean --system` inspect providers only, without a
+- [x] `targets --system` / `clean --system` inspect providers only, without a
       filesystem scan, and refuse a path argument.
-- [ ] TUI `S` opens a system-scope Targets view whose selection, review, run,
+- [x] TUI `S` opens a system-scope Targets view whose selection, review, run,
       and results behave and journal identically to the folder flow; `m` is
       gone and no list mixes scopes.
-- [ ] New providers have command-output/fixture parser tests and never require
+- [x] New providers have command-output/fixture parser tests and never require
       deleting real data; Android AVDs, VMware bundles, and Cowork state are
       unreachable by any level.
-- [ ] README, VISION (§7 provider table, §7.3), and the TUI help agree.
+- [x] README, VISION (§7 provider table, §7.3), and the TUI help agree.
 
 ---
 
@@ -1526,16 +1574,85 @@ commands preferred over direct deletion, argv arrays only:
 **Goal:** find storage that generic cache commands cannot understand because its
 risk depends on project state.
 
-### Current state
+### Implemented (2026-10-14)
 
-- Marker-based workspace detection exists for several common artifact names.
-- The Phase 2 Cargo scanner resolves workspace roots and target directories,
-  collapses members, and uses a 14-day newest-manifest/build-artifact threshold.
-- Custom/shared target directories retain observed owner evidence but are
-  conservatively refused because a single explicit scan cannot yet prove
-  complete ownership.
-- Git state, repository-level sleeper-project evidence, and individually safe
-  Python-environment recommendations are not implemented.
+- `cleanrs-core/src/projects.rs` provides a shared, read-only project inventory.
+  `cleanrs projects [PATH] [--json]` exposes ranked project/worktree reports;
+  `targets` and `clean` JSON also include them. `projects` skips machine-wide
+  providers. Human output uses the existing TTY/NO_COLOR tables and shows
+  attributed storage, activity, Git flags, intervals/confidence, exact operations,
+  rebuild consequences, supporting evidence and weakening evidence.
+- Discover repositories, linked worktrees and ecosystem markers only under the
+  explicit root. A containing repository outside that root remains unknown.
+  Nested packages inherit repository evidence; active sibling worktrees weaken
+  dormancy, and out-of-scope worktrees prevent a dormant conclusion.
+- Git inspection distinguishes dirty, untracked, remote-less, no-upstream,
+  synchronized, unpushed, behind and diverged states. It records local commit
+  time and worktree relationships without fetching. Synchronization describes
+  local refs, not live remote state. Commands use argv arrays, disable fsmonitor,
+  content filters, optional locks and lazy fetching, refuse external config
+  includes/partial clones, and discard inherited Git redirection/config variables.
+  Filtered repositories may conservatively appear dirty. Unsafe, dataless,
+  symlinked, externally referenced, or incomplete admin metadata never authorizes
+  cleanup.
+- Repository inspection is sequential and bounded: at most 128 repositories,
+  768 commands and a 15-second budget checked between commands. Each project
+  command has a 2-second timeout and 4 MiB output cap. Omitted/failed inspection
+  remains visible and cannot be mistaken for a clean repository.
+- Project activity combines newest source/manifest/dependency-lockfile metadata,
+  commit time, newest artifact activity and related worktrees. Dependency
+  lockfiles are metadata signals, not proof that a process is running. No
+  arbitrary source contents are parsed by cleanrs; native Git determines
+  working-tree state. Repositories with observed dataless/cloud content are
+  refused before invoking status. Dormancy defaults to 90 days; the existing
+  14-day Cargo artifact threshold remains separate. Future timestamps, local
+  work and recent output weaken inactivity; no report calls a repository
+  abandoned from mtime alone.
+- **Corrected to the Phase 4A plan:** the earlier implementation classified
+  Python environments as user data and matched generic Gradle/Xcode `build`
+  directories from ecosystem markers. Environments are now `network`, identified
+  by `pyvenv.cfg` regardless of their name, excluded from `safe` with a manual-
+  install warning. Generic `build`/`out`/`coverage` and mobile build paths require
+  repository-local gitignore proof; tracked-source protection still vetoes them.
+  The shared bounded Git inspector records ignore rules and rechecks ignored
+  status before execution, refusing removed repositories or changed ignore rules.
+- Artifact age now uses the newest entry in its tree rather than directory
+  mtime alone. Dirty/untracked/unpushed/remote-less source does not prevent
+  independently generated stale build cleanup. Tracked source inside an
+  artifact path does: Git checks artifact pathspecs and retains only vetoed
+  roots, not source filenames. Incomplete repository inspection also refuses
+  cleanup. The same guard runs again immediately before an artifact action.
+  Selection-scoped TUI review checks admin metadata and tracked paths without
+  running status over unselected source; activity is explicitly uninspected.
+- Cargo candidates retain structured `CargoOwnership`: target directory,
+  observed workspace owners and completeness. Shared/custom output is reported
+  once, with references from other owners, newest-owner manifest activity and
+  conservative retention across owners. Incomplete ownership remains refused,
+  including manual selection; one dormant owner cannot authorize a shared
+  clean. Marker-only Cargo findings cannot substitute for unavailable metadata.
+  Native cleanup revalidates frozen metadata resolution, executable version,
+  target identity, cloud state, mount boundaries and coverage before running.
+- Trusted user/explicit TOML accepts `[[retention]]` with absolute or `~/` paths,
+  `project_only`, `artifact_days`, `dormant_days` and `keep`. Exact project rules
+  override root rules; the most-specific root wins otherwise. Explicit config
+  overrides identical user rules. `keep` requires explicit naming even with
+  `--ignore-staleness`. Working-directory policy is never loaded. Target evidence
+  is retained in the backward-compatible history journal.
+- Tests use temporary repositories, worktrees, provider stubs, homes, policy
+  files and cache/build trees. They cover all repository states, recent source
+  and existing-file writes, unknown/limited inspection, cloud/dataless metadata,
+  fsmonitor refusal, tracked-file changes after review, shared/active Cargo
+  owners and changed target resolution, retention precedence/keep, Python
+  network/safe-exclusion policy, and human/JSON CLI parity. Existing execution fixtures now
+  resolve their sandbox tools through PATH so they also run on NixOS.
+- A reproducible multi-repository benchmark and measured Linux baseline live in
+  [docs/benchmarks-phase4.md](docs/benchmarks-phase4.md). The fixture is generated
+  in a unique temporary directory; it never scans or cleans the real home.
+
+**Correction:** the previous state said Git/project intelligence was absent.
+It is implemented above. Shared/custom Cargo ownership is deliberately still
+conservative: observing owners in one root does not prove there are none
+outside it. This is a safety refusal, not permission to guess ownership.
 
 ### Work
 
@@ -1571,21 +1688,21 @@ risk depends on project state.
 
 ### Practical completion criteria
 
-- [ ] Dirty, untracked, unpushed, remote-less, and synchronized repository
+- [x] Dirty, untracked, unpushed, remote-less, and synchronized repository
       fixtures are classified distinctly.
-- [ ] Large project-local artifacts are attributed to their project and native
+- [x] Large project-local artifacts are attributed to their project and native
       ecosystem.
-- [ ] Cargo sleeper-project recommendations combine Phase 2 build age with
+- [x] Cargo sleeper-project recommendations combine Phase 2 build age with
       repository activity and never label a project abandoned from mtime alone.
-- [ ] Shared Cargo build directories retain owner evidence; one dormant project
+- [x] Shared Cargo build directories retain owner evidence; one dormant project
       cannot authorize cleanup that disrupts an active or out-of-scope owner.
-- [ ] A stale Cargo build can be proposed for cleanup without proposing
+- [x] A stale Cargo build can be proposed for cleanup without proposing
       repository deletion, including for dirty, untracked, remote-less, and
       unpushed repository fixtures.
-- [ ] Shared cache/build directories are counted once.
-- [ ] No severity level selects repository or environment user data.
-- [ ] Recommendations explain the evidence and exact proposed action.
-- [ ] Scanning many repositories has a recorded performance baseline and avoids
+- [x] Shared cache/build directories are counted once.
+- [x] No severity level selects repository or environment user data.
+- [x] Recommendations explain the evidence and exact proposed action.
+- [x] Scanning many repositories has a recorded performance baseline and avoids
       spawning an unbounded number of subprocesses.
 
 ---
@@ -1718,17 +1835,13 @@ Work should continue in this order:
 1. **Phase 5A M0–M5 complete:** shared cleanup pipeline, per-candidate
    selection, browser/targets/review/run/results, cached totals, safety parity,
    freshness, terminal polish and documentation are implemented (details above).
-2. **Phase 4A target coverage and system scope** (next), in this order:
-   1. detector model extension (any-of markers, nested paths, inner markers)
-      plus the tier-1 folder detectors and their fixtures;
-   2. system scope: `--system` in the CLI, `S` in the TUI, removal of `m`;
-   3. new system providers (Gradle, Android, Metro/Expo/Watchman, Go, Maven,
-      Playwright/Puppeteer, small caches), then the §7.3 leftovers (VMware,
-      Claude Cowork, wallpaper cache).
-3. Then **Phase 4 project hygiene** using the shared pipeline: Cargo
-   shared-target ownership and project-activity evidence first, then repository
-   state (including gitignore evidence that unlocks Phase 4A tier-2
-   detectors), worktree, lockfile and process-activity evidence.
+2. **Phase 4A coverage/system scope implemented:** expanded folder detectors,
+   provider coverage, `--system`, global `S`, and removal of `m`. Wallpaper cleanup
+   remains gated on real macOS version/schema and quiescence validation; discovery
+   is informational until that evidence exists.
+3. **Phase 4 project hygiene implemented:** repository/worktree activity,
+   retention, shared Cargo ownership safeguards, and Git-ignore evidence for tier-2
+   detectors. Phase 5 indexing/scheduling and the remaining TUI work are next.
 4. **Resolved Cargo observation (2026-10-13):** stale `cargo.target` actions
    intentionally require aggressive severity; the targets UI now says “needs
    aggressive” at lower levels. Fourteen days is an artifact threshold, not
@@ -1742,7 +1855,7 @@ Work should continue in this order:
    observed APFS container-free-space evidence only when its measurement
    boundary is truthful and reproducible.
 
-Phases 0–3 now provide accounting, read-only inventory, immutable cleanup plans,
-guarded execution, persistent config trust, and lightweight history. Phase 5A
-(the interactive TUI) now completes the next feature boundary; Phase 4A (target
-coverage and system scope) is next, followed by Phase 4.
+**Correction:** the previous continuation listed Phases 4A and 4 as future work.
+Their implementations are now integrated on `feature/phase-4a-target-coverage`.
+The wallpaper deletion gate above is intentionally unresolved; no supported
+macOS version is claimed without observed schema/regeneration evidence.

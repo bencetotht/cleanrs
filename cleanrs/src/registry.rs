@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use cleanrs_core::fs::{NodeIndex, ScanResult};
+use cleanrs_core::fs::ScanResult;
 use cleanrs_core::providers::ProviderHost;
 use cleanrs_core::targets::{
     Automation, CandidateSafety, CleanupLevel, CommandSpec, DetectedTarget, PlannedOperation,
@@ -25,6 +25,8 @@ enum CommandTrust<'a> {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RegistryFile {
+    #[serde(default, rename = "retention")]
+    pub retention: Vec<cleanrs_core::projects::RetentionRule>,
     #[serde(default)]
     pub enable: Vec<String>,
     #[serde(default)]
@@ -54,6 +56,10 @@ pub(crate) struct ConfiguredTarget {
 #[serde(deny_unknown_fields)]
 pub(crate) struct DetectConfig {
     #[serde(default)]
+    pub markers: Vec<String>,
+    #[serde(default)]
+    pub inner_marker: Option<String>,
+    #[serde(default)]
     pub path: Option<String>,
     #[serde(default)]
     pub marker: Option<String>,
@@ -75,6 +81,7 @@ pub(crate) struct ReclaimConfig {
 
 #[derive(Debug, Default)]
 pub(crate) struct ResolvedRegistry {
+    pub retention: Vec<cleanrs_core::projects::RetentionRule>,
     pub enabled: BTreeSet<String>,
     pub disabled: BTreeSet<String>,
     pub targets: BTreeMap<String, ConfiguredTarget>,
@@ -91,11 +98,15 @@ impl ResolvedRegistry {
         if let Some(home) = home {
             let user = home.join(".config/cleanrs/targets.toml");
             if user.is_file() {
-                resolved.merge_file(&user, CommandTrust::ImplicitUserConfig)?;
+                resolved.merge_file(&user, CommandTrust::ImplicitUserConfig, home.into())?;
             }
         }
         if let Some(explicit) = explicit {
-            resolved.merge_file(explicit, CommandTrust::ExplicitHash(trusted_explicit_hash))?;
+            resolved.merge_file(
+                explicit,
+                CommandTrust::ExplicitHash(trusted_explicit_hash),
+                home,
+            )?;
         }
         Ok(resolved)
     }
@@ -123,6 +134,8 @@ impl ResolvedRegistry {
                     id,
                     description: format!("ad-hoc path target {path}"),
                     detect: DetectConfig {
+                        markers: Vec::new(),
+                        inner_marker: None,
                         path: Some(path.into()),
                         marker: None,
                         dir: None,
@@ -153,6 +166,8 @@ impl ResolvedRegistry {
                     id,
                     description: "ad-hoc argv command target".into(),
                     detect: DetectConfig {
+                        markers: Vec::new(),
+                        inner_marker: None,
                         path: None,
                         marker: None,
                         dir: None,
@@ -173,7 +188,12 @@ impl ResolvedRegistry {
         Ok(())
     }
 
-    fn merge_file(&mut self, path: &Path, command_trust: CommandTrust<'_>) -> Result<()> {
+    fn merge_file(
+        &mut self,
+        path: &Path,
+        command_trust: CommandTrust<'_>,
+        home: Option<&Path>,
+    ) -> Result<()> {
         let canonical = path
             .canonicalize()
             .with_context(|| format!("failed to resolve config {}", path.display()))?;
@@ -196,6 +216,23 @@ impl ResolvedRegistry {
                     );
                 }
             }
+        }
+        for mut rule in config.retention {
+            let expanded = expand_home(&rule.path.to_string_lossy(), home);
+            if !expanded.is_absolute()
+                || expanded
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                bail!(
+                    "retention paths must be absolute or home-relative, without ..: {}",
+                    rule.path.display()
+                );
+            }
+            rule.path = expanded.canonicalize().unwrap_or(expanded);
+            self.retention
+                .retain(|old| old.path != rule.path || old.project_only != rule.project_only);
+            self.retention.push(rule);
         }
         for id in config.enable {
             self.disabled.remove(&id);
@@ -241,21 +278,19 @@ impl ResolvedRegistry {
                     ));
                 }
                 items.push(item);
-            } else if let (Some(marker), Some(directory)) =
-                (&target.detect.marker, &target.detect.dir)
+            } else if target.detect.marker.is_some()
+                || !target.detect.markers.is_empty()
+                || target.detect.inner_marker.is_some()
             {
-                for project in (0..scan.arena.nodes.len()).map(NodeIndex::from_usize) {
-                    let children: BTreeMap<_, _> = scan
-                        .arena
-                        .children(project)
-                        .map(|child| (scan.arena.name(child), child))
-                        .collect();
-                    let (Some(_), Some(candidate)) = (
-                        children.get(marker.as_str()),
-                        children.get(directory.as_str()),
-                    ) else {
-                        continue;
-                    };
+                let mut markers: Vec<_> =
+                    target.detect.markers.iter().map(String::as_str).collect();
+                markers.extend(target.detect.marker.as_deref());
+                let index = cleanrs_core::targets::DetectorIndex::new(&scan.arena);
+                for (project, candidate) in index.candidates(
+                    &markers,
+                    target.detect.dir.as_deref().unwrap_or(""),
+                    target.detect.inner_marker.as_deref(),
+                ) {
                     let project_path = scan.arena.path(project);
                     if !target.scope.is_empty()
                         && !target
@@ -266,7 +301,13 @@ impl ResolvedRegistry {
                     {
                         continue;
                     }
-                    items.push(path_item(scan, target, scan.arena.path(*candidate), home));
+                    let mut item = path_item(scan, target, scan.arena.path(candidate), home);
+                    item.project_root = Some(project_path);
+                    item.evidence.push(format!(
+                        "markers: {markers:?}; inner marker: {:?}",
+                        target.detect.inner_marker
+                    ));
+                    items.push(item);
                 }
             } else if let Some(command) = &target.detect.command {
                 items.push(command_item(target, command, host));
@@ -275,15 +316,31 @@ impl ResolvedRegistry {
         items
     }
 
+    pub(crate) fn detect_system(&self, host: &dyn ProviderHost) -> Vec<DetectedTarget> {
+        self.targets
+            .values()
+            .filter(|target| self.permits(&target.id))
+            .filter_map(|target| {
+                target
+                    .detect
+                    .command
+                    .as_deref()
+                    .map(|command| command_item(target, command, host))
+            })
+            .collect()
+    }
+
     pub(crate) fn export(&self, builtin_ids: &[&str]) -> Result<String> {
         #[derive(Serialize)]
         struct Export<'a> {
             builtin: &'a [&'a str],
+            retention: &'a [cleanrs_core::projects::RetentionRule],
             sources: &'a [PathBuf],
             target: Vec<&'a ConfiguredTarget>,
         }
         toml::to_string_pretty(&Export {
             builtin: builtin_ids,
+            retention: &self.retention,
             sources: &self.sources,
             target: self.targets.values().collect(),
         })
@@ -314,17 +371,34 @@ fn validate_target(target: &ConfiguredTarget) -> Result<()> {
             target.id
         );
     }
+    let folder = target.detect.marker.is_some()
+        || !target.detect.markers.is_empty()
+        || target.detect.dir.is_some()
+        || target.detect.inner_marker.is_some();
     let detector_count = [
         target.detect.path.is_some(),
         target.detect.command.is_some(),
-        target.detect.marker.is_some() || target.detect.dir.is_some(),
+        folder,
     ]
     .into_iter()
-    .filter(|value| *value)
+    .filter(|v| *v)
     .count();
-    if detector_count != 1 || target.detect.marker.is_some() != target.detect.dir.is_some() {
+    let has_marker = target.detect.marker.is_some() || !target.detect.markers.is_empty();
+    if detector_count != 1
+        || target.detect.marker.is_some() && !target.detect.markers.is_empty()
+        || folder && !has_marker && target.detect.inner_marker.is_none()
+        || has_marker && target.detect.dir.is_none() && target.detect.inner_marker.is_none()
+        || target
+            .detect
+            .marker
+            .iter()
+            .chain(target.detect.markers.iter())
+            .chain(target.detect.inner_marker.iter())
+            .chain(target.detect.dir.iter())
+            .any(|path| !cleanrs_core::targets::valid_detector_path(path))
+    {
         bail!(
-            "target {:?} must declare exactly one complete detector",
+            "target {:?} must declare exactly one complete detector with normal relative marker/directory paths",
             target.id
         );
     }
@@ -397,6 +471,8 @@ fn command_item(
         argv.remove(0);
     }
     DetectedTarget {
+        cargo_ownership: None,
+        gitignore: None,
         id: target.id.clone(),
         provider: ProviderIdentity {
             id: "configuration".into(),
@@ -491,5 +567,39 @@ fn default_level(class: TargetClass) -> CleanupLevel {
         CleanupLevel::Standard
     } else {
         CleanupLevel::Safe
+    }
+}
+
+#[cfg(test)]
+mod detector_tests {
+    use super::*;
+    #[test]
+    fn detector_forms_validate_relative_paths_and_reject_mixed_modes() {
+        let target = |detect: serde_json::Value| -> ConfiguredTarget {
+            serde_json::from_value(serde_json::json!({"id":"fixture", "detect":detect, "class":"cheap", "reclaim":{"method":"delete"}})).unwrap()
+        };
+        for detect in [
+            serde_json::json!({"markers":["build.gradle","settings.gradle.kts"],"dir":"android/.gradle"}),
+            serde_json::json!({"marker":"ios/Podfile", "dir":"ios/Pods"}),
+            serde_json::json!({"inner_marker":"pyvenv.cfg"}),
+        ] {
+            assert!(validate_target(&target(detect)).is_ok());
+        }
+        for detect in [
+            serde_json::json!({"marker":"x", "markers":["y"], "dir":"cache"}),
+            serde_json::json!({"markers":["x"]}),
+            serde_json::json!({"dir":"cache"}),
+            serde_json::json!({"path":"/fixture", "inner_marker":"pyvenv.cfg"}),
+            serde_json::json!({"marker":"x", "dir":"/cache"}),
+            serde_json::json!({"marker":"../x", "dir":"cache"}),
+            serde_json::json!({"marker":"x", "dir":"a//b"}),
+            serde_json::json!({"inner_marker":"./pyvenv.cfg"}),
+            serde_json::json!({"inner_marker":""}),
+        ] {
+            assert!(
+                validate_target(&target(detect.clone())).is_err(),
+                "{detect}"
+            );
+        }
     }
 }

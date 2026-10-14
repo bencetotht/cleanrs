@@ -95,9 +95,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     .split(frame.area());
     let found = targets.baseline.as_ref().map_or(0, |p| p.targets.len());
     let metadata = format!(
-        " level: {} · scope: folder{} · {found} found",
+        " level: {} · scope: {} · {found} found",
         format!("{:?}", targets.level).to_lowercase(),
-        if targets.machine { " + machine" } else { "" }
+        if targets.system { "system" } else { "folder" }
     );
     let header = Layout::horizontal([
         Constraint::Min(10),
@@ -107,8 +107,12 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     frame.render_widget(
         Paragraph::new(super::truncate(
             &format!(
-                "Targets in {}",
-                app.target_scope.as_ref().unwrap().display()
+                "Targets {}",
+                if targets.system {
+                    "system".into()
+                } else {
+                    app.target_scope.as_ref().unwrap().display().to_string()
+                }
             ),
             header[0].width as usize,
         ))

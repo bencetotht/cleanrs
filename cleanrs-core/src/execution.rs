@@ -323,6 +323,12 @@ fn direct_delete(
             "target device, inode, or type changed after planning".into(),
         ));
     }
+    if current.kind == NodeKind::File && !children_only {
+        // The parent is held open without following links; the final name and
+        // identity were checked with fstatat immediately before unlinking.
+        unlink_at(parent_fd.as_raw_fd(), name, false)?;
+        return Ok(());
+    }
     if current.kind != NodeKind::Directory {
         return Err(DeleteError::Validation(
             "direct cleanup target is no longer a directory".into(),
@@ -745,17 +751,22 @@ mod tests {
     #[test]
     fn symlinked_executable_entry_is_pinned_with_its_resolved_target() {
         let fixture = tempdir().unwrap();
-        let executable = fixture.path().join("provider-real");
+        // Use an existing interpreter so the identity fixture does not depend
+        // on writing a new executable while parallel process tests run.
+        let executable = std::path::PathBuf::from("/bin/sh");
         let entry = fixture.path().join("provider");
         let marker = fixture.path().join("marker");
-        fs::write(&executable, format!("#!/bin/sh\ntouch {:?}\n", marker)).unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         std::os::unix::fs::symlink(&executable, &entry).unwrap();
         let planned = executable_identity(&entry).unwrap();
         let result = execute_command(
             &CommandSpec {
                 executable: entry,
-                args: Vec::new(),
+                args: vec![
+                    "-c".into(),
+                    ": > \"$1\"".into(),
+                    "fixture".into(),
+                    marker.display().to_string(),
+                ],
                 environment: BTreeMap::new(),
             },
             planned,
@@ -815,5 +826,36 @@ mod tests {
         assert_eq!(stdout, b"\xffraw\nlast");
         assert_eq!(stderr, b"err");
         assert_eq!(result.stdout_summary.as_deref(), Some("\u{fffd}raw"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod provider_file_tests {
+    use super::*;
+    use crate::fs::{FileSystem, NativeFileSystem};
+
+    #[test]
+    fn exact_cache_file_delete_preserves_neighbors_and_refuses_replacement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cache = fixture.path().join("haste-map-fixture");
+        let neighbor = fixture.path().join("unrelated");
+        std::fs::write(&cache, b"map").unwrap();
+        std::fs::write(&neighbor, b"preserve").unwrap();
+        let metadata = NativeFileSystem.metadata(&cache).unwrap();
+        let identity = CandidateIdentity {
+            device: metadata.device,
+            inode: metadata.inode,
+            kind: metadata.kind,
+        };
+        let result = execute_direct_delete(&cache, false, identity, metadata.allocated_size);
+        assert_eq!(result.status, ActionStatus::Success);
+        assert!(!cache.exists());
+        assert_eq!(std::fs::read(&neighbor).unwrap(), b"preserve");
+        std::os::unix::fs::symlink(&neighbor, &cache).unwrap();
+        assert_eq!(
+            execute_direct_delete(&cache, false, identity, 0).status,
+            ActionStatus::ValidationAbort
+        );
+        assert!(neighbor.exists());
     }
 }

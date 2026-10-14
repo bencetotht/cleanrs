@@ -42,6 +42,8 @@ fn estimate() -> ReclaimEstimate {
 }
 fn candidate(root: &Path, name: &str, class: TargetClass) -> DetectedTarget {
     DetectedTarget {
+        cargo_ownership: None,
+        gitignore: None,
         id: name.into(),
         provider: ProviderIdentity::workspace(),
         description: name.into(),
@@ -128,6 +130,8 @@ fn fabricated(root: &Path) -> ReviewedPlan {
     }
     let accounting = Arc::new(pipeline::SelectionAccounting::new(arena, true, &targets));
     ReviewedPlan {
+        system: false,
+        projects: Default::default(),
         scan_finished: None,
         scan_age_offset: Duration::ZERO,
         accounting,
@@ -237,7 +241,7 @@ fn targets_scope_cache_and_default_request_match_cli() {
     app.handle(Action::Back);
     app.handle(Action::Targets);
     assert!(app.targets().unwrap().selected.is_empty());
-    app.handle(Action::Machine);
+    app.handle(Action::SystemTargets);
     let requests = app.drain_requests();
     let Request::Plan { request, .. } = requests.last().unwrap() else {
         panic!("plan request");
@@ -247,7 +251,8 @@ fn targets_scope_cache_and_default_request_match_cli() {
     assert!(
         request.config.is_none() && request.target.is_empty() && request.target_argv.is_empty()
     );
-    app.handle(Action::Machine);
+    app.handle(Action::Back);
+    app.handle(Action::Rescan);
     assert!(
         matches!(app.drain_requests().last(), Some(Request::Plan { request, .. }) if request.workspace_only)
     );
@@ -542,6 +547,7 @@ fn all_screens_render_semantic_states_and_warnings_without_color() {
             .iter()
             .enumerate()
             .map(|(i, a)| cleanrs_core::journal::JournalAction {
+                evidence: vec![],
                 target_id: a.target.id.clone(),
                 provider_id: a.target.provider.id.clone(),
                 path: a.target.path.clone(),
@@ -576,6 +582,7 @@ fn all_screens_render_semantic_states_and_warnings_without_color() {
             timestamp_unix_seconds: 0,
             cleanrs_version: "fixture".into(),
             scope: run.plan.scope.clone(),
+            system: run.plan.system,
             level: "safe".into(),
             explicitly_named_ids: Vec::new(),
             outcome: "partial".into(),
@@ -628,7 +635,14 @@ fn pipeline_tick_keys_equal_cli_select_and_preserve_policy_eligible_source() {
     );
     // Aged fixture verifies no override on level-eligible manual ticks.
     for name in [".next", "dist"] {
-        let file = std::fs::File::open(root.join("project").join(name)).unwrap();
+        let artifact = root.join("project").join(name);
+        for entry in std::fs::read_dir(&artifact).unwrap() {
+            std::fs::File::open(entry.unwrap().path())
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(40 * 86400))
+                .unwrap();
+        }
+        let file = std::fs::File::open(artifact).unwrap();
         file.set_modified(std::time::SystemTime::now() - Duration::from_secs(40 * 86400))
             .unwrap();
     }
@@ -1086,7 +1100,7 @@ fn redetection_preserves_surviving_ticks_and_narrow_help_scrolls() {
     });
     assert_eq!(app.targets().unwrap().selected, selected);
     assert!(app.targets().unwrap().summary.is_some());
-    app.handle(Action::Machine);
+    app.handle(Action::Rescan);
     let generation = app.targets().unwrap().generation;
     app.on_worker(WorkerEvent::Planned {
         scope: scope.clone(),
@@ -1799,4 +1813,184 @@ fn cache_write_failure_keeps_sizes_and_reports_session_only_fallback() {
             && message.contains("Disk cache unavailable")
             && message.contains("sizes kept for this session")
     );
+}
+
+#[test]
+fn git_project_selection_review_checks_tracked_paths_without_reading_unselected_source() {
+    let fixture = tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "core.fsmonitor=false",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    std::fs::write(root.join("package.json"), "{}").unwrap();
+    std::fs::write(root.join(".gitignore"), ".next/\n").unwrap();
+    git(&["init", "-q", "--initial-branch=main"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "fixture"]);
+    std::fs::create_dir(root.join(".next")).unwrap();
+    std::fs::write(root.join(".next/output"), "generated output").unwrap();
+    let baseline = pipeline::build_reviewed_plan(
+        worker::plan_request(root.clone(), None, CleanupLevel::Safe, false, None),
+        Arc::new(Quiet),
+    )
+    .unwrap();
+    let key = baseline
+        .targets
+        .iter()
+        .find(|p| p.target.id == "node.next")
+        .unwrap()
+        .candidate_key
+        .clone();
+    let request = || {
+        worker::plan_request(
+            root.clone(),
+            None,
+            CleanupLevel::Safe,
+            false,
+            Some(HashSet::from([key.clone()])),
+        )
+    };
+    let review = pipeline::build_tui_reviewed_plan(request(), Arc::new(Quiet), &baseline).unwrap();
+    assert_eq!(review.actions.len(), 1);
+    let evidence = review.projects.projects[0].git.as_ref().unwrap();
+    assert!(evidence.complete && !evidence.activity_inspected);
+    assert_eq!(review.projects.inspection_commands, 2);
+    git(&["add", "--force", ".next/output"]);
+    let changed = pipeline::build_tui_reviewed_plan(request(), Arc::new(Quiet), &baseline).unwrap();
+    assert!(
+        changed.actions.is_empty(),
+        "new tracked source must drop the old tick"
+    );
+    assert!(root.join(".next/output").exists());
+}
+
+#[test]
+fn system_shortcut_is_global_cached_separate_and_returns_to_its_origin() {
+    let (_dir, mut app) = fixture();
+    let folder = app.target_scope.clone();
+    let selected = app.targets().unwrap().selected.clone();
+    app.drain_requests();
+    let mut keys = Keymap::default();
+    press(&mut app, &mut keys, KeyCode::Char('S'), KeyModifiers::NONE);
+    assert!(app.targets().unwrap().system);
+    let requests = app.drain_requests();
+    let Request::Plan {
+        request,
+        browser_scan,
+        ..
+    } = requests.last().unwrap()
+    else {
+        panic!("system detection");
+    };
+    assert!(request.system && !request.workspace_only);
+    assert!(browser_scan.is_none());
+    let generation = app.targets().unwrap().generation;
+    let mut system_plan = fabricated(_dir.path());
+    system_plan.system = true;
+    system_plan.scope = crate::pipeline::system_scope();
+    app.on_worker(WorkerEvent::Planned {
+        scope: crate::pipeline::system_scope(),
+        generation,
+        purpose: PlanPurpose::Detect,
+        result: Ok(Arc::new(system_plan)),
+    });
+    assert!(rendered(&app, false, 120, 30).0.contains("system"));
+    app.handle(Action::Toggle);
+    let system_selection = app.targets().unwrap().selected.clone();
+    app.handle(Action::Back);
+    assert_eq!(app.target_scope, folder);
+    assert_eq!(app.targets().unwrap().selected, selected);
+    press(&mut app, &mut keys, KeyCode::Char('S'), KeyModifiers::NONE);
+    assert!(
+        app.drain_requests().is_empty(),
+        "system cache reopens without detection"
+    );
+    assert_eq!(app.targets().unwrap().selected, system_selection);
+    app.handle(Action::Rescan);
+    assert!(
+        matches!(app.drain_requests().last(), Some(Request::Plan { request, .. }) if request.system)
+    );
+    app.handle(Action::Back);
+    app.handle(Action::Back);
+    assert_eq!(app.screen(), Screen::Browser);
+    press(&mut app, &mut keys, KeyCode::Char('S'), KeyModifiers::NONE);
+    assert_eq!(app.screen(), Screen::Targets);
+    app.handle(Action::Back);
+    assert_eq!(app.screen(), Screen::Browser);
+    assert!(
+        keys.action(
+            KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
+            Screen::Review,
+            false
+        )
+        .is_none()
+    );
+    assert!(
+        keys.action(
+            KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
+            Screen::Run,
+            false
+        )
+        .is_none()
+    );
+    assert!(
+        keys.action(
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            Screen::Targets,
+            false
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn system_review_results_restore_prior_folder_results() {
+    let (dir, mut app) = fixture();
+    run_fixture(&mut app);
+    app.screens.pop();
+    app.screens.push(Screen::Results);
+    let folder_scope = app.run.as_ref().unwrap().plan.scope.clone();
+    app.handle(Action::SystemTargets);
+    let scope = crate::pipeline::system_scope();
+    let generation = app.targets().unwrap().generation;
+    let mut plan = fabricated(dir.path());
+    plan.system = true;
+    plan.scope = scope.clone();
+    app.on_worker(WorkerEvent::Planned {
+        scope,
+        generation,
+        purpose: PlanPurpose::Detect,
+        result: Ok(Arc::new(plan)),
+    });
+    review(&mut app);
+    assert_eq!(app.screen(), Screen::Review);
+    assert!(app.reviewed.as_ref().unwrap().system);
+    app.handle(Action::Back);
+    run_fixture(&mut app);
+    app.screens.pop();
+    app.screens.push(Screen::Results);
+    app.handle(Action::Back);
+    assert_eq!(app.screen(), Screen::Results);
+    assert_eq!(app.run.as_ref().unwrap().plan.scope, folder_scope);
+    assert!(!app.run.as_ref().unwrap().plan.system);
 }
