@@ -252,6 +252,15 @@ contexts separately, pins both context name and endpoint, skips remote contexts,
 and never combines build cache, stopped containers, images, and volumes into a
 generic prune.
 
+**Planned, not yet implemented (Phase 4B):** complete provider sizing and
+cleanup coverage, including Gradle installations using only `gradlew`, measured
+Homebrew caches and Xcode DerivedData, and separate unused anonymous/named
+Docker-volume targets. **Correction:** the earlier blanket volume-cleanup ban
+is superseded in the design. Anonymous-volume pruning will be a confirmed
+action; named-volume removal will require explicit selection and remain outside
+all level presets. Current volume inventory is still informational. See
+[the Phase 4B checklist](DEVELOPMENT_PLAN.md#phase-4b--complete-provider-sizing-and-cleanup-coverage).
+
 For Rust projects, Cargo metadata is queried with `--frozen --no-deps` for at
 most 256 manifests under the explicit scan root. Workspace members sharing a
 target directory collapse into one candidate. Activity is the newest

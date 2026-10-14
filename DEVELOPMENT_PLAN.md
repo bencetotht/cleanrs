@@ -56,8 +56,9 @@ installed versions, so cleanrs initially classifies that mixed action as
 | 2 | Developer-storage inventory and cleanup plans | **Complete** |
 | 3 | Cleanup execution and lightweight history | **Complete** |
 | 5A | Interactive TUI: explore, select, clean (pulled forward from Phase 5) | **M0–M5 complete** |
-| 4A | Target coverage and system scope (split out of Phase 4) | **Next priority** |
-| 4 | Project hygiene and stale-project intelligence | **After 4A** |
+| 4A | Target coverage and system scope (split out of Phase 4) | **Inventory implemented; remaining cleanup tracked in 4B** |
+| 4 | Project hygiene and stale-project intelligence | **Implemented** |
+| 4B | Complete provider sizing and cleanup coverage | **Planned; next priority before Phase 5** |
 | 5 | Index, scheduling, and remaining ratatui daily-driver work | **Terminal groundwork only** |
 | 6 | Extensibility and optional portability | **Deferred** |
 
@@ -65,6 +66,10 @@ installed versions, so cleanrs initially classifies that mixed action as
 interactive TUI was split out of Phase 5 as Phase 5A and moved ahead of it;
 the reasons are recorded in the Phase 5A decision record. Phase numbers are
 kept stable so existing references remain valid.
+
+**Correction (2026-10-14):** the overview previously still called Phase 4A
+the next priority and Phase 4 future work despite their implementation records.
+Both are integrated; Phase 4B now tracks the remaining provider work explicitly.
 
 **Correction (2026-10-14):** after 5A, Phase 4 was again listed as next. Real
 TUI use showed that the limiting factor is detector and provider coverage, not
@@ -244,7 +249,8 @@ disk analyzers.
   informational rather than receiving a speculative command.
 - Docker enumerates local Unix-socket contexts separately, pins context and
   endpoint, reports build cache/stopped containers/images/volumes independently,
-  skips remote contexts, and never emits a generic volume-prune plan.
+  skips remote contexts, and currently emits no volume-prune plan. Phase 4B
+  replaces that blanket restriction with separate anonymous/named actions.
 - Cargo uses bounded, frozen metadata inspection to resolve workspace roots and
   target directories, collapses member crates by target directory, uses newest
   manifest/build activity with a 14-day default, and plans a workspace-pinned
@@ -1569,6 +1575,136 @@ commands preferred over direct deletion, argv arrays only:
 
 ---
 
+## Phase 4B — Complete provider sizing and cleanup coverage
+
+**Status: planned (2026-10-14). Next provider milestone, before Phase 5
+indexing/scheduling.** This phase completes the provider workflows exposed by
+Phases 2/3/4A; it is not a requirement to add more crates.
+
+**Correction:** “provider implemented” in earlier phases often means executable
+or path detection plus a command plan, not measured storage and usable cleanup.
+The system Targets view currently conflates unmeasured storage, unsupported
+output parsing, unknown cleanup yield, and failed inspection as `unknown`.
+Phase 4A's completed inventory boundary does not complete the work below.
+
+### Provider accounting and inspection
+
+- [ ] **Yarn:** resolve the installed variant's actual cache location and scope,
+      measure it, and validate the native cache-clean operation. Executable-only
+      detection must not imply that a cache exists; inspection must not trigger
+      Corepack downloads or read policy from the working directory.
+- [ ] **pnpm / npm / npx:** measure resolved stores and caches, distinguish npm
+      content-cache verification/GC from npx execution-cache cleanup, and add a
+      supported version-checked npx cleanup action where available. Total store
+      allocation is not the amount pnpm prune or npm verify will recover.
+- [ ] **Bun:** diagnose failed `bun pm cache` inspection, handle installed-version
+      capabilities, resolve and measure the real cache, and retain clone-aware
+      uncertainty. Preserve the actual failure detail instead of only exit code.
+- [ ] **pip / Poetry / Conda:** resolve and measure package caches, implement
+      provider-specific parsers (pip's structured human report and Conda's JSON
+      dry-run cannot use the current bare-integer parser), and distinguish full
+      cache removal from partial pruning. Environment inventory must enumerate
+      individual environments and their allocation; any environment removal is
+      explicitly selected and reviewed, separate from cache cleanup.
+- [ ] **CocoaPods:** resolve and measure the downloaded-pod cache; `pod cache
+      list` output is inventory evidence, not a cache directory or byte estimate.
+- [ ] **Cargo / rustup:** locate and size registry/Git caches and individual
+      toolchains. Check installed native capabilities for granular cache GC and
+      toolchain removal; implement supported operations with version evidence.
+      Explicit toolchain selection must disclose project dependencies. If an
+      operation remains unsupported, give a specific reason and retain measured
+      inventory rather than treating detection as completed cleanup coverage.
+- [ ] **Homebrew autoremove / Nix GC:** use removable-object inventory and
+      provider-native read-only size information where available; preserve unknown
+      yield when it cannot be derived. Do not present all installed/store bytes
+      as the cleanup estimate.
+- [ ] **OrbStack machines / VMware / Claude Cowork:** size individually identified
+      machine/bundle storage and distinguish it from Docker cache. Investigate
+      supported native removal/decommission operations for explicitly selected
+      machines/bundles; retain a concrete unsupported reason where none exists.
+      These remain user data, outside every level preset and scheduled apply.
+- [ ] **Docker contexts:** show context name and endpoint in rows/details,
+      distinguish unavailable contexts from available storage, and retain useful
+      inspection stderr. One failed `system df` must not look like four duplicate
+      anonymous Docker failures. Keep engine bytes separate from host recovery.
+- [ ] **Wallpaper:** close the outstanding Phase 4A version/schema and
+      quiescence/regeneration validation gate before enabling confirmed cleanup.
+      Inventory remains available with a specific blocked-capability explanation.
+
+### Required cleanup targets
+
+- [ ] **Unused anonymous Docker volumes:** add a separate stable target,
+      proposed ID `docker.volumes-anonymous`, using native `docker volume prune`
+      without `--all`. Only volumes referenced by no container qualify, including
+      no references from stopped containers. Assign confirmed `standard` cleanup;
+      exclude from unattended `safe` apply. Inspect anonymous-volume candidates
+      and report their bytes separately from named volumes.
+- [ ] **Unused named Docker volumes:** add a separate stable target, proposed ID
+      `docker.volumes-named`, inventory individual eligible volumes and require
+      explicit selection of those names. Named volumes remain `user_data`, outside
+      every level preset. Review discloses permanent data loss and executes native
+      `docker volume rm` for the selected unused names; do not use `volume prune
+      --all` as a substitute because it would also sweep anonymous volumes.
+- [ ] Revalidate Docker context/endpoint and volume reference state immediately
+      before execution. Handle references changing after review without forced
+      removal. Explain that removing stopped containers can make additional
+      volumes unused; newly eligible volumes require fresh review rather than
+      silently widening the reviewed volume set. Validate installed prune
+      capabilities and ensure anonymous pruning cannot sweep unreviewed volumes
+      if eligibility changes. Journal identities, exact argv, and provider results.
+- [ ] **Gradle / gradlew caches:** complete `gradle.caches` for
+      `$GRADLE_USER_HOME/caches` (default `~/.gradle/caches`), with wrapper
+      distributions and daemon state separate. Existing Phase 4A implementation
+      requires a global `gradle` executable to establish stopped-daemon evidence;
+      support installations using only `gradlew` without assuming absence of
+      global Gradle proves inactivity. Do not execute arbitrary project wrapper
+      scripts without explicit trust or cause downloads during inspection.
+      Provide measured, reviewed cache deletion once quiescence is established,
+      with dependency-download/rebuild consequences and guarded path identity.
+- [ ] **Homebrew cache:** complete explicit measured inventory of `brew --cache`
+      (commonly `~/Library/Caches/Homebrew`, honoring configured locations).
+      Existing `homebrew.cleanup` and `.scrub` already plan native cleanup, but
+      they also cover old installed versions and are not equivalent to deleting
+      the entire cache directory. Make the supported cache scope and omissions
+      visible; investigate a separate full-download-cache action if native cleanup
+      does not cover the requested scope. Validate it before offering it and
+      avoid overlapping estimates/actions with cleanup/scrub.
+- [ ] **Xcode DerivedData:** complete sizing and reviewed removal of
+      `~/Library/Developer/Xcode/DerivedData` in system scope. The current
+      `xcode.derived-data` action already exists but its estimate is always unknown;
+      retain explicit selection and rebuild-cost warnings. Keep archives, device
+      support, all simulator user data, and unavailable simulators separate.
+      Measure simulator inventory and the subset removed by native
+      `simctl delete unavailable`, rather than parsing device JSON as an integer.
+
+The shell `rm -rf` examples describe desired storage coverage; implementation
+uses native provider commands where supported, otherwise the shared guarded
+filesystem executor. No shell commands are introduced.
+
+### Completion criteria
+
+- [ ] Every provider above has a recorded cache/object location, measured
+      allocation where accessible, a cleanup capability or specific remaining
+      blocker, and fixture coverage for installed-version differences.
+- [ ] Report occupied allocation, estimated cleanup intervals/confidence,
+      provider-reported bytes and observed recovery separately. Partial GC/prune
+      cannot inherit whole-cache size as its reclaimable estimate.
+- [ ] CLI/TUI distinguish “not measured”, “cleanup yield unknown”, “inspection
+      failed” and “inventory only”; explanations include actionable evidence.
+      Empty storage is distinguished from executable detection and failed sizing.
+- [ ] Docker anonymous/named fixtures include running/stopped references,
+      reference changes after review, context changes, and newly orphaned volumes.
+      Named cleanup never sweeps anonymous or unselected volumes; anonymous
+      cleanup never reaches named volumes. No destructive tests use real Docker
+      storage, the real home directory, or unsandboxed `--apply`.
+- [ ] Cache sizing reuses filesystem/set accounting, deduplicates overlapping
+      targets, retains cloud/dataless/mount/symlink invariants, and runs through
+      the existing selection/review/execution/history pipeline in both scopes.
+- [ ] Update README/VISION capability statements only as features land; this
+      checklist stays open until end-to-end sizing and cleanup are verified.
+
+---
+
 ## Phase 4 — Project hygiene and stale-project intelligence
 
 **Goal:** find storage that generic cache commands cannot understand because its
@@ -1841,7 +1977,8 @@ Work should continue in this order:
    is informational until that evidence exists.
 3. **Phase 4 project hygiene implemented:** repository/worktree activity,
    retention, shared Cargo ownership safeguards, and Git-ignore evidence for tier-2
-   detectors. Phase 5 indexing/scheduling and the remaining TUI work are next.
+   detectors. Phase 4B provider sizing/cleanup completion above comes next, before Phase 5
+   indexing/scheduling and the remaining TUI work.
 4. **Resolved Cargo observation (2026-10-13):** stale `cargo.target` actions
    intentionally require aggressive severity; the targets UI now says “needs
    aggressive” at lower levels. Fourteen days is an artifact threshold, not
