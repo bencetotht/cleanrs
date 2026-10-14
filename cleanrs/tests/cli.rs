@@ -809,6 +809,124 @@ fi
     );
 }
 
+// Each run uses a stub Docker executable and an explicit temporary root. The
+// first context is deliberately unavailable: it must not substitute for the
+// reviewed OrbStack context, and no real Docker daemon is contacted.
+#[test]
+#[cfg(unix)]
+fn docker_cleanup_revalidates_the_reviewed_context_and_live_inspection() {
+    for action in ["docker.images", "docker.build-cache"] {
+        for mode in [
+            "stable",
+            "reordered",
+            "endpoint-changed",
+            "missing",
+            "unavailable",
+            "version-changed",
+        ] {
+            let fixture = tempdir().unwrap();
+            let bin = fixture.path().join("bin");
+            fs::create_dir(&bin).unwrap();
+            let docker = bin.join("docker");
+            let script = r#"#!/bin/sh
+count=0
+if [ -f "$HOME/context-count" ]; then read count < "$HOME/context-count"; fi
+if [ "$1" = "version" ]; then
+  if [ "$FIXTURE_MODE" = "version-changed" ] && [ "$count" -gt 0 ]; then
+    echo '30.0.0'
+  else
+    echo '29.4.0'
+  fi
+elif [ "$1" = "context" ] && [ "$2" = "ls" ]; then
+  count=$((count + 1))
+  echo "$count" > "$HOME/context-count"
+  default='{"Name":"default","DockerEndpoint":"unix:///fixture/default.sock"}'
+  orb='{"Name":"orbstack","DockerEndpoint":"unix:///fixture/orbstack.sock"}'
+  if [ "$count" -gt 1 ] && [ "$FIXTURE_MODE" = "endpoint-changed" ]; then
+    orb='{"Name":"orbstack","DockerEndpoint":"unix:///fixture/replaced.sock"}'
+  fi
+  if [ "$count" -gt 1 ] && [ "$FIXTURE_MODE" = "reordered" ]; then
+    echo "$orb"
+    echo "$default"
+  else
+    echo "$default"
+    if [ "$count" -eq 1 ] || [ "$FIXTURE_MODE" != "missing" ]; then echo "$orb"; fi
+  fi
+elif [ "$1" = "--context" ] && [ "$3" = "system" ]; then
+  if [ "$2" = "default" ]; then echo 'default daemon unavailable' >&2; exit 1; fi
+  if [ "$count" -gt 1 ] && [ "$FIXTURE_MODE" = "unavailable" ]; then
+    echo 'reviewed daemon unavailable' >&2
+    exit 1
+  fi
+  echo '{"Type":"Images","Reclaimable":"12MB (100%)"}'
+  echo '{"Type":"Build Cache","Reclaimable":"8MB (100%)"}'
+elif [ "$1" = "--context" ] && [ "$2" = "orbstack" ]; then
+  echo "$*" >> "$HOME/applied-argv"
+  echo 'Total reclaimed space: 1MB'
+else
+  exit 2
+fi
+"#;
+            fs::write(&docker, script).unwrap();
+            fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+                .args([
+                    "clean",
+                    fixture.path().to_str().unwrap(),
+                    "--only",
+                    action,
+                    "--level",
+                    "aggressive",
+                    "--apply",
+                    "--yes",
+                    "--json",
+                ])
+                .env("PATH", &bin)
+                .env("HOME", fixture.path())
+                .env("XDG_STATE_HOME", fixture.path().join("state"))
+                .env("FIXTURE_MODE", mode)
+                .output()
+                .unwrap();
+            let json: serde_json::Value =
+                serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+                    panic!(
+                        "{action}/{mode}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                });
+            assert_eq!(
+                json["results"].as_array().unwrap().len(),
+                1,
+                "{action}/{mode}: {json}"
+            );
+            let applied = fixture.path().join("applied-argv");
+            if matches!(mode, "stable" | "reordered") {
+                assert!(output.status.success(), "{action}/{mode}: {json}");
+                assert_eq!(json["results"][0]["result"]["status"], "success");
+                let expected = if action == "docker.images" {
+                    "--context orbstack image prune --all --force --filter until=336h\n"
+                } else {
+                    "--context orbstack builder prune --force --filter until=336h\n"
+                };
+                assert_eq!(fs::read_to_string(applied).unwrap(), expected);
+            } else {
+                assert!(!output.status.success(), "{action}/{mode}");
+                assert_eq!(json["results"][0]["result"]["status"], "validation_abort");
+                assert!(
+                    !applied.exists(),
+                    "{action}/{mode}: cleanup must not execute"
+                );
+                let error = json["results"][0]["result"]["error"].as_str().unwrap();
+                if mode == "unavailable" {
+                    assert!(error.contains("reviewed daemon unavailable"), "{error}");
+                } else {
+                    assert!(error.contains("identity or context changed"), "{error}");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn explicit_config_adds_a_scoped_path_target() {
     let fixture = tempdir().unwrap();

@@ -1587,6 +1587,28 @@ The system Targets view currently conflates unmeasured storage, unsupported
 output parsing, unknown cleanup yield, and failed inspection as `unknown`.
 Phase 4A's completed inventory boundary does not complete the work below.
 
+### Implemented follow-up: Docker execution context matching (2026-10-14)
+
+- **Correction:** execution preflight previously picked the first refreshed
+  candidate with the same action ID. Docker repeats action IDs across contexts,
+  so an OrbStack images/build-cache plan could abort against the unrelated
+  `default` context even when the reviewed identity was unchanged.
+- Preflight now finds the reviewed full provider identity, including executable,
+  version, context and endpoint, among matching action IDs. Missing/changed
+  identity still aborts; a failed fresh inspection or changed exact cleanup
+  operation also aborts instead of authorizing mutation from identity alone.
+- CLI regression fixtures cover both image and build-cache cleanup with an
+  unavailable first context, reordered contexts, changed endpoints/versions,
+  a removed reviewed context, and a newly unavailable reviewed daemon. They use
+  a stub Docker executable and an explicit temporary root, never real Docker
+  storage. Remaining provider accounting and UI diagnostics below stay open.
+- Validation: all 184 workspace tests passed (61 binary, 48 CLI, 75 core)
+  with `TMPDIR` set to a unique directory under `/private/tmp`; clippy with
+  warnings denied, formatting, and diff checks passed. The default macOS
+  `/var/folders/...` temporary path exposes existing canonical-path fixture
+  failures (`/var` versus `/private/var`); those tests pass with the canonical
+  temporary root. No real provider cleanup was performed.
+
 ### Provider accounting and inspection
 
 - [ ] **Yarn:** resolve the installed variant's actual cache location and scope,

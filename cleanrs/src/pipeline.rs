@@ -1185,16 +1185,35 @@ fn revalidate_provider(target: &DetectedTarget, home: Option<&Path>) -> Result<(
         return Ok(());
     }
     let selected = HashSet::from([target.id.clone()]);
-    let current = inspect_builtin_providers(&SystemProviderHost::default(), &selected)
+    let candidates: Vec<_> = inspect_builtin_providers(&SystemProviderHost::default(), &selected)
         .items
         .into_iter()
-        .find(|item| item.id == target.id)
-        .ok_or_else(|| "provider action is no longer available".to_owned())?;
-    if current.provider != target.provider {
-        return Err(format!(
-            "provider identity or context changed after planning (planned {:?}, current {:?})",
-            target.provider, current.provider
-        ));
+        .filter(|item| item.id == target.id)
+        .collect();
+    if candidates.is_empty() {
+        return Err("provider action is no longer available".into());
+    }
+    // Docker emits the same action ID for each local context. Revalidate the
+    // reviewed identity (including endpoint), never whichever context is first.
+    let current = candidates
+        .iter()
+        .find(|item| item.provider == target.provider)
+        .ok_or_else(|| {
+            format!(
+                "provider identity or context changed after planning (planned {:?}; no matching identity remains)",
+                target.provider
+            )
+        })?;
+    // A context can still exist while its daemon becomes unavailable. Identity
+    // equality alone must not authorize an action whose fresh inspection failed.
+    if let cleanrs_core::targets::CandidateSafety::Refused(reason) = &current.safety {
+        return Err(format!("provider inspection refused cleanup: {reason}"));
+    }
+    if matches!(current.operation, PlannedOperation::Informational) {
+        return Err("provider action no longer has a cleanup operation".into());
+    }
+    if current.operation != target.operation {
+        return Err("provider cleanup operation changed after planning".into());
     }
     Ok(())
 }
