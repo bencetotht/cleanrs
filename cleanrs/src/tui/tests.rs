@@ -1349,6 +1349,56 @@ fn review_drops_vanished_replaced_and_newly_refused_ticks_without_widening() {
 }
 
 #[test]
+fn busy_indicators_animate_without_worker_progress() {
+    let (_fixture, mut app) = fixture();
+    let render_lines = |app: &App| {
+        rendered(app, false, 100, 24)
+            .1
+            .content
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let scope = app.target_scope.clone().unwrap();
+    for reviewing in [false, true] {
+        let targets = app.targets_cache.get_mut(&scope).unwrap();
+        targets.planning = true;
+        targets.reviewing = reviewing;
+        targets.activity = "inspecting system provider: pip…".into();
+        assert!(app.busy());
+        // Advance only the timer: a quiet provider must not freeze its spinner.
+        let before = render_lines(&app);
+        app.on_tick();
+        let after = render_lines(&app);
+        let before = before.lines().nth(1).unwrap();
+        let after = after.lines().nth(1).unwrap();
+        assert_ne!(before.chars().next(), after.chars().next());
+        assert_eq!(
+            before.chars().skip(1).collect::<String>(),
+            after.chars().skip(1).collect::<String>()
+        );
+        assert!(after.contains("inspecting system provider: pip"));
+    }
+    app.targets_cache.get_mut(&scope).unwrap().planning = false;
+    run_fixture(&mut app);
+    app.run.as_mut().unwrap().actions[0] = RunAction::Running;
+    assert!(app.busy());
+    let before = render_lines(&app);
+    app.on_tick();
+    let after = render_lines(&app);
+    assert_ne!(before.lines().nth(1), after.lines().nth(1));
+    let running_row = |text: &str| {
+        text.lines()
+            .find(|line| line.contains("running"))
+            .unwrap()
+            .to_owned()
+    };
+    assert_ne!(running_row(&before), running_row(&after));
+    assert!(after.contains("action 1/1 · 0 completed"));
+}
+
+#[test]
 fn freshness_is_human_and_stale_views_warn_with_refresh_hint() {
     assert_eq!(views::freshness(Duration::from_secs(59)), "59s ago");
     assert_eq!(views::freshness(Duration::from_secs(60)), "1m ago");

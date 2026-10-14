@@ -1220,6 +1220,17 @@ the centered minimum-size message rendered. All sessions and fixtures were
 removed; no real home/Developer scan or mutation was performed.
 
 
+**Spinner regression fixed (2026-10-14).** Targets detection/review and the
+cleanup-run activity header had hard-coded `⠹` characters even though the
+80 ms busy timer still advanced. Browser, Targets and Run now share the same
+ten-frame spinner driven by that timer; running action rows use it too.
+A render regression fixture advances only timer ticks, without worker events,
+and verifies that detection, review and run indicators animate while their
+activity/progress remains unchanged. Idle freshness timing is unchanged.
+Validation: 62 binary/TUI tests passed with a canonical temporary root;
+clippy with warnings denied, formatting and diff checks passed. The development
+binary was rebuilt.
+
 **Post-M5 TUI improvements (2026-10-13).**
 
 - Targets now show a scope-relative project-path column instead of an ambiguous

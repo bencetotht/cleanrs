@@ -12,8 +12,6 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row as TableRow, Table, TableState},
 };
 
-const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
 pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     let directory = app.directory();
     let info_height = if app.info { 8 } else { 0 };
@@ -40,7 +38,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         Paragraph::new(directory.volume.as_str()).style(theme.dim()),
         header[1],
     );
-    let spinner = SPINNER[app.tick % SPINNER.len()];
+    let spinner = super::spinner(app.tick);
     let activity = if directory.busy() {
         let mut dirs = 0_u64;
         let mut entries = 0_u64;

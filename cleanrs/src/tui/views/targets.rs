@@ -123,9 +123,13 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     frame.render_widget(
         Paragraph::new(if targets.planning {
             if targets.reviewing {
-                format!("⠹ building reviewed plan… · {}", targets.activity)
+                format!(
+                    "{} building reviewed plan… · {}",
+                    super::spinner(app.tick),
+                    targets.activity
+                )
             } else {
-                format!("⠹ {}", targets.activity)
+                format!("{} {}", super::spinner(app.tick), targets.activity)
             }
         } else if targets.baseline.is_none() {
             "idle · detection unavailable · press r to refresh".into()

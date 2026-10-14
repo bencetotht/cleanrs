@@ -68,9 +68,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         .iter()
         .position(|a| matches!(a, RunAction::Running))
         .map_or(done.min(total), |i| i + 1);
+    let spinner = super::spinner(app.tick);
     frame.render_widget(
         Paragraph::new(format!(
-            "⠹ action {current}/{total} · {done} completed{}",
+            "{spinner} action {current}/{total} · {done} completed{}",
             if run.stop.load(std::sync::atomic::Ordering::Acquire) {
                 " · stopping after current action"
             } else {
@@ -90,7 +91,6 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             .gauge_style(theme.success()),
         areas[2],
     );
-    let spinner = ["⠋", "⠙", "⠹", "⠸"][app.tick % 4];
     let lines: Vec<_> = run
         .plan
         .actions
