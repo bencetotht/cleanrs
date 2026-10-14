@@ -268,6 +268,90 @@ impl TargetDefinition {
 /// strictly below a detected project root.
 pub const BUILTIN_TARGETS: &[TargetDefinition] = &[
     TargetDefinition {
+        id: "xcode.project-build",
+        description: "project-local Xcode build output",
+        detector: MarkerDetector {
+            marker: "*.xcodeproj",
+            directory: "build",
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: Some(RebuildCost::High),
+        stale_after_days: 30,
+        children_only: false,
+    },
+    TargetDefinition {
+        id: "gradle.cache",
+        description: "project-local Gradle generated cache",
+        detector: MarkerDetector {
+            marker: "build.gradle",
+            directory: ".gradle",
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+    },
+    TargetDefinition {
+        id: "gradle.kotlin-cache",
+        description: "project-local Gradle generated cache",
+        detector: MarkerDetector {
+            marker: "build.gradle.kts",
+            directory: ".gradle",
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+    },
+    TargetDefinition {
+        id: "python.venv",
+        description: "project Python environment",
+        detector: MarkerDetector {
+            marker: "pyproject.toml",
+            directory: ".venv",
+        },
+        class: TargetClass::Irreplaceable,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+    },
+    TargetDefinition {
+        id: "python.requirements-venv",
+        description: "project Python environment",
+        detector: MarkerDetector {
+            marker: "requirements.txt",
+            directory: ".venv",
+        },
+        class: TargetClass::Irreplaceable,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+    },
+    TargetDefinition {
+        id: "gradle.build",
+        description: "Gradle generated build output",
+        detector: MarkerDetector {
+            marker: "build.gradle",
+            directory: "build",
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+    },
+    TargetDefinition {
+        id: "gradle.kotlin-build",
+        description: "Gradle generated build output",
+        detector: MarkerDetector {
+            marker: "build.gradle.kts",
+            directory: "build",
+        },
+        class: TargetClass::Cheap,
+        rebuild_cost_override: None,
+        stale_after_days: 30,
+        children_only: false,
+    },
+    TargetDefinition {
         id: "cargo.target",
         description: "Rust build output",
         detector: MarkerDetector {
@@ -328,6 +412,9 @@ pub enum CandidateSafety {
 /// A detected and sized target candidate.
 #[derive(Debug, Clone, Serialize)]
 pub struct DetectedTarget {
+    /// Structured Cargo ownership from metadata inspection; incomplete shared
+    /// ownership is evidence only and never authorizes cleanup.
+    pub cargo_ownership: Option<CargoOwnership>,
     pub id: String,
     pub provider: ProviderIdentity,
     pub description: String,
@@ -349,6 +436,14 @@ pub struct DetectedTarget {
     pub exclusive_priority: u8,
     pub consequence: String,
     pub evidence: Vec<String>,
+}
+
+/// Owners observed during a bounded, explicit-root Cargo inspection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CargoOwnership {
+    pub target_directory: PathBuf,
+    pub observed_owners: Vec<PathBuf>,
+    pub complete: bool,
 }
 
 /// Structured policy explanation for presentation. The planner and UI share
@@ -771,7 +866,10 @@ pub fn detect_workspace_targets(
     let mut detected = BTreeMap::<PathBuf, DetectedTarget>::new();
     for definition in definitions {
         for (&project, children) in &children_by_name {
-            if !children.contains_key(definition.detector.marker) {
+            if !(children.contains_key(definition.detector.marker)
+                || definition.detector.marker == "*.xcodeproj"
+                    && children.keys().any(|name| name.ends_with(".xcodeproj")))
+            {
                 continue;
             }
             let Some(&candidate) = children.get(definition.detector.directory) else {
@@ -798,6 +896,7 @@ pub fn detect_workspace_targets(
             detected
                 .entry(path.clone())
                 .or_insert_with(|| DetectedTarget {
+                    cargo_ownership: None,
                     id: definition.id.into(),
                     provider: ProviderIdentity::workspace(),
                     description: definition.description.into(),
@@ -937,6 +1036,7 @@ pub fn detect_explicit_path_target(
         )
     };
     DetectedTarget {
+        cargo_ownership: None,
         id,
         provider: ProviderIdentity {
             id: "configuration".into(),
@@ -980,13 +1080,26 @@ fn workspace_consequence(definition: &TargetDefinition) -> &'static str {
         "cargo.target" => "Rust build output will be rebuilt on the next build",
         "node.modules" => "dependencies must be restored by the package manager",
         "node.next" => "Next.js output will be regenerated on the next build",
+        "python.venv" | "python.requirements-venv" => {
+            "Python environments may contain local installs or user data; review individually before permanent removal"
+        }
+        "gradle.build" | "gradle.kotlin-build" | "gradle.cache" | "gradle.kotlin-cache" => {
+            "Gradle will regenerate build/cache output; the next build may be expensive"
+        }
+        "xcode.project-build" => "Xcode project build output will require a rebuild",
         "node.dist" => "distribution output will be regenerated by its build",
         _ => "generated workspace output will need to be recreated",
     }
 }
 
-fn modified_age_days(arena: &Arena, index: NodeIndex, now: u64) -> Option<u64> {
-    let modified = arena.nodes[index.as_usize()].modified_unix_seconds;
+pub(crate) fn modified_age_days(arena: &Arena, index: NodeIndex, now: u64) -> Option<u64> {
+    // Directory mtime alone misses writes to an existing build artifact.
+    let mut stack = vec![index];
+    let mut modified = 0;
+    while let Some(index) = stack.pop() {
+        modified = modified.max(arena.nodes[index.as_usize()].modified_unix_seconds);
+        stack.extend(arena.children(index));
+    }
     u64::try_from(modified)
         .ok()
         .filter(|modified| *modified <= now)

@@ -25,6 +25,8 @@ enum CommandTrust<'a> {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RegistryFile {
+    #[serde(default, rename = "retention")]
+    pub retention: Vec<cleanrs_core::projects::RetentionRule>,
     #[serde(default)]
     pub enable: Vec<String>,
     #[serde(default)]
@@ -75,6 +77,7 @@ pub(crate) struct ReclaimConfig {
 
 #[derive(Debug, Default)]
 pub(crate) struct ResolvedRegistry {
+    pub retention: Vec<cleanrs_core::projects::RetentionRule>,
     pub enabled: BTreeSet<String>,
     pub disabled: BTreeSet<String>,
     pub targets: BTreeMap<String, ConfiguredTarget>,
@@ -91,11 +94,15 @@ impl ResolvedRegistry {
         if let Some(home) = home {
             let user = home.join(".config/cleanrs/targets.toml");
             if user.is_file() {
-                resolved.merge_file(&user, CommandTrust::ImplicitUserConfig)?;
+                resolved.merge_file(&user, CommandTrust::ImplicitUserConfig, home.into())?;
             }
         }
         if let Some(explicit) = explicit {
-            resolved.merge_file(explicit, CommandTrust::ExplicitHash(trusted_explicit_hash))?;
+            resolved.merge_file(
+                explicit,
+                CommandTrust::ExplicitHash(trusted_explicit_hash),
+                home,
+            )?;
         }
         Ok(resolved)
     }
@@ -173,7 +180,12 @@ impl ResolvedRegistry {
         Ok(())
     }
 
-    fn merge_file(&mut self, path: &Path, command_trust: CommandTrust<'_>) -> Result<()> {
+    fn merge_file(
+        &mut self,
+        path: &Path,
+        command_trust: CommandTrust<'_>,
+        home: Option<&Path>,
+    ) -> Result<()> {
         let canonical = path
             .canonicalize()
             .with_context(|| format!("failed to resolve config {}", path.display()))?;
@@ -196,6 +208,23 @@ impl ResolvedRegistry {
                     );
                 }
             }
+        }
+        for mut rule in config.retention {
+            let expanded = expand_home(&rule.path.to_string_lossy(), home);
+            if !expanded.is_absolute()
+                || expanded
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                bail!(
+                    "retention paths must be absolute or home-relative, without ..: {}",
+                    rule.path.display()
+                );
+            }
+            rule.path = expanded.canonicalize().unwrap_or(expanded);
+            self.retention
+                .retain(|old| old.path != rule.path || old.project_only != rule.project_only);
+            self.retention.push(rule);
         }
         for id in config.enable {
             self.disabled.remove(&id);
@@ -279,11 +308,13 @@ impl ResolvedRegistry {
         #[derive(Serialize)]
         struct Export<'a> {
             builtin: &'a [&'a str],
+            retention: &'a [cleanrs_core::projects::RetentionRule],
             sources: &'a [PathBuf],
             target: Vec<&'a ConfiguredTarget>,
         }
         toml::to_string_pretty(&Export {
             builtin: builtin_ids,
+            retention: &self.retention,
             sources: &self.sources,
             target: self.targets.values().collect(),
         })
@@ -397,6 +428,7 @@ fn command_item(
         argv.remove(0);
     }
     DetectedTarget {
+        cargo_ownership: None,
         id: target.id.clone(),
         provider: ProviderIdentity {
             id: "configuration".into(),

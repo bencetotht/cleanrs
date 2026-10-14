@@ -42,6 +42,7 @@ fn estimate() -> ReclaimEstimate {
 }
 fn candidate(root: &Path, name: &str, class: TargetClass) -> DetectedTarget {
     DetectedTarget {
+        cargo_ownership: None,
         id: name.into(),
         provider: ProviderIdentity::workspace(),
         description: name.into(),
@@ -128,6 +129,7 @@ fn fabricated(root: &Path) -> ReviewedPlan {
     }
     let accounting = Arc::new(pipeline::SelectionAccounting::new(arena, true, &targets));
     ReviewedPlan {
+        projects: Default::default(),
         scan_finished: None,
         scan_age_offset: Duration::ZERO,
         accounting,
@@ -542,6 +544,7 @@ fn all_screens_render_semantic_states_and_warnings_without_color() {
             .iter()
             .enumerate()
             .map(|(i, a)| cleanrs_core::journal::JournalAction {
+                evidence: vec![],
                 target_id: a.target.id.clone(),
                 provider_id: a.target.provider.id.clone(),
                 path: a.target.path.clone(),
@@ -628,7 +631,14 @@ fn pipeline_tick_keys_equal_cli_select_and_preserve_policy_eligible_source() {
     );
     // Aged fixture verifies no override on level-eligible manual ticks.
     for name in [".next", "dist"] {
-        let file = std::fs::File::open(root.join("project").join(name)).unwrap();
+        let artifact = root.join("project").join(name);
+        for entry in std::fs::read_dir(&artifact).unwrap() {
+            std::fs::File::open(entry.unwrap().path())
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(40 * 86400))
+                .unwrap();
+        }
+        let file = std::fs::File::open(artifact).unwrap();
         file.set_modified(std::time::SystemTime::now() - Duration::from_secs(40 * 86400))
             .unwrap();
     }
@@ -1799,4 +1809,73 @@ fn cache_write_failure_keeps_sizes_and_reports_session_only_fallback() {
             && message.contains("Disk cache unavailable")
             && message.contains("sizes kept for this session")
     );
+}
+
+#[test]
+fn git_project_selection_review_checks_tracked_paths_without_reading_unselected_source() {
+    let fixture = tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "core.fsmonitor=false",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    std::fs::write(root.join("package.json"), "{}").unwrap();
+    std::fs::write(root.join(".gitignore"), ".next/\n").unwrap();
+    git(&["init", "-q", "--initial-branch=main"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "fixture"]);
+    std::fs::create_dir(root.join(".next")).unwrap();
+    std::fs::write(root.join(".next/output"), "generated output").unwrap();
+    let baseline = pipeline::build_reviewed_plan(
+        worker::plan_request(root.clone(), None, CleanupLevel::Safe, false, None),
+        Arc::new(Quiet),
+    )
+    .unwrap();
+    let key = baseline
+        .targets
+        .iter()
+        .find(|p| p.target.id == "node.next")
+        .unwrap()
+        .candidate_key
+        .clone();
+    let request = || {
+        worker::plan_request(
+            root.clone(),
+            None,
+            CleanupLevel::Safe,
+            false,
+            Some(HashSet::from([key.clone()])),
+        )
+    };
+    let review = pipeline::build_tui_reviewed_plan(request(), Arc::new(Quiet), &baseline).unwrap();
+    assert_eq!(review.actions.len(), 1);
+    let evidence = review.projects.projects[0].git.as_ref().unwrap();
+    assert!(evidence.complete && !evidence.activity_inspected);
+    assert_eq!(review.projects.inspection_commands, 2);
+    git(&["add", "--force", ".next/output"]);
+    let changed = pipeline::build_tui_reviewed_plan(request(), Arc::new(Quiet), &baseline).unwrap();
+    assert!(
+        changed.actions.is_empty(),
+        "new tracked source must drop the old tick"
+    );
+    assert!(root.join(".next/output").exists());
 }

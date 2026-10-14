@@ -65,6 +65,8 @@ enum Commands {
     Doctor(DoctorArgs),
     /// Detect and size cleanup targets without executing anything.
     Targets(TargetArgs),
+    /// Explain project activity, Git state, and ranked artifact recommendations.
+    Projects(TargetArgs),
     /// Plan cleanup, or execute the same reviewed plan with --apply.
     Clean(CleanArgs),
     /// Show cleanup runs and their action-level outcomes.
@@ -101,11 +103,11 @@ struct TargetArgs {
     #[arg(long, value_name = "ID")]
     exclude: Vec<String>,
 
-    /// Show at most N largest targets. Human output defaults to 25; JSON is unlimited.
+    /// Limit targets/projects to N items. Target tables default to 25; project reports and JSON are unlimited.
     #[arg(long, value_name = "N")]
     top: Option<usize>,
 
-    /// Hide targets whose reclaimable ceiling is below this size (for example 10MiB).
+    /// Minimum estimated storage size to display (for example 10MiB).
     #[arg(long, value_parser = parse_size, default_value = "0")]
     min_size: u64,
 
@@ -377,7 +379,8 @@ fn main() -> Result<()> {
         Commands::Scan(args) => run_scan(args),
         Commands::Tui { .. } => unreachable!("TUI dispatched before terminal logging"),
         Commands::Doctor(args) => run_doctor(args),
-        Commands::Targets(args) => run_targets(args),
+        Commands::Targets(args) => run_targets(args, false),
+        Commands::Projects(args) => run_targets(args, true),
         Commands::Clean(args) => run_clean(args),
         Commands::History(args) => run_history(args),
         Commands::TrustConfig(args) => run_trust_config(args),
@@ -400,6 +403,7 @@ struct TargetsOutput {
     hidden: usize,
     default_limit_applied: bool,
     providers: Vec<ProviderStatus>,
+    projects: cleanrs_core::projects::ProjectInventory,
     targets: Vec<DetectedTarget>,
 }
 
@@ -415,12 +419,16 @@ pub(crate) struct CleanOutput {
     pub(crate) selected_provider_actions: usize,
     pub(crate) selected_unknown_actions: usize,
     pub(crate) providers: Vec<ProviderStatus>,
+    pub(crate) projects: cleanrs_core::projects::ProjectInventory,
     pub(crate) targets: Vec<PlannedTarget>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) results: Vec<AppliedActionOutput>,
 }
 
-fn run_targets(args: TargetArgs) -> Result<()> {
+fn run_targets(mut args: TargetArgs, projects_only: bool) -> Result<()> {
+    if projects_only {
+        args.workspace_only = true;
+    }
     if args.top == Some(0) {
         bail!("--top must be at least 1");
     }
@@ -515,6 +523,7 @@ fn run_targets(args: TargetArgs) -> Result<()> {
         && !args.targets_only_cli
         && registry.permits("cargo.target")
         && !registry.targets.contains_key("cargo.target")
+        && !args.exclude.iter().any(|id| id == "cargo.target")
         && (args.only.is_empty() || args.only.iter().any(|id| id == "cargo.target"))
     {
         let cargo_inventory = inspect_cargo_builds(
@@ -547,6 +556,31 @@ fn run_targets(args: TargetArgs) -> Result<()> {
     }
     targets.extend(provider_inventory.items);
     targets = dedupe_inventory_paths(targets);
+    let project_progress = ScanProgressIndicator::create(
+        "project hygiene (bounded Git inspection)",
+        !args.json && stderr_is_terminal(),
+    );
+    let mut projects = cleanrs_core::projects::inspect_projects(
+        &scan,
+        &mut targets,
+        &registry.retention,
+        &SystemProviderHost::project_inspection(),
+        cleanrs_core::projects::InspectionLimits {
+            home: home.clone(),
+            ..Default::default()
+        },
+    );
+    if let Some(progress) = project_progress {
+        progress.finish();
+    }
+    if projects_only {
+        projects
+            .projects
+            .retain(|project| project.usage.sortable_bytes() >= args.min_size);
+        if let Some(top) = args.top {
+            projects.projects.truncate(top);
+        }
+    }
     targets.sort_by(|left, right| {
         std::cmp::Reverse(target_sort_size(left))
             .cmp(&std::cmp::Reverse(target_sort_size(right)))
@@ -567,9 +601,17 @@ fn run_targets(args: TargetArgs) -> Result<()> {
         hidden: total_detected.saturating_sub(targets.len()),
         default_limit_applied,
         providers: provider_inventory.statuses,
+        projects,
         targets,
     };
-    if args.json {
+    if projects_only {
+        if args.json {
+            serde_json::to_writer_pretty(io::stdout().lock(), &output.projects)?;
+            println!();
+        } else {
+            TerminalUi::detect().print_projects(&output.projects);
+        }
+    } else if args.json {
         serde_json::to_writer_pretty(io::stdout().lock(), &output)?;
         println!();
     } else {
@@ -646,6 +688,7 @@ fn run_clean(args: CleanArgs) -> Result<()> {
         selected_provider_actions: plan.selected_provider_actions,
         selected_unknown_actions: plan.selected_unknown_actions,
         providers: plan.providers.clone(),
+        projects: plan.projects.clone(),
         targets: plan.targets.clone(),
         results: Vec::new(),
     };

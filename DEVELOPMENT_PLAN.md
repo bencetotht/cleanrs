@@ -55,15 +55,18 @@ installed versions, so cleanrs initially classifies that mixed action as
 | 1 | Fast read-only scanner and diagnostics | **Useful MVP implemented; performance and UX work remains** |
 | 2 | Developer-storage inventory and cleanup plans | **Complete** |
 | 3 | Cleanup execution and lightweight history | **Complete** |
-| 5A | Interactive TUI: explore, select, clean (pulled forward from Phase 5) | **M0–M5 complete; Phase 4 next** |
-| 4 | Project hygiene and stale-project intelligence | **Next priority** |
-| 5 | Index, scheduling, and remaining ratatui daily-driver work | **Terminal groundwork only** |
+| 5A | Interactive TUI: explore, select, clean (pulled forward from Phase 5) | **M0–M5 complete** |
+| 4 | Project hygiene and stale-project intelligence | **Complete** |
+| 5 | Index, scheduling, and remaining ratatui daily-driver work | **Next priority; terminal groundwork and static TUI cache exist** |
+| 6 | Extensibility and optional portability | **Deferred** |
 
 **Correction (2026-10-13):** Phase 4 was previously the next priority. The
 interactive TUI was split out of Phase 5 as Phase 5A and moved ahead of it;
 the reasons are recorded in the Phase 5A decision record. Phase numbers are
 kept stable so existing references remain valid.
-| 6 | Extensibility and optional portability | **Deferred** |
+
+**Correction (2026-10-14):** Phase 4 is now implemented. Phase 5 is the next
+feature boundary; the earlier “Phase 4 next” status is superseded.
 
 Phases define dependency order, but small supporting improvements may land when
 they directly unblock the active phase. A phase does not need laboratory-grade
@@ -1376,16 +1379,84 @@ Rust 1.85 compatibility is checked by the existing CI MSRV job.
 **Goal:** find storage that generic cache commands cannot understand because its
 risk depends on project state.
 
-### Current state
+### Implemented (2026-10-14)
 
-- Marker-based workspace detection exists for several common artifact names.
-- The Phase 2 Cargo scanner resolves workspace roots and target directories,
-  collapses members, and uses a 14-day newest-manifest/build-artifact threshold.
-- Custom/shared target directories retain observed owner evidence but are
-  conservatively refused because a single explicit scan cannot yet prove
-  complete ownership.
-- Git state, repository-level sleeper-project evidence, and individually safe
-  Python-environment recommendations are not implemented.
+- `cleanrs-core/src/projects.rs` provides a shared, read-only project inventory.
+  `cleanrs projects [PATH] [--json]` exposes ranked project/worktree reports;
+  `targets` and `clean` JSON also include them. `projects` skips machine-wide
+  providers. Human output uses the existing TTY/NO_COLOR tables and shows
+  attributed storage, activity, Git flags, intervals/confidence, exact operations,
+  rebuild consequences, supporting evidence and weakening evidence.
+- Discover repositories, linked worktrees and ecosystem markers only under the
+  explicit root. A containing repository outside that root remains unknown.
+  Nested packages inherit repository evidence; active sibling worktrees weaken
+  dormancy, and out-of-scope worktrees prevent a dormant conclusion.
+- Git inspection distinguishes dirty, untracked, remote-less, no-upstream,
+  synchronized, unpushed, behind and diverged states. It records local commit
+  time and worktree relationships without fetching. Synchronization describes
+  local refs, not live remote state. Commands use argv arrays, disable fsmonitor,
+  content filters, optional locks and lazy fetching, refuse external config
+  includes/partial clones, and discard inherited Git redirection/config variables.
+  Filtered repositories may conservatively appear dirty. Unsafe, dataless,
+  symlinked, externally referenced, or incomplete admin metadata never authorizes
+  cleanup.
+- Repository inspection is sequential and bounded: at most 128 repositories,
+  768 commands and a 15-second budget checked between commands. Each project
+  command has a 2-second timeout and 4 MiB output cap. Omitted/failed inspection
+  remains visible and cannot be mistaken for a clean repository.
+- Project activity combines newest source/manifest/dependency-lockfile metadata,
+  commit time, newest artifact activity and related worktrees. Dependency
+  lockfiles are metadata signals, not proof that a process is running. No
+  arbitrary source contents are parsed by cleanrs; native Git determines
+  working-tree state. Repositories with observed dataless/cloud content are
+  refused before invoking status. Dormancy defaults to 90 days; the existing
+  14-day Cargo artifact threshold remains separate. Future timestamps, local
+  work and recent output weaken inactivity; no report calls a repository
+  abandoned from mtime alone.
+- Existing Node/Cargo targets are joined by `.venv` beside `pyproject.toml` or
+  `requirements.txt`, Gradle `build`/`.gradle` beside Groovy/Kotlin manifests,
+  and project-local `build` beside an Xcode project. Environments are user data
+  and require individual explicit selection plus interactive confirmation; no
+  severity level selects them. Reports distinguish project dependency copies,
+  environments, generated output and local caches from machine-wide provider
+  stores. Repository/worktree reports have no automatic deletion operation.
+- Artifact age now uses the newest entry in its tree rather than directory
+  mtime alone. Dirty/untracked/unpushed/remote-less source does not prevent
+  independently generated stale build cleanup. Tracked source inside an
+  artifact path does: Git checks artifact pathspecs and retains only vetoed
+  roots, not source filenames. Incomplete repository inspection also refuses
+  cleanup. The same guard runs again immediately before an artifact action.
+  Selection-scoped TUI review checks admin metadata and tracked paths without
+  running status over unselected source; activity is explicitly uninspected.
+- Cargo candidates retain structured `CargoOwnership`: target directory,
+  observed workspace owners and completeness. Shared/custom output is reported
+  once, with references from other owners, newest-owner manifest activity and
+  conservative retention across owners. Incomplete ownership remains refused,
+  including manual selection; one dormant owner cannot authorize a shared
+  clean. Marker-only Cargo findings cannot substitute for unavailable metadata.
+  Native cleanup revalidates frozen metadata resolution, executable version,
+  target identity, cloud state, mount boundaries and coverage before running.
+- Trusted user/explicit TOML accepts `[[retention]]` with absolute or `~/` paths,
+  `project_only`, `artifact_days`, `dormant_days` and `keep`. Exact project rules
+  override root rules; the most-specific root wins otherwise. Explicit config
+  overrides identical user rules. `keep` requires explicit naming even with
+  `--ignore-staleness`. Working-directory policy is never loaded. Target evidence
+  is retained in the backward-compatible history journal.
+- Tests use temporary repositories, worktrees, provider stubs, homes, policy
+  files and cache/build trees. They cover all repository states, recent source
+  and existing-file writes, unknown/limited inspection, cloud/dataless metadata,
+  fsmonitor refusal, tracked-file changes after review, shared/active Cargo
+  owners and changed target resolution, retention precedence/keep, Python
+  user-data policy, and human/JSON CLI parity. Existing execution fixtures now
+  resolve their sandbox tools through PATH so they also run on NixOS.
+- A reproducible multi-repository benchmark and measured Linux baseline live in
+  [docs/benchmarks-phase4.md](docs/benchmarks-phase4.md). The fixture is generated
+  in a unique temporary directory; it never scans or cleans the real home.
+
+**Correction:** the previous state said Git/project intelligence was absent.
+It is implemented above. Shared/custom Cargo ownership is deliberately still
+conservative: observing owners in one root does not prove there are none
+outside it. This is a safety refusal, not permission to guess ownership.
 
 ### Work
 
@@ -1417,22 +1488,34 @@ risk depends on project state.
 
 ### Practical completion criteria
 
-- [ ] Dirty, untracked, unpushed, remote-less, and synchronized repository
+- [x] Dirty, untracked, unpushed, remote-less, and synchronized repository
       fixtures are classified distinctly.
-- [ ] Large project-local artifacts are attributed to their project and native
+- [x] Large project-local artifacts are attributed to their project and native
       ecosystem.
-- [ ] Cargo sleeper-project recommendations combine Phase 2 build age with
+- [x] Cargo sleeper-project recommendations combine Phase 2 build age with
       repository activity and never label a project abandoned from mtime alone.
-- [ ] Shared Cargo build directories retain owner evidence; one dormant project
+- [x] Shared Cargo build directories retain owner evidence; one dormant project
       cannot authorize cleanup that disrupts an active or out-of-scope owner.
-- [ ] A stale Cargo build can be proposed for cleanup without proposing
+- [x] A stale Cargo build can be proposed for cleanup without proposing
       repository deletion, including for dirty, untracked, remote-less, and
       unpushed repository fixtures.
-- [ ] Shared cache/build directories are counted once.
-- [ ] No severity level selects repository or environment user data.
-- [ ] Recommendations explain the evidence and exact proposed action.
-- [ ] Scanning many repositories has a recorded performance baseline and avoids
+- [x] Shared cache/build directories are counted once.
+- [x] No severity level selects repository or environment user data.
+- [x] Recommendations explain the evidence and exact proposed action.
+- [x] Scanning many repositories has a recorded performance baseline and avoids
       spawning an unbounded number of subprocesses.
+
+
+Validation on this Linux host: `cargo test --workspace --no-fail-fast` passes
+162 tests (55 binary, 45 CLI, 62 core); `cargo clippy --workspace --all-targets
+-- -D warnings`, `cargo fmt --all -- --check` and `git diff --check` pass. The
+`projects --help` command was smoke-checked. macOS runtime/SDK validation is
+unavailable here; benchmark results are explicitly Linux-only.
+
+**Status: complete.** Phase 5 owns incremental indexing, scheduling and richer
+TUI overview/project-evidence panes. Optional live-process inspection and
+additional ecosystem detectors can be added when they have a verified safety
+contract; no current recommendation infers liveness from a lockfile.
 
 ---
 
@@ -1563,9 +1646,11 @@ Work should continue in this order:
 1. **Phase 5A M0–M5 complete:** shared cleanup pipeline, per-candidate
    selection, browser/targets/review/run/results, cached totals, safety parity,
    freshness, terminal polish and documentation are implemented (details above).
-2. Begin **Phase 4 project hygiene** using the shared pipeline: Cargo
-   shared-target ownership and project-activity evidence first, then repository
-   state, worktree, lockfile and process-activity evidence.
+2. **Phase 4 complete:** project/Git/worktree evidence, structured Cargo owners,
+   retention rules, explainable artifact recommendations, cleanup revalidation,
+   sandbox fixtures and a recorded performance baseline are implemented.
+   Begin **Phase 5** incremental indexing, scheduling and remaining TUI daily-
+   driver work using the existing shared pipeline.
 3. **Resolved Cargo observation (2026-10-13):** stale `cargo.target` actions
    intentionally require aggressive severity; the targets UI now says “needs
    aggressive” at lower levels. Fourteen days is an artifact threshold, not
@@ -1581,4 +1666,4 @@ Work should continue in this order:
 
 Phases 0–3 now provide accounting, read-only inventory, immutable cleanup plans,
 guarded execution, persistent config trust, and lightweight history. Phase 5A
-(the interactive TUI) now completes the next feature boundary; Phase 4 is next.
+(the interactive TUI) and Phase 4 project hygiene are complete; Phase 5 is next.

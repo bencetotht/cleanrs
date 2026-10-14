@@ -2,15 +2,16 @@
 
 Storage usage analyzer and cleaner for developers, written in Rust. Fully transparent.
 
-> **Status: Phases 0–3 implemented.** The read-only `scan`, `doctor`, and
+> **Status: Phases 0–4 and Phase 5A implemented.** The read-only `scan`, `doctor`, and
 > workspace/provider `targets` commands are joined by immutable cleanup plans,
 > guarded `clean --apply`, persistent command-config trust, and action-level
 > `history`. Direct deletion is descriptor-relative and provider commands are
 > revalidated before execution. `cleanrs tui` now supports progressive sizes,
 > navigation, accounting details, scoped target selection, and reviewed cleanup
-> through the same guarded pipeline. Phase 5A polish comes next, followed by
-> Phase 4 project hygiene; deeper snapshot
-> and File Provider research remains deferred unless it enables a concrete
+> through the same guarded pipeline. `cleanrs projects` adds Git/worktree state,
+> activity evidence, retention rules and artifact recommendations. Phase 5
+> indexing, scheduling and the remaining TUI overview work come next. Deeper
+> snapshot and File Provider research remain deferred unless they enable a concrete
 > capability. See
 > [the findings](docs/findings-phase0.md), [VISION.md](VISION.md), and the
 > explicit progress boundary in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
@@ -137,6 +138,7 @@ establish, before anything is built on top of it.
 cleanrs scan [PATH]      One-shot analysis (--json, --reclaimable, --explain)
 cleanrs doctor           Reconcile container state; report the unexplained gap
 cleanrs targets [PATH]   List workspace targets and machine-wide provider actions
+cleanrs projects [PATH]  Explain project/Git activity and artifact recommendations
 cleanrs clean [PATH]     Plan cleanup; --select PATH picks items; --apply executes
 cleanrs history          Action outcomes and evidence from applied runs
 cleanrs trust-config     Trust/list/revoke an explicit command config by hash
@@ -199,6 +201,7 @@ cargo build --release
 ./target/release/cleanrs doctor
 ./target/release/cleanrs doctor --scan .
 ./target/release/cleanrs targets .
+./target/release/cleanrs projects .
 ./target/release/cleanrs clean . --level standard
 ./target/release/cleanrs history
 ```
@@ -295,6 +298,68 @@ override. Every final TUI tick, including a preset pick, is journalled as manual
 `doctor --scan PATH` reconciles one explicit scan scope against Data-volume
 usage and labels the remainder as unattributed. Without `--scan`, it stays cheap
 and reports the path attribution as unknown rather than inventing a number.
+
+### Project hygiene
+
+`cleanrs projects PATH` is read-only. It ranks project/worktree findings by
+inactivity evidence and potential artifact cleanup, showing attributed storage,
+Git state, evidence, reclaimable intervals/confidence, exact proposed actions
+and rebuild consequences. `--json` provides the full report; `--top N` and
+`--min-size SIZE` filter projects. The same evidence enriches `targets` and
+`clean` plans, including the TUI's shared planning pipeline.
+
+Git inspection disables fsmonitor and repository content filters and refuses
+external config includes/partial clones. Filtered repositories may appear dirty
+conservatively. It distinguishes dirty/untracked work, missing remotes/upstreams,
+unpushed commits, behind/diverged branches and synchronization against local
+remote refs. It never fetches. Source/manifest/dependency-lockfile timestamps,
+recent commits, newest build output and sibling worktree activity contribute
+to the explanation. Dormancy defaults to 90 days; Cargo's 14-day artifact
+threshold does not mean that the repository is abandoned. Old, clean or pushed
+source is never permission to delete a repository, and project reports do not
+create repository-deletion actions.
+
+Generated artifacts can be cleaned while dirty or unpushed source stays intact.
+Tracked files inside an artifact directory refuse cleanup, and the check runs
+again before execution. Shared/custom Cargo directories retain observed owners,
+are counted once, and remain refused while complete ownership is unproven.
+Cargo metadata resolution and target safety are revalidated before its native
+cleanup command. Node dependencies, Cargo output, Gradle build/cache output,
+project-local Xcode output and Python `.venv` environments are attributed
+separately. Python environments may contain local installs/user data: they need
+individual explicit selection and interactive confirmation, regardless of level.
+
+Retention policy lives in the existing user or explicitly named TOML config:
+
+```toml
+[[retention]]
+path = "~/Developer"
+artifact_days = 30
+dormant_days = 120
+
+[[retention]]
+path = "~/Developer/expensive-rust-project"
+project_only = true
+artifact_days = 180
+dormant_days = 365
+keep = true
+```
+
+Exact project rules override root rules; otherwise the most-specific root wins.
+`keep` prevents selection by a level even with `--ignore-staleness`; an explicit
+`--select PATH` still requires review. Policy is never discovered from the
+working directory. Reports and history retain the policy/ownership evidence.
+
+Inspection is sequential and bounded to 128 repositories/768 Git commands,
+with a 15-second budget checked between commands and a 2-second timeout/4 MiB
+output limit per command. Unsafe metadata, out-of-scope repositories/worktrees,
+failures and exhausted budgets are visible as uncertainty. Unknown repository
+inspection refuses artifact cleanup; out-of-scope sibling worktrees prevent a
+dormancy conclusion. No live-process state is inferred from lockfile age.
+See [the fixture benchmark](docs/benchmarks-phase4.md) for measured costs.
+
+**Correction:** the earlier status still described Phase 5A polish and Phase 4
+as upcoming. Both feature boundaries are now complete; Phase 5 is next.
 
 ### Interactive cleanup
 

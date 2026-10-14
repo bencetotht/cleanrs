@@ -7,6 +7,7 @@ pub mod execution;
 pub mod fs;
 pub mod index;
 pub mod journal;
+pub mod projects;
 pub mod providers;
 pub mod targets;
 

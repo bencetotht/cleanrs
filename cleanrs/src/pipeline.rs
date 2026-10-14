@@ -114,6 +114,7 @@ pub(crate) struct ReviewedPlan {
     pub(crate) scan_age_offset: std::time::Duration,
     pub(crate) coverage_complete: bool,
     pub(crate) providers: Vec<ProviderStatus>,
+    pub(crate) projects: cleanrs_core::projects::ProjectInventory,
     pub(crate) selected_provider_actions: usize,
     pub(crate) selected_unknown_actions: usize,
     pub(crate) run_id: String,
@@ -491,6 +492,7 @@ fn build_plan(
         && !request.targets_only_cli
         && registry.permits("cargo.target")
         && !registry.targets.contains_key("cargo.target")
+        && !request.exclude.iter().any(|id| id == "cargo.target")
         && (request.only.is_empty() || request.only.iter().any(|id| id == "cargo.target"))
     {
         let cargo_inventory = inspect_cargo_builds_with_progress(
@@ -525,6 +527,24 @@ fn build_plan(
     let provider_count = provider_inventory.items.len();
     detected.extend(provider_inventory.items);
     detected = dedupe_inventory_paths(detected);
+    observer.on_event(PlanEvent::PhaseStarted {
+        phase: "project hygiene",
+    });
+    let projects = cleanrs_core::projects::inspect_projects(
+        &scan,
+        &mut detected,
+        &registry.retention,
+        &SystemProviderHost::project_inspection(),
+        cleanrs_core::projects::InspectionLimits {
+            review_only: detection.is_some(),
+            home: home.clone(),
+            ..Default::default()
+        },
+    );
+    observer.on_event(PlanEvent::PhaseFinished {
+        phase: "project hygiene",
+        count: projects.projects.len(),
+    });
     let level = request.level;
     observer.on_event(PlanEvent::PhaseFinished {
         phase: "provider inspection",
@@ -630,6 +650,7 @@ fn build_plan(
         scan_age_offset: std::time::Duration::ZERO,
         coverage_complete,
         providers: provider_inventory.statuses,
+        projects,
         selected_provider_actions: summary.provider_actions,
         selected_unknown_actions: summary.unknown_actions,
         run_id: new_run_id(),
@@ -815,6 +836,13 @@ pub(crate) fn execute_reviewed_plan(
                 stderr_summary: None,
                 error: Some("stopped by user".into()),
             }
+        } else if let Err(reason) = cleanrs_core::projects::revalidate_artifact_repository(
+            &action.target,
+            &plan.scope,
+            home,
+            &SystemProviderHost::project_inspection(),
+        ) {
+            ActionResult::validation_abort(reason)
         } else {
             match &action.target.operation {
                 PlannedOperation::DirectDelete {
@@ -831,7 +859,26 @@ pub(crate) fn execute_reviewed_plan(
                     Err(reason) => ActionResult::validation_abort(reason),
                 },
                 PlannedOperation::Command { command } => {
-                    if let Err(reason) = revalidate_provider(&action.target) {
+                    let cargo_preflight = if action.target.id == "cargo.target" {
+                        action
+                            .target
+                            .path
+                            .as_deref()
+                            .ok_or_else(|| "Cargo target has no path".to_owned())
+                            .and_then(|path| {
+                                plan.accounting
+                                    .identity(&CandidateKey::from_target(&action.target))
+                                    .ok_or_else(|| "Cargo target identity unavailable".to_owned())
+                                    .and_then(|identity| {
+                                        validate_direct_preflight(path, identity, home)
+                                    })
+                            })
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(reason) =
+                        cargo_preflight.and_then(|()| revalidate_provider(&action.target))
+                    {
                         ActionResult::validation_abort(reason)
                     } else if let Some(error) = &action.executable_identity_error {
                         ActionResult::validation_abort(format!(
@@ -970,6 +1017,18 @@ fn revalidate_provider(target: &DetectedTarget) -> Result<(), String> {
         return Ok(());
     }
     if target.provider.id == "cargo" {
+        let manifest = target
+            .project_root
+            .as_ref()
+            .ok_or("Cargo workspace missing")?
+            .join("Cargo.toml");
+        ensure_no_symlink_ancestors(&manifest)?;
+        let metadata = NativeFileSystem
+            .metadata(&manifest)
+            .map_err(|e| e.to_string())?;
+        if metadata.kind != NodeKind::File || metadata.flags.contains(NodeFlags::DATALESS) {
+            return Err("Cargo manifest is unsafe or dataless".into());
+        }
         let executable = target
             .provider
             .executable
@@ -987,6 +1046,7 @@ fn revalidate_provider(target: &DetectedTarget) -> Result<(), String> {
         {
             return Err("Cargo provider version changed after planning".into());
         }
+        cleanrs_core::providers::revalidate_cargo_build(target, &SystemProviderHost::default())?;
         return Ok(());
     }
     let selected = HashSet::from([target.id.clone()]);
@@ -1028,6 +1088,7 @@ fn journal_action(target: &DetectedTarget, source: Option<&SelectionSource>) -> 
             UsageEstimate::Unknown { .. } => (None, None, None, None),
         };
     JournalAction {
+        evidence: target.evidence.clone(),
         target_id: target.id.clone(),
         provider_id: target.provider.id.clone(),
         path: target.path.clone(),

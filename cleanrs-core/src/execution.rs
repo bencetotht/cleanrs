@@ -745,17 +745,22 @@ mod tests {
     #[test]
     fn symlinked_executable_entry_is_pinned_with_its_resolved_target() {
         let fixture = tempdir().unwrap();
-        let executable = fixture.path().join("provider-real");
+        // Use an existing interpreter so the identity fixture does not depend
+        // on writing a new executable while parallel process tests run.
+        let executable = std::path::PathBuf::from("/bin/sh");
         let entry = fixture.path().join("provider");
         let marker = fixture.path().join("marker");
-        fs::write(&executable, format!("#!/bin/sh\ntouch {:?}\n", marker)).unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         std::os::unix::fs::symlink(&executable, &entry).unwrap();
         let planned = executable_identity(&entry).unwrap();
         let result = execute_command(
             &CommandSpec {
                 executable: entry,
-                args: Vec::new(),
+                args: vec![
+                    "-c".into(),
+                    ": > \"$1\"".into(),
+                    "fixture".into(),
+                    marker.display().to_string(),
+                ],
                 environment: BTreeMap::new(),
             },
             planned,

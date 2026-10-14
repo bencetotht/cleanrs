@@ -1,21 +1,24 @@
 # cleanrs — Vision & Design
 
-> **Status:** design reference with Phases 0–3 and Phase 5A implemented: filesystem and
+> **Status:** design reference with Phases 0–4 and Phase 5A implemented: filesystem and
 > accounting foundations, read-only inventory/planning, guarded cleanup
-> execution, persistent command-config trust, lightweight history, and interactive cleanup.
+> execution, persistent command-config trust, lightweight history, interactive cleanup,
+> and project/Git/worktree hygiene with retention and artifact recommendations.
 > Empirical results and unresolved gates are tracked in
 > [docs/findings-phase0.md](docs/findings-phase0.md). This file remains the
 > reference for what cleanrs is, why it exists, and how it should be built.
 > The implementation roadmap now prioritizes fast developer-storage inventory,
-> native cleanup orchestration, project hygiene, scheduling, indexing, and the
-> TUI. Deeper APFS research is pursued when it enables those workflows rather
+> native cleanup orchestration, scheduling, indexing, and the remaining TUI
+> overview work. Deeper APFS research is pursued when it enables those workflows rather
 > than acting as a release gate.
 >
 > **Claim discipline:** every quantitative statement in this document carries a
 > label — `[ref]` external reference, `[exp]` preliminary experiment, `[target]`
 > a goal to design toward, `[hyp]` a hypothesis requiring validation. Sources
-> are listed in §16. Nothing here has been measured by this project, because
-> this project has no code yet.
+> are listed in §16. **Correction:** the earlier “no code/no measurements”
+> statement is obsolete. Implementations and measured fixture baselines are
+> recorded in DEVELOPMENT_PLAN.md and docs/; aspirational claims below retain
+> their original labels.
 
 ---
 
@@ -596,6 +599,43 @@ This baseline also imposes four cross-provider requirements:
 
 ---
 
+### 7.4 Project hygiene (Phase 4 implementation)
+
+`projects [PATH]` inventories explicit-root repositories/worktrees and their
+project-local artifacts. Git status distinguishes dirty/untracked, remote-less,
+no-upstream, synchronized, unpushed, behind and diverged states; synchronization
+is against local refs and never triggers a fetch. Source/manifest/dependency-
+lockfile metadata, commit time, artifact activity and related worktrees support
+or weaken inactivity recommendations. Directory mtime alone is insufficient.
+Dormancy and artifact retention use separate thresholds; neither implies that
+source may be deleted. Reports identify large inactive projects/worktrees but
+create no repository-deletion action.
+
+The inventory enriches the existing CLI/TUI planning pipeline. Dirty or unpushed
+source can coexist with removable generated output, but tracked source inside
+an artifact root refuses cleanup. Repository inspection is bounded and refuses
+unknown/unsafe metadata; cloud/dataless state, symlinks and out-of-scope Git
+admin references cannot silently authorize commands. Git inspection disables
+fsmonitor, configured content filters, optional locks and lazy fetching and
+removes inherited Git overrides; external config includes are refused.
+Tracked-source protection is repeated before an artifact action.
+
+Cargo output retains its observed workspace owners and completeness, is counted
+once, and stays refused for incomplete shared/custom ownership. Native cleanup
+revalidates metadata resolution and filesystem identity/safety. Project-local
+Node dependency copies, Gradle output/cache, Xcode build output and Python
+`.venv` environments remain distinct from provider stores. Python environments
+are conservatively user data requiring individual naming and confirmation.
+
+Trusted user/explicit configuration accepts per-root/project `[[retention]]`
+rules (`path`, `project_only`, `artifact_days`, `dormant_days`, `keep`). Exact
+project policy wins, otherwise the most-specific root wins. `keep` is an
+explicit-selection boundary even when age filtering is disabled. Recommendations
+show intervals/confidence, supporting and weakening evidence, the exact proposed
+operation and rebuild consequence; history preserves that evidence. Dependency
+lockfile timestamps never prove process liveness. Richer TUI project panes,
+indexing and scheduled maintenance remain Phase 5 work.
+
 ## 8. Reclaiming space safely
 
 ### 8.1 Trash does not reclaim storage
@@ -1040,6 +1080,7 @@ cleanrs tui  [PATH]           Browse storage, select targets, review and run cle
                               Working directory default; y on review confirms.
 cleanrs doctor                Reconcile container state; report unexplained gap.
                               --container <id> --all-containers
+cleanrs projects [PATH]       Explain project/Git activity and artifact recommendations.
 cleanrs targets               List detected targets with sizes and confidence.
                               --only --exclude --target... --export
 cleanrs clean                 Reclaim space. Dry-run by DEFAULT.

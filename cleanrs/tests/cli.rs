@@ -5,6 +5,33 @@ use std::process::Command;
 
 use tempfile::tempdir;
 
+// Resolve fixture tools before tests narrow PATH to stub provider directories.
+// macOS uses /usr/bin and /bin; NixOS deliberately does not provide those paths.
+fn test_tool(name: &str) -> String {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("fixture tool {name} missing from PATH"))
+        .display()
+        .to_string()
+}
+
+fn rewrite_fixture_tools(path: &std::path::Path) {
+    let mut text = fs::read_to_string(path).unwrap();
+    for tool in ["rmdir", "touch", "false", "rm", "mv", "mkdir"] {
+        for prefix in ["/usr/bin/", "/bin/"] {
+            text = text.replace(
+                &format!("{prefix}{tool}"),
+                &format!("__CLEANRS_FIXTURE_{tool}__"),
+            );
+        }
+    }
+    for tool in ["rmdir", "touch", "false", "rm", "mv", "mkdir"] {
+        text = text.replace(&format!("__CLEANRS_FIXTURE_{tool}__"), &test_tool(tool));
+    }
+    fs::write(path, text).unwrap();
+}
+
 #[test]
 fn scan_json_is_machine_readable_and_defaults_to_allocated() {
     let fixture = tempdir().unwrap();
@@ -517,6 +544,7 @@ esac
     .unwrap();
     let mut permissions = fs::metadata(&cargo).unwrap().permissions();
     permissions.set_mode(0o755);
+    rewrite_fixture_tools(&cargo);
     fs::set_permissions(&cargo, permissions).unwrap();
     bin
 }
@@ -553,6 +581,7 @@ fi
     .unwrap();
     let mut permissions = fs::metadata(&brew).unwrap().permissions();
     permissions.set_mode(0o755);
+    rewrite_fixture_tools(&brew);
     fs::set_permissions(&brew, permissions).unwrap();
     bin
 }
@@ -678,6 +707,7 @@ fi
         ),
     )
     .unwrap();
+    rewrite_fixture_tools(&brew);
     fs::set_permissions(&brew, fs::Permissions::from_mode(0o755)).unwrap();
     let state = fixture.path().join("state");
     let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
@@ -748,6 +778,7 @@ fi
         ),
     )
     .unwrap();
+    rewrite_fixture_tools(&brew);
     fs::set_permissions(&brew, fs::Permissions::from_mode(0o755)).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
         .args([
@@ -1047,11 +1078,8 @@ reclaim = { method = "run", argv = ["printf", "never executed"] }
 fn cli_command_target_preserves_json_argv_without_executing_it() {
     let fixture = tempdir().unwrap();
     let marker = fixture.path().join("must-not-exist");
-    let argv = serde_json::to_string(&vec![
-        "/usr/bin/touch".to_string(),
-        marker.display().to_string(),
-    ])
-    .unwrap();
+    let argv =
+        serde_json::to_string(&vec![test_tool("touch"), marker.display().to_string()]).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
         .args([
             "targets",
@@ -1191,11 +1219,8 @@ fn ad_hoc_argv_executes_without_a_shell_and_appears_in_history() {
     let fixture = tempdir().unwrap();
     let marker = fixture.path().join("command-ran");
     let state = fixture.path().join("state");
-    let argv = serde_json::to_string(&vec![
-        "/usr/bin/touch".to_string(),
-        marker.display().to_string(),
-    ])
-    .unwrap();
+    let argv =
+        serde_json::to_string(&vec![test_tool("touch"), marker.display().to_string()]).unwrap();
     let apply = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
         .args([
             "clean",
@@ -1232,7 +1257,7 @@ fn ad_hoc_argv_executes_without_a_shell_and_appears_in_history() {
         "snapshots must collapse by run ID"
     );
     assert_eq!(json[0]["actions"][0]["status"], "success");
-    assert_eq!(json[0]["actions"][0]["argv"][0], "/usr/bin/touch");
+    assert_eq!(json[0]["actions"][0]["argv"][0], test_tool("touch"));
 }
 
 #[test]
@@ -1240,12 +1265,9 @@ fn partial_command_failure_continues_and_is_journalled() {
     let fixture = tempdir().unwrap();
     let marker = fixture.path().join("second-command-ran");
     let state = fixture.path().join("state");
-    let failing = serde_json::to_string(&vec!["/usr/bin/false"]).unwrap();
-    let succeeding = serde_json::to_string(&vec![
-        "/usr/bin/touch".to_string(),
-        marker.display().to_string(),
-    ])
-    .unwrap();
+    let failing = serde_json::to_string(&vec![test_tool("false")]).unwrap();
+    let succeeding =
+        serde_json::to_string(&vec![test_tool("touch"), marker.display().to_string()]).unwrap();
     let apply = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
         .args([
             "clean",
@@ -1299,6 +1321,7 @@ fn filesystem_replacement_abort_is_partial_and_journalled() {
         ),
     )
     .unwrap();
+    rewrite_fixture_tools(&replacer);
     fs::set_permissions(&replacer, fs::Permissions::from_mode(0o755)).unwrap();
     let config = scope.join("targets.toml");
     fs::write(
@@ -1405,6 +1428,7 @@ reclaim = {{ method = "run", argv = ["/usr/bin/touch", {:?}] }}
         ),
     )
     .unwrap();
+    rewrite_fixture_tools(&config);
     let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
         .args([
             "clean",
@@ -1673,4 +1697,141 @@ fn tui_rejects_non_tty_before_touching_terminal_modes() {
         output.stdout.is_empty(),
         "must not enter the alternate screen"
     );
+}
+
+#[test]
+fn projects_reports_artifacts_and_evidence_without_executing_or_loading_cwd_policy() {
+    let fixture = tempdir().unwrap();
+    let project = fixture.path().join("project");
+    fs::create_dir_all(project.join(".next")).unwrap();
+    fs::create_dir(project.join(".venv")).unwrap();
+    fs::write(project.join("package.json"), "{}").unwrap();
+    fs::write(project.join("pyproject.toml"), "[project]").unwrap();
+    fs::write(project.join(".next/output"), "generated").unwrap();
+    fs::write(
+        project.join("targets.toml"),
+        "this is invalid and must never load",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args(["projects", ".", "--json"])
+        .current_dir(&project)
+        .env("HOME", fixture.path().join("home"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["projects"].as_array().unwrap().len(), 1);
+    let artifacts = json["projects"][0]["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 2);
+    assert!(
+        artifacts
+            .iter()
+            .all(|a| a["target"]["usage"]["reclaimable"]["confidence"].is_string())
+    );
+    assert!(
+        artifacts
+            .iter()
+            .any(|a| a["ecosystem"] == "python" && a["recommended"] == false)
+    );
+    assert!(project.join(".next/output").exists());
+    let human = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+        .args(["projects", project.to_str().unwrap()])
+        .env("HOME", fixture.path().join("home"))
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        human.contains("ACTIVITY")
+            && human.contains("ATTRIBUTED")
+            && human.contains("consequence:")
+    );
+    assert!(!human.contains('\u{1b}'));
+}
+
+#[test]
+fn project_retention_is_shared_by_targets_and_clean_and_keep_survives_ignore_staleness() {
+    let fixture = tempdir().unwrap();
+    let project = fixture.path().join("project");
+    fs::create_dir_all(project.join(".next")).unwrap();
+    fs::write(project.join("package.json"), "{}").unwrap();
+    fs::write(project.join(".next/output"), "generated").unwrap();
+    let config = fixture.path().join("policy.toml");
+    fs::write(
+        &config,
+        format!(
+            "[[retention]]\npath = {:?}\nartifact_days = 0\ndormant_days = 180\nkeep = true\n",
+            project.display().to_string()
+        ),
+    )
+    .unwrap();
+    let command = |subcommand: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cleanrs"));
+        cmd.arg(subcommand)
+            .arg(&project)
+            .arg("--workspace-only")
+            .arg("--config")
+            .arg(&config)
+            .arg("--json")
+            .env("HOME", fixture.path().join("home"));
+        cmd
+    };
+    let targets = command("targets").output().unwrap();
+    assert!(
+        targets.status.success(),
+        "{}",
+        String::from_utf8_lossy(&targets.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&targets.stdout).unwrap();
+    assert_eq!(json["projects"]["projects"][0]["protected"], true);
+    assert_eq!(json["targets"][0]["stale_after_days"], 0);
+    let clean = command("clean")
+        .arg("--ignore-staleness")
+        .arg("--level")
+        .arg("aggressive")
+        .output()
+        .unwrap();
+    assert!(clean.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    assert_eq!(json["selected_targets"], 0);
+    let manual = command("clean")
+        .arg("--select")
+        .arg(project.join(".next"))
+        .output()
+        .unwrap();
+    assert!(manual.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&manual.stdout).unwrap();
+    assert_eq!(json["selected_targets"], 1);
+    assert_eq!(json["targets"][0]["selection"]["source"]["kind"], "manual");
+    assert!(project.join(".next/output").exists());
+}
+
+#[test]
+fn retention_rejects_relative_paths_parent_traversal_and_unknown_fields() {
+    let fixture = tempdir().unwrap();
+    let config = fixture.path().join("policy.toml");
+    for text in [
+        "[[retention]]\npath = 'relative'\nartifact_days = 14\n",
+        "[[retention]]\npath = '/tmp/../'\nartifact_days = 14\n",
+        "[[retention]]\npath = '/tmp'\nartifact_days = 14\nunknown = true\n",
+    ] {
+        fs::write(&config, text).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+            .arg("projects")
+            .arg(fixture.path())
+            .arg("--config")
+            .arg(&config)
+            .arg("--json")
+            .env("HOME", fixture.path().join("home"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted invalid policy: {text}");
+    }
 }

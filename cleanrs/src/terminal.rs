@@ -268,6 +268,115 @@ impl TerminalUi {
         }
     }
 
+    pub(crate) fn print_projects(&self, inventory: &cleanrs_core::projects::ProjectInventory) {
+        println!(
+            "{}",
+            self.heading("cleanrs projects — read-only recommendations")
+        );
+        let mut table = self.table();
+        table.set_header([
+            "PROJECT",
+            "ATTRIBUTED",
+            "ACTIVITY",
+            "GIT",
+            "INACTIVITY",
+            "ARTIFACTS",
+        ]);
+        for project in &inventory.projects {
+            table.add_row(vec![
+                project.root.display().to_string(),
+                match &project.usage {
+                    UsageEstimate::Filesystem { allocated, .. } => human_bytes(*allocated),
+                    _ => "unknown".into(),
+                },
+                format!("{:?}", project.activity),
+                project.git.as_ref().map_or_else(
+                    || "not inspected".into(),
+                    |git| {
+                        format!(
+                            "{:?} dirty={} untracked={} complete={}",
+                            git.synchronization, git.dirty, git.untracked, git.complete
+                        )
+                    },
+                ),
+                project.inactivity_days.map_or_else(
+                    || "unknown".into(),
+                    |d| format!("{d}d / {}d", project.dormant_after_days),
+                ),
+                project.artifacts.len().to_string(),
+            ]);
+        }
+        println!("{table}");
+        for project in &inventory.projects {
+            println!("\n{}", project.root.display());
+            println!("  {}", project.recommendation);
+            for evidence in &project.evidence {
+                println!("  {evidence}");
+            }
+            for shared in &project.shared_artifacts {
+                println!(
+                    "  shared Cargo output (counted under primary owner): {}",
+                    shared.display()
+                );
+            }
+            for artifact in &project.artifacts {
+                let (usage, confidence) = usage_display(&artifact.target.usage);
+                println!(
+                    "  {} {}: {} · {}",
+                    if artifact.recommended {
+                        "recommend"
+                    } else {
+                        "review"
+                    },
+                    artifact.path.display(),
+                    usage,
+                    artifact.ecosystem
+                );
+                println!(
+                    "    confidence: {}",
+                    confidence.map_or_else(
+                        || "unknown".into(),
+                        |confidence| format!("{confidence:?}").to_lowercase()
+                    )
+                );
+                match &artifact.target.operation {
+                    PlannedOperation::DirectDelete {
+                        path,
+                        children_only,
+                        ..
+                    } => println!(
+                        "    permanently delete {}{}",
+                        if *children_only { "children of " } else { "" },
+                        path.display()
+                    ),
+                    PlannedOperation::Command { command } => {
+                        println!("    argv: {:?}", command_argv(command))
+                    }
+                    PlannedOperation::Informational => {
+                        println!("    informational; no cleanup operation")
+                    }
+                }
+                println!("    consequence: {}", artifact.target.consequence);
+                for evidence in artifact
+                    .supporting_evidence
+                    .iter()
+                    .chain(&artifact.weakening_evidence)
+                {
+                    println!("    {evidence}");
+                }
+            }
+        }
+        for diagnostic in &inventory.diagnostics {
+            println!("\n{diagnostic}");
+        }
+        println!(
+            "\n{} repositories inspected, {} commands, {} omitted",
+            inventory.inspected_repositories,
+            inventory.inspection_commands,
+            inventory.omitted_repositories
+        );
+    }
+
     pub(crate) fn print_targets(&self, output: &TargetsOutput) {
         println!(
             "{}  {}",
@@ -840,7 +949,12 @@ pub(crate) struct CliPlanObserver {
 impl PlanObserver for CliPlanObserver {
     fn on_event(&self, event: PlanEvent) {
         match event {
-            PlanEvent::PhaseStarted { phase } => tracing::debug!(phase, "planning started"),
+            PlanEvent::PhaseStarted { phase } => {
+                tracing::debug!(phase, "planning started");
+                if let Some(indicator) = &self.progress {
+                    indicator.bar.set_message(format!("Inspecting {phase}"));
+                }
+            }
             PlanEvent::PhaseFinished { phase, count } => {
                 tracing::debug!(phase, count, "planning finished")
             }

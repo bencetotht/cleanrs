@@ -16,6 +16,9 @@ pub const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// One completed or aborted cleanup action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalAction {
+    /// Evidence reviewed for project activity, retention, and ownership.
+    #[serde(default)]
+    pub evidence: Vec<String>,
     pub target_id: String,
     pub provider_id: String,
     pub path: Option<PathBuf>,
