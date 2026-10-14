@@ -176,3 +176,23 @@ fn record_for(path: &Path) -> Result<TrustRecord> {
             .map_or(0, |duration| duration.as_secs()),
     })
 }
+pub(crate) fn resolve_explicit_config_trust(
+    home: Option<&Path>,
+    config: Option<&Path>,
+    trust_now: bool,
+) -> Result<Option<String>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let Some(home) = home else {
+        if trust_now {
+            bail!("HOME is required to persist config trust");
+        }
+        return Ok(None);
+    };
+    let store = TrustStore::for_home(home);
+    if trust_now {
+        store.trust(config)?;
+    }
+    store.trusted_hash(config)
+}

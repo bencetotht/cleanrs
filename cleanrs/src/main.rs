@@ -2,37 +2,40 @@ use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
-use cleanrs_core::accounting::{estimate_subtree, estimate_subtrees};
-use cleanrs_core::execution::{
-    ActionResult, ActionStatus, ExecutableIdentity, command_argv, executable_identity,
-    execute_command, execute_direct_delete,
-};
+use cleanrs_core::accounting::estimate_subtree;
+use cleanrs_core::execution::command_argv;
 use cleanrs_core::fs::{Arena, NodeIndex, ScanResult, doctor};
-use cleanrs_core::journal::{Journal, JournalAction, JournalRun, default_journal_path};
 use cleanrs_core::providers::{
-    BUILTIN_PROVIDER_ACTION_IDS, ProviderHost, ProviderStatus, SystemProviderHost,
-    inspect_builtin_providers, inspect_cargo_builds,
+    BUILTIN_PROVIDER_ACTION_IDS, ProviderStatus, SystemProviderHost, inspect_builtin_providers,
+    inspect_cargo_builds,
 };
 use cleanrs_core::targets::{
-    Automation, BUILTIN_TARGETS, CandidateIdentity, CleanupLevel, CommandSpec, DetectedTarget,
-    PlanSelection, PlannedOperation, PlannedTarget, UsageEstimate, detect_workspace_targets,
-    plan_cleanup,
+    BUILTIN_TARGETS, CleanupLevel, DetectedTarget, PlannedOperation, PlannedTarget, SelectionMode,
+    detect_workspace_targets,
 };
 use cleanrs_core::{ReclaimEstimate, ScanOptions, Scanner};
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
+mod pipeline;
 mod registry;
 mod terminal;
 mod trust;
+mod tui;
 
+use pipeline::{
+    AppliedActionOutput, PlanRequest, ReviewedPlan, build_reviewed_plan, dedupe_inventory_paths,
+    enforce_apply_boundary, execute_reviewed_plan, journal_for_environment, selected_provider_ids,
+    target_sort_size, validate_target_ids,
+};
 use registry::ResolvedRegistry;
-use terminal::{ActionProgressIndicator, ScanProgressIndicator, TerminalUi, stderr_is_terminal};
-use trust::TrustStore;
+use terminal::{
+    CliExecutionObserver, CliPlanObserver, ScanProgressIndicator, TerminalUi, stderr_is_terminal,
+};
+use trust::{TrustStore, resolve_explicit_config_trust};
 
 #[derive(Debug, Parser)]
 #[command(name = "cleanrs", version, about, propagate_version = true)]
@@ -49,6 +52,15 @@ struct Cli {
 enum Commands {
     /// Scan an explicit directory without reading file contents.
     Scan(ScanArgs),
+    /// Browse storage, select targets, and review cleanup (requires a terminal).
+    #[command(
+        long_about = "Browse storage and select recognized cleanup targets. T opens targets; Space toggles items; u clears ticks; 1/2/3 applies a level preset; x rebuilds the reviewed plan. Only y on review confirms permanent deletion (Enter does not). ? shows help on every screen. Requires an interactive terminal of at least 80x20; respects NO_COLOR."
+    )]
+    Tui {
+        /// Directory to browse. Defaults to the working directory, never home.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Inspect container, volume, snapshot, swap, and access state.
     Doctor(DoctorArgs),
     /// Detect and size cleanup targets without executing anything.
@@ -56,6 +68,9 @@ enum Commands {
     /// Plan cleanup, or execute the same reviewed plan with --apply.
     Clean(CleanArgs),
     /// Show cleanup runs and their action-level outcomes.
+    #[command(
+        long_about = "Show cleanup runs and action-level outcomes. Removed allocation and provider-reported sizes are evidence, not observed APFS free-space recovery. [manual] means policy-eligible, picked by hand; [manual: <reason>] means an explicit policy override. Every TUI tick is recorded as manual."
+    )]
     History(HistoryArgs),
     /// Persist trust for an explicitly named command configuration.
     TrustConfig(TrustConfigArgs),
@@ -181,6 +196,10 @@ struct CleanArgs {
     /// Exclude these stable target IDs; may be supplied more than once.
     #[arg(long, value_name = "ID")]
     exclude: Vec<String>,
+
+    /// Select exactly these candidate paths (or full command CandidateKeys), overriding level/age policy.
+    #[arg(long, value_name = "PATH")]
+    select: Vec<String>,
 
     /// Plan eligible targets even when their age is below the staleness policy.
     #[arg(long)]
@@ -349,9 +368,14 @@ pub(crate) struct OutputEntry {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // TUI diagnostics must never be written over the alternate screen.
+    if let Commands::Tui { path } = &cli.command {
+        return tui::run(path, cli.verbose);
+    }
     init_logging(cli.verbose);
     match cli.command {
         Commands::Scan(args) => run_scan(args),
+        Commands::Tui { .. } => unreachable!("TUI dispatched before terminal logging"),
         Commands::Doctor(args) => run_doctor(args),
         Commands::Targets(args) => run_targets(args),
         Commands::Clean(args) => run_clean(args),
@@ -394,34 +418,6 @@ pub(crate) struct CleanOutput {
     pub(crate) targets: Vec<PlannedTarget>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) results: Vec<AppliedActionOutput>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct AppliedActionOutput {
-    pub(crate) target_id: String,
-    pub(crate) result: ActionResult,
-}
-
-/// The owned handoff shared by rendering, confirmation, execution, and history.
-/// No action is rediscovered or widened after this value is constructed.
-#[derive(Debug, Clone, Serialize)]
-struct ReviewedPlan {
-    run_id: String,
-    created_unix_seconds: u64,
-    scope: PathBuf,
-    level: CleanupLevel,
-    explicitly_named_ids: Vec<String>,
-    targets: Vec<PlannedTarget>,
-    selected_estimate: ReclaimEstimate,
-    selected_provider_reported: u64,
-    actions: Vec<ReviewedAction>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ReviewedAction {
-    target: DetectedTarget,
-    executable_identity: Option<ExecutableIdentity>,
-    executable_identity_error: Option<String>,
 }
 
 fn run_targets(args: TargetArgs) -> Result<()> {
@@ -597,204 +593,59 @@ fn run_clean(args: CleanArgs) -> Result<()> {
         bail!("--workers must be at least 1");
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let trusted_hash = resolve_explicit_config_trust(
+    resolve_explicit_config_trust(
         home.as_deref(),
         args.config.as_deref(),
         args.trust_config_commands,
     )?;
-    let mut registry = if args.targets_only_cli {
-        ResolvedRegistry::default()
-    } else {
-        ResolvedRegistry::load(
-            home.as_deref(),
-            args.config.as_deref(),
-            trusted_hash.as_deref(),
-        )?
-    };
-    registry.add_cli_targets(&args.target, &args.target_argv)?;
-    validate_target_ids(&args.only, "--only", &registry)?;
-    validate_target_ids(&args.exclude, "--exclude", &registry)?;
-    let definitions: Vec<_> = BUILTIN_TARGETS
-        .iter()
-        .copied()
-        .filter(|_| !args.no_builtin_targets && !args.targets_only_cli)
-        .filter(|definition| registry.permits(definition.id))
-        .filter(|definition| !registry.targets.contains_key(definition.id))
-        .filter(|definition| args.only.is_empty() || args.only.iter().any(|id| id == definition.id))
-        .filter(|definition| !args.exclude.iter().any(|id| id == definition.id))
-        .map(|mut definition| {
-            if definition.id == "cargo.target" {
-                definition.stale_after_days = args.cargo_stale_after;
-            }
-            definition
-        })
-        .collect();
-
-    let mut options = ScanOptions::default();
-    if let Some(workers) = args.workers {
-        options.workers = workers;
-    }
-    let scanner = Scanner::new(options);
     let progress = ScanProgressIndicator::create(
         &format!("cleanup candidates in {}", args.path.display()),
         !args.json && stderr_is_terminal(),
     );
-    let scan = if let Some(indicator) = &progress {
-        scanner.scan_with_observer(&args.path, indicator.clone())
-    } else {
-        scanner.scan(&args.path)
-    };
-    if let Some(indicator) = &progress {
+    let plan = build_reviewed_plan(
+        PlanRequest {
+            path: args.path.clone(),
+            home: home.clone(),
+            level: args.level.into(),
+            explicitly_named_ids: args.only.clone(),
+            only: args.only.clone(),
+            exclude: args.exclude.clone(),
+            ignore_staleness: args.ignore_staleness,
+            workers: args.workers,
+            workspace_only: args.workspace_only,
+            cargo_stale_after: args.cargo_stale_after,
+            config: args.config.clone(),
+            no_builtin_targets: args.no_builtin_targets,
+            target: args.target.clone(),
+            target_argv: args.target_argv.clone(),
+            targets_only_cli: args.targets_only_cli,
+            manual_selections: HashSet::new(),
+            select: args.select.clone(),
+            selection_mode: if args.select.is_empty() {
+                SelectionMode::LevelPlusManual
+            } else {
+                SelectionMode::ManualOnly
+            },
+        },
+        std::sync::Arc::new(CliPlanObserver {
+            progress: progress.clone(),
+        }),
+    );
+    if let Some(indicator) = progress {
         indicator.finish();
     }
-    let scan =
-        scan.with_context(|| format!("failed to build cleanup plan in {}", args.path.display()))?;
-    let mut detected = detect_workspace_targets(&scan, &definitions, home.as_deref());
-    detected.extend(
-        registry
-            .detect(&scan, home.as_deref(), &SystemProviderHost::default())
-            .into_iter()
-            .filter(|item| args.only.is_empty() || args.only.contains(&item.id))
-            .filter(|item| !args.exclude.contains(&item.id)),
-    );
-    let provider_ids = if args.no_builtin_targets || args.targets_only_cli {
-        HashSet::new()
-    } else {
-        selected_provider_ids(&args.only, &args.exclude, &registry)
-    };
-    let mut provider_inventory = if args.workspace_only || provider_ids.is_empty() {
-        Default::default()
-    } else {
-        inspect_builtin_providers(&SystemProviderHost::default(), &provider_ids)
-    };
-    if !args.no_builtin_targets
-        && !args.targets_only_cli
-        && registry.permits("cargo.target")
-        && !registry.targets.contains_key("cargo.target")
-        && (args.only.is_empty() || args.only.iter().any(|id| id == "cargo.target"))
-    {
-        let cargo_inventory = inspect_cargo_builds(
-            &scan,
-            &SystemProviderHost::default(),
-            home.as_deref(),
-            args.cargo_stale_after,
-        );
-        let resolved_paths: HashSet<_> = cargo_inventory
-            .items
-            .iter()
-            .filter_map(|item| item.path.clone())
-            .collect();
-        let resolved_projects: HashSet<_> = cargo_inventory
-            .items
-            .iter()
-            .filter_map(|item| item.project_root.clone())
-            .collect();
-        detected.retain(|item| {
-            item.id != "cargo.target"
-                || !resolved_paths.contains(item.path.as_ref().expect("workspace target path"))
-                    && !resolved_projects.contains(
-                        item.project_root
-                            .as_ref()
-                            .expect("workspace target project root"),
-                    )
-        });
-        detected.extend(cargo_inventory.items);
-        provider_inventory.statuses.extend(cargo_inventory.statuses);
-    }
-    detected.extend(provider_inventory.items);
-    detected = dedupe_inventory_paths(detected);
-    let level = CleanupLevel::from(args.level);
-    let mut targets = plan_cleanup(detected, level, &args.only, args.ignore_staleness);
-    targets.sort_by(|left, right| {
-        let left_selected = matches!(left.selection, PlanSelection::Selected);
-        let right_selected = matches!(right.selection, PlanSelection::Selected);
-        Reverse((left_selected, target_sort_size(&left.target)))
-            .cmp(&Reverse((right_selected, target_sort_size(&right.target))))
-            .then_with(|| left.target.path.cmp(&right.target.path))
-    });
-
-    let selected: Vec<_> = targets
-        .iter()
-        .filter(|target| matches!(target.selection, PlanSelection::Selected))
-        .collect();
-    let selected_roots: Vec<_> = selected
-        .iter()
-        .filter_map(|planned| {
-            if !matches!(planned.target.usage, UsageEstimate::Filesystem { .. }) {
-                return None;
-            }
-            let index = (0..scan.arena.nodes.len())
-                .map(NodeIndex::from_usize)
-                .find(|index| {
-                    planned
-                        .target
-                        .path
-                        .as_ref()
-                        .is_some_and(|path| scan.arena.path(*index) == *path)
-                })
-                .expect("direct-delete target path must remain in its source arena");
-            Some(index)
-        })
-        .collect();
-    let selected_estimate =
-        estimate_subtrees(&scan.arena, &selected_roots, scan.coverage_complete());
-    let selected_provider_reported = selected
-        .iter()
-        .filter_map(|planned| match planned.target.usage {
-            UsageEstimate::ProviderReported { bytes, .. } => bytes,
-            _ => None,
-        })
-        .fold(0_u64, u64::saturating_add);
-    let selected_provider_actions = selected
-        .iter()
-        .filter(|planned| matches!(planned.target.usage, UsageEstimate::ProviderReported { .. }))
-        .count();
-    let selected_unknown_actions = selected
-        .iter()
-        .filter(|planned| matches!(planned.target.usage, UsageEstimate::Unknown { .. }))
-        .count();
-    let actions = selected
-        .iter()
-        .map(|planned| {
-            let (identity, error) = match &planned.target.operation {
-                PlannedOperation::Command { command } => {
-                    match executable_identity(&command.executable) {
-                        Ok(identity) => (Some(identity), None),
-                        Err(error) => (None, Some(error.to_string())),
-                    }
-                }
-                _ => (None, None),
-            };
-            ReviewedAction {
-                target: planned.target.clone(),
-                executable_identity: identity,
-                executable_identity_error: error,
-            }
-        })
-        .collect();
-    let selected_count = selected.len();
-    let plan = ReviewedPlan {
-        run_id: new_run_id(),
-        created_unix_seconds: now_seconds(),
-        scope: scan.root.clone(),
-        level,
-        explicitly_named_ids: args.only.clone(),
-        targets,
-        selected_estimate: selected_estimate.clone(),
-        selected_provider_reported,
-        actions,
-    };
+    let plan = plan?;
     let mut output = CleanOutput {
-        scope: scan.root.clone(),
-        level,
-        coverage_complete: scan.coverage_complete(),
+        scope: plan.scope.clone(),
+        level: plan.level,
+        coverage_complete: plan.coverage_complete,
         execution: "dry-run; no action was run".into(),
-        selected_targets: selected_count,
-        selected_estimate,
-        selected_provider_reported,
-        selected_provider_actions,
-        selected_unknown_actions,
-        providers: provider_inventory.statuses,
+        selected_targets: plan.actions.len(),
+        selected_estimate: plan.selected_estimate.clone(),
+        selected_provider_reported: plan.selected_provider_reported,
+        selected_provider_actions: plan.selected_provider_actions,
+        selected_unknown_actions: plan.selected_unknown_actions,
+        providers: plan.providers.clone(),
         targets: plan.targets.clone(),
         results: Vec::new(),
     };
@@ -818,7 +669,14 @@ fn run_clean(args: CleanArgs) -> Result<()> {
     }
 
     let journal = journal_for_environment(home.as_deref())?;
-    let (results, run) = apply_reviewed_plan(&plan, home.as_deref(), args.json, &journal)?;
+    let (results, run) = execute_reviewed_plan(
+        &plan,
+        home.as_deref(),
+        args.yes,
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut CliExecutionObserver::new(args.json),
+        &journal,
+    )?;
     output.execution = run.outcome.clone();
     output.results = results;
     if args.json {
@@ -832,38 +690,6 @@ fn run_clean(args: CleanArgs) -> Result<()> {
     } else {
         bail!("cleanup completed with outcome: {}", run.outcome)
     }
-}
-
-fn enforce_apply_boundary(plan: &ReviewedPlan, unattended: bool) -> Result<()> {
-    #[cfg(unix)]
-    if unsafe { libc::geteuid() } == 0 {
-        bail!("cleanrs refuses destructive execution as root");
-    }
-    if plan.actions.is_empty() {
-        bail!("cleanup plan selects no executable actions");
-    }
-    if unattended {
-        if plan.actions.len() > 100 {
-            bail!("unattended cleanup is limited to 100 actions; review interactively");
-        }
-        let known_bytes = plan
-            .selected_estimate
-            .ceiling
-            .unwrap_or(u64::MAX)
-            .saturating_add(plan.selected_provider_reported);
-        if known_bytes > 50 * 1024 * 1024 * 1024 {
-            bail!("unattended filesystem cleanup is limited to 50 GiB; review interactively");
-        }
-        if plan.actions.iter().any(|action| {
-            matches!(
-                action.target.properties.automation,
-                Automation::ExplicitTargetOnly
-            )
-        }) {
-            bail!("explicit-only actions require interactive confirmation and cannot use --yes");
-        }
-    }
-    Ok(())
 }
 
 fn confirm_apply(plan: &ReviewedPlan) -> Result<bool> {
@@ -900,365 +726,6 @@ fn confirm_apply(plan: &ReviewedPlan) -> Result<bool> {
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
-}
-
-fn apply_reviewed_plan(
-    plan: &ReviewedPlan,
-    home: Option<&Path>,
-    json: bool,
-    journal: &Journal,
-) -> Result<(Vec<AppliedActionOutput>, JournalRun)> {
-    let mut results = Vec::with_capacity(plan.actions.len());
-    let mut journal_actions = Vec::with_capacity(plan.targets.len());
-
-    // Preserve skipped planning decisions in history as well as attempted work.
-    for planned in &plan.targets {
-        if let PlanSelection::Skipped(reason) = &planned.selection {
-            let result = ActionResult {
-                status: ActionStatus::Skipped,
-                removed_allocation: None,
-                provider_reported: None,
-                exit_code: None,
-                stdout_summary: None,
-                stderr_summary: None,
-                error: Some(reason.clone()),
-            };
-            journal_actions.push(journal_action(&planned.target).finish(&result));
-        }
-    }
-
-    let selected_offset = journal_actions.len();
-    for action in &plan.actions {
-        journal_actions.push(journal_action(&action.target));
-    }
-    let mut run = JournalRun {
-        schema: 1,
-        run_id: plan.run_id.clone(),
-        timestamp_unix_seconds: plan.created_unix_seconds,
-        cleanrs_version: env!("CARGO_PKG_VERSION").into(),
-        scope: plan.scope.clone(),
-        level: format!("{:?}", plan.level).to_lowercase(),
-        explicitly_named_ids: plan.explicitly_named_ids.clone(),
-        outcome: "running".into(),
-        actions: journal_actions,
-    };
-    // The initial durable record means an interruption is visible as a run
-    // with pending actions. Each completed action appends a newer snapshot.
-    journal.append(&run)?;
-
-    for (action_index, action) in plan.actions.iter().enumerate() {
-        let deletion_progress = match &action.target.operation {
-            PlannedOperation::DirectDelete { path, .. } => {
-                eprintln!(
-                    "Applying {}: permanent delete {}",
-                    action.target.id,
-                    path.display()
-                );
-                ActionProgressIndicator::create(&action.target.id, !json && stderr_is_terminal())
-            }
-            PlannedOperation::Command { command } => {
-                eprintln!(
-                    "Applying {}: argv = {:?}",
-                    action.target.id,
-                    command_argv(command)
-                );
-                None
-            }
-            PlannedOperation::Informational => None,
-        };
-        let mut result = match &action.target.operation {
-            PlannedOperation::DirectDelete {
-                path,
-                children_only,
-                identity,
-            } => match validate_direct_preflight(path, *identity, home) {
-                Ok(()) => execute_direct_delete(
-                    path,
-                    *children_only,
-                    *identity,
-                    filesystem_allocated(&action.target.usage),
-                ),
-                Err(reason) => ActionResult::validation_abort(reason),
-            },
-            PlannedOperation::Command { command } => {
-                if let Err(reason) = revalidate_provider(&action.target) {
-                    ActionResult::validation_abort(reason)
-                } else if let Some(error) = &action.executable_identity_error {
-                    ActionResult::validation_abort(format!(
-                        "executable identity was unavailable during review: {error}"
-                    ))
-                } else if let Some(identity) = action.executable_identity {
-                    execute_command(command, identity, !json, 64 * 1024)
-                } else {
-                    ActionResult::validation_abort("reviewed command has no executable identity")
-                }
-            }
-            PlannedOperation::Informational => {
-                ActionResult::validation_abort("informational action reached execution")
-            }
-        };
-        if let Some(progress) = deletion_progress {
-            progress.finish(result.status);
-        }
-        if result.status == ActionStatus::Success && result.provider_reported.is_none() {
-            result.provider_reported = result
-                .stdout_summary
-                .as_deref()
-                .and_then(parse_provider_reported_bytes);
-        }
-        run.actions[selected_offset + action_index] =
-            journal_action(&action.target).finish(&result);
-        results.push(AppliedActionOutput {
-            target_id: action.target.id.clone(),
-            result,
-        });
-        journal.append(&run)?;
-    }
-
-    let successes = results
-        .iter()
-        .filter(|result| result.result.status == ActionStatus::Success)
-        .count();
-    let outcome = if successes == results.len() {
-        "success"
-    } else if successes == 0 {
-        "failed"
-    } else {
-        "partial"
-    };
-    run.outcome = outcome.into();
-    journal.append(&run)?;
-    Ok((results, run))
-}
-
-fn validate_direct_preflight(
-    path: &Path,
-    planned: CandidateIdentity,
-    home: Option<&Path>,
-) -> Result<(), String> {
-    if path == Path::new("/") || home.is_some_and(|home| path == home) {
-        return Err("protected filesystem root".into());
-    }
-    if let Some(home) = home {
-        for denied in [
-            home.join("Library/Mobile Documents"),
-            home.join("Library/CloudStorage"),
-        ] {
-            if path.starts_with(denied) {
-                return Err("path is inside synced cloud storage".into());
-            }
-        }
-    }
-    ensure_no_symlink_ancestors(path)?;
-    let parent = path.parent().ok_or("cleanup target has no parent")?;
-    let parent_metadata = std::fs::metadata(parent).map_err(|error| error.to_string())?;
-    let target_metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if parent_metadata.dev() != target_metadata.dev() {
-            return Err("cleanup target is a mount root".into());
-        }
-    }
-    let scan = Scanner::new(ScanOptions::default())
-        .scan(path)
-        .map_err(|error| format!("final metadata preflight failed: {error}"))?;
-    if !scan.coverage_complete() {
-        return Err("final metadata preflight had incomplete coverage".into());
-    }
-    let root = &scan.arena.nodes[scan.arena.root().as_usize()];
-    let current = CandidateIdentity {
-        device: root.device,
-        inode: root.inode,
-        kind: root.kind,
-    };
-    if current != planned {
-        return Err("target device, inode, or type changed after planning".into());
-    }
-    if root.flags.contains(cleanrs_core::fs::NodeFlags::DATALESS) || scan.dataless_entries > 0 {
-        return Err("candidate contains dataless or ubiquitous content".into());
-    }
-    if scan.mount_boundaries > 0 {
-        return Err("candidate crosses a mount boundary".into());
-    }
-    Ok(())
-}
-
-fn ensure_no_symlink_ancestors(path: &Path) -> Result<(), String> {
-    let mut cursor = PathBuf::new();
-    for component in path.components() {
-        cursor.push(component);
-        let metadata = std::fs::symlink_metadata(&cursor).map_err(|error| error.to_string())?;
-        if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "cleanup path has symlinked ancestor: {}",
-                cursor.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn revalidate_provider(target: &DetectedTarget) -> Result<(), String> {
-    if matches!(target.provider.id.as_str(), "workspace" | "configuration") {
-        return Ok(());
-    }
-    if target.provider.id == "cargo" {
-        let executable = target
-            .provider
-            .executable
-            .clone()
-            .ok_or_else(|| "planned Cargo executable is missing".to_owned())?;
-        let output = SystemProviderHost::default()
-            .run_inspection(&CommandSpec {
-                executable,
-                args: vec!["--version".into()],
-                environment: Default::default(),
-            })
-            .map_err(|error| error.to_string())?;
-        if output.exit_code != Some(0)
-            || target.provider.version.as_deref() != Some(output.stdout.trim())
-        {
-            return Err("Cargo provider version changed after planning".into());
-        }
-        return Ok(());
-    }
-    let selected = HashSet::from([target.id.clone()]);
-    let current = inspect_builtin_providers(&SystemProviderHost::default(), &selected)
-        .items
-        .into_iter()
-        .find(|item| item.id == target.id)
-        .ok_or_else(|| "provider action is no longer available".to_owned())?;
-    if current.provider != target.provider {
-        return Err(format!(
-            "provider identity or context changed after planning (planned {:?}, current {:?})",
-            target.provider, current.provider
-        ));
-    }
-    Ok(())
-}
-
-fn filesystem_allocated(usage: &UsageEstimate) -> u64 {
-    match usage {
-        UsageEstimate::Filesystem { allocated, .. } => *allocated,
-        _ => 0,
-    }
-}
-
-fn journal_action(target: &DetectedTarget) -> JournalAction {
-    let (planned_allocated, estimated_floor, estimated_ceiling, provider_estimated) =
-        match &target.usage {
-            UsageEstimate::Filesystem {
-                allocated,
-                reclaimable,
-                ..
-            } => (
-                Some(*allocated),
-                reclaimable.floor,
-                reclaimable.ceiling,
-                None,
-            ),
-            UsageEstimate::ProviderReported { bytes, .. } => (None, None, None, *bytes),
-            UsageEstimate::Unknown { .. } => (None, None, None, None),
-        };
-    JournalAction {
-        target_id: target.id.clone(),
-        provider_id: target.provider.id.clone(),
-        path: target.path.clone(),
-        context: target.provider.context.clone(),
-        argv: match &target.operation {
-            PlannedOperation::Command { command } => Some(command_argv(command)),
-            _ => None,
-        },
-        status: "pending".into(),
-        planned_allocated,
-        estimated_floor,
-        estimated_ceiling,
-        provider_estimated,
-        removed_allocation: None,
-        provider_reported: None,
-        bytes_trashed: None,
-        exit_code: None,
-        stdout_summary: None,
-        stderr_summary: None,
-        error: None,
-    }
-}
-
-fn parse_provider_reported_bytes(output: &str) -> Option<u64> {
-    let words: Vec<_> = output.split_whitespace().collect();
-    for index in 0..words.len() {
-        let token = words[index]
-            .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '.');
-        let split = token
-            .find(|character: char| character.is_ascii_alphabetic())
-            .unwrap_or(token.len());
-        let (number, unit) = token.split_at(split);
-        if number.is_empty() || unit.is_empty() {
-            continue;
-        }
-        let value: f64 = number.parse().ok()?;
-        let multiplier = match unit.to_ascii_lowercase().as_str() {
-            "b" => 1_f64,
-            "kb" => 1_000_f64,
-            "mb" => 1_000_000_f64,
-            "gb" => 1_000_000_000_f64,
-            "tb" => 1_000_000_000_000_f64,
-            "kib" => 1024_f64,
-            "mib" => 1024_f64.powi(2),
-            "gib" => 1024_f64.powi(3),
-            "tib" => 1024_f64.powi(4),
-            _ => continue,
-        };
-        let context = words[index.saturating_sub(4)..index]
-            .join(" ")
-            .to_ascii_lowercase();
-        if context.contains("reclaim") || context.contains("free") || context.contains("removed") {
-            return Some((value * multiplier) as u64);
-        }
-    }
-    None
-}
-
-fn new_run_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    format!("{nanos}-{}", std::process::id())
-}
-
-fn now_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
-}
-
-fn journal_for_environment(home: Option<&Path>) -> Result<Journal> {
-    let state_home = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
-    let path = default_journal_path(home, state_home.as_deref())
-        .context("HOME or XDG_STATE_HOME is required for cleanup history")?;
-    Ok(Journal::new(path))
-}
-
-fn resolve_explicit_config_trust(
-    home: Option<&Path>,
-    config: Option<&Path>,
-    trust_now: bool,
-) -> Result<Option<String>> {
-    let Some(config) = config else {
-        return Ok(None);
-    };
-    let Some(home) = home else {
-        if trust_now {
-            bail!("HOME is required to persist config trust");
-        }
-        return Ok(None);
-    };
-    let store = TrustStore::for_home(home);
-    if trust_now {
-        store.trust(config)?;
-    }
-    store.trusted_hash(config)
 }
 
 fn run_history(args: HistoryArgs) -> Result<()> {
@@ -1298,15 +765,23 @@ fn run_history(args: HistoryArgs) -> Result<()> {
                 };
                 let evidence = action
                     .removed_allocation
-                    .map(|bytes| format!("removed {bytes} bytes allocation"))
+                    .map(|bytes| format!("removed {} allocation", human_bytes(bytes)))
                     .or_else(|| {
                         action
                             .provider_reported
-                            .map(|bytes| format!("provider reported {bytes} bytes"))
+                            .map(|bytes| format!("provider reported {}", human_bytes(bytes)))
                     })
                     .or(action.error)
                     .unwrap_or_else(|| action.status.clone());
-                println!("  {marker} {:<28} {evidence}", action.target_id);
+                let manual = if action.selection_source == "manual" {
+                    action.overridden_skip_reason.as_deref().map_or_else(
+                        || " [manual]".to_owned(),
+                        |reason| format!(" [manual: {reason}]"),
+                    )
+                } else {
+                    String::new()
+                };
+                println!("  {marker} {:<28} {evidence}{manual}", action.target_id);
             }
         }
     }
@@ -1369,59 +844,6 @@ fn run_trust_config(args: TrustConfigArgs) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn target_sort_size(target: &DetectedTarget) -> u64 {
-    target.usage.sortable_bytes()
-}
-
-fn validate_target_ids(ids: &[String], flag: &str, registry: &ResolvedRegistry) -> Result<()> {
-    for id in ids {
-        if !BUILTIN_TARGETS.iter().any(|definition| definition.id == id)
-            && !BUILTIN_PROVIDER_ACTION_IDS.contains(&id.as_str())
-            && !registry.targets.contains_key(id)
-        {
-            bail!("unknown target ID {id:?} passed to {flag}");
-        }
-    }
-    Ok(())
-}
-
-fn selected_provider_ids(
-    only: &[String],
-    exclude: &[String],
-    registry: &ResolvedRegistry,
-) -> HashSet<String> {
-    BUILTIN_PROVIDER_ACTION_IDS
-        .iter()
-        .filter(|id| only.is_empty() || only.iter().any(|selected| selected == **id))
-        .filter(|id| !exclude.iter().any(|excluded| excluded == **id))
-        .filter(|id| registry.permits(id))
-        .filter(|id| !registry.targets.contains_key(**id))
-        .map(|id| (*id).to_owned())
-        .collect()
-}
-
-fn dedupe_inventory_paths(items: Vec<DetectedTarget>) -> Vec<DetectedTarget> {
-    let mut output: Vec<DetectedTarget> = Vec::new();
-    for item in items {
-        if let Some(path) = item.path.as_ref() {
-            if let Some(existing) = output
-                .iter()
-                .position(|candidate| candidate.path.as_ref() == Some(path))
-            {
-                if output[existing].provider.id == "configuration" {
-                    continue;
-                }
-                // Registry and provider items are appended after embedded
-                // marker findings, so the later, more specific resolution wins.
-                output[existing] = item;
-                continue;
-            }
-        }
-        output.push(item);
-    }
-    output
 }
 
 fn run_scan(args: ScanArgs) -> Result<()> {

@@ -3,7 +3,7 @@
 //! This module turns target definitions and a collected filesystem scan into
 //! inspectable candidates. Mutation remains isolated in the execution module.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -351,6 +351,86 @@ pub struct DetectedTarget {
     pub evidence: Vec<String>,
 }
 
+/// Structured policy explanation for presentation. The planner and UI share
+/// this decision; presentation never infers eligibility from string messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyStatus<'a> {
+    Eligible,
+    Refused(&'a str),
+    Informational,
+    NeedsLevel(CleanupLevel),
+    ExplicitOnly,
+    NotSelectedByLevel,
+    NotStale(u32),
+    UnknownAge,
+    Skipped(&'a str),
+}
+
+impl PolicyStatus<'_> {
+    fn reason(&self) -> String {
+        match self {
+            Self::Eligible => "eligible".into(),
+            Self::Refused(reason) => format!("safety refusal: {reason}"),
+            Self::Informational => "informational only; no cleanup operation".into(),
+            Self::NeedsLevel(level) => format!("requires {level:?} cleanup level").to_lowercase(),
+            Self::ExplicitOnly | Self::NotSelectedByLevel => "not selected by cleanup level".into(),
+            Self::NotStale(_) => "target is not stale".into(),
+            Self::UnknownAge => "target age is unknown".into(),
+            Self::Skipped(reason) => (*reason).into(),
+        }
+    }
+}
+
+impl DetectedTarget {
+    /// Safety and informational actions are untickable even with explicit naming.
+    #[must_use]
+    pub fn manually_selectable(&self) -> bool {
+        matches!(self.safety, CandidateSafety::Eligible)
+            && !matches!(self.operation, PlannedOperation::Informational)
+    }
+
+    #[must_use]
+    pub fn explicit_only(&self) -> bool {
+        self.properties.recoverability == Recoverability::UserData
+            || matches!(self.properties.automation, Automation::ExplicitTargetOnly)
+    }
+
+    #[must_use]
+    pub fn policy_status(
+        &self,
+        level: CleanupLevel,
+        explicitly_named: bool,
+        ignore_staleness: bool,
+    ) -> PolicyStatus<'_> {
+        match &self.safety {
+            CandidateSafety::Refused(reason) => PolicyStatus::Refused(reason),
+            CandidateSafety::Eligible
+                if matches!(self.operation, PlannedOperation::Informational) =>
+            {
+                PolicyStatus::Informational
+            }
+            CandidateSafety::Eligible if !level.reaches(self.minimum_level) => {
+                PolicyStatus::NeedsLevel(self.minimum_level)
+            }
+            CandidateSafety::Eligible if !level.selects(self.properties, explicitly_named) => {
+                if self.explicit_only() {
+                    PolicyStatus::ExplicitOnly
+                } else {
+                    PolicyStatus::NotSelectedByLevel
+                }
+            }
+            CandidateSafety::Eligible if !ignore_staleness && self.stale != Some(true) => {
+                if self.stale == Some(false) {
+                    PolicyStatus::NotStale(self.stale_after_days)
+                } else {
+                    PolicyStatus::UnknownAge
+                }
+            }
+            CandidateSafety::Eligible => PolicyStatus::Eligible,
+        }
+    }
+}
+
 /// Stable filesystem facts that must still match immediately before deletion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CandidateIdentity {
@@ -359,20 +439,111 @@ pub struct CandidateIdentity {
     pub kind: NodeKind,
 }
 
+/// Stable, printable identity for a detected candidate. The JSON tuple encoding
+/// avoids delimiter ambiguity in paths, provider contexts, and exact argv.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CandidateKey(String);
+
+impl CandidateKey {
+    #[must_use]
+    pub fn from_target(target: &DetectedTarget) -> Self {
+        let value = if let Some(path) = &target.path {
+            // Inspected paths are already absolute; refused missing paths keep
+            // their inspected spelling so they can still be explained.
+            serde_json::to_string(&(
+                &target.id,
+                path.canonicalize().unwrap_or_else(|_| path.clone()),
+            ))
+        } else {
+            let command = match &target.operation {
+                PlannedOperation::Command { command } => Some(command),
+                _ => None,
+            };
+            serde_json::to_string(&(&target.id, &target.provider, command))
+        };
+        Self(value.expect("candidate identity is serializable"))
+    }
+}
+
+impl std::fmt::Display for CandidateKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Manual picks are explicit naming, but never override a safety refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SelectionSource {
+    Level,
+    Manual { overrode: Option<String> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMode {
+    LevelPlusManual,
+    ManualOnly,
+}
+
 /// Why a detected target is or is not part of a cleanup plan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "status", content = "reason", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanSelection {
-    Selected,
+    Selected { source: SelectionSource },
     Skipped(String),
 }
+
+// Preserve the existing status/reason JSON contract, adding source only for
+// selected rows. Existing consumers can continue testing status == selected.
+impl Serialize for PlanSelection {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(2))?;
+        match self {
+            Self::Selected { source } => {
+                map.serialize_entry("status", "selected")?;
+                map.serialize_entry("source", source)?;
+            }
+            Self::Skipped(reason) => {
+                map.serialize_entry("status", "skipped")?;
+                map.serialize_entry("reason", reason)?;
+            }
+        }
+        map.end()
+    }
+}
+
+/// A manual request rejected before a reviewed plan can be constructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionError(pub String);
+
+impl std::fmt::Display for SelectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for SelectionError {}
 
 /// One fully explained row in a dry-run cleanup plan.
 #[derive(Debug, Clone, Serialize)]
 pub struct PlannedTarget {
+    pub candidate_key: CandidateKey,
     #[serde(flatten)]
     pub target: DetectedTarget,
     pub selection: PlanSelection,
+}
+
+impl PlannedTarget {
+    #[must_use]
+    pub fn policy_status(&self, level: CleanupLevel) -> PolicyStatus<'_> {
+        let status = self.target.policy_status(level, false, false);
+        if status == PolicyStatus::Eligible {
+            if let PlanSelection::Skipped(reason) = &self.selection {
+                return PolicyStatus::Skipped(reason);
+            }
+        }
+        status
+    }
 }
 
 /// Select detected targets without executing any filesystem operation.
@@ -383,90 +554,184 @@ pub fn plan_cleanup(
     explicitly_named_ids: &[String],
     ignore_staleness: bool,
 ) -> Vec<PlannedTarget> {
-    let mut planned: Vec<_> = targets
-        .into_iter()
-        .map(|target| {
-            let explicitly_named = explicitly_named_ids.iter().any(|id| id == &target.id);
-            let selection = match &target.safety {
-                CandidateSafety::Refused(reason) => {
-                    PlanSelection::Skipped(format!("safety refusal: {reason}"))
-                }
-                CandidateSafety::Eligible
-                    if matches!(&target.operation, PlannedOperation::Informational) =>
-                {
-                    PlanSelection::Skipped("informational only; no cleanup operation".into())
-                }
-                CandidateSafety::Eligible if !level.reaches(target.minimum_level) => {
-                    PlanSelection::Skipped(
-                        format!("requires {:?} cleanup level", target.minimum_level).to_lowercase(),
-                    )
-                }
-                CandidateSafety::Eligible
-                    if !level.selects(target.properties, explicitly_named) =>
-                {
-                    PlanSelection::Skipped("not selected by cleanup level".into())
-                }
-                CandidateSafety::Eligible if !ignore_staleness && target.stale != Some(true) => {
-                    PlanSelection::Skipped(match target.stale {
-                        Some(false) => "target is not stale".into(),
-                        None => "target age is unknown".into(),
-                        Some(true) => unreachable!("guard excludes stale targets"),
-                    })
-                }
-                CandidateSafety::Eligible => PlanSelection::Selected,
-            };
-            PlannedTarget { target, selection }
-        })
-        .collect();
+    plan_cleanup_with_selection(
+        targets,
+        level,
+        explicitly_named_ids,
+        ignore_staleness,
+        &HashSet::new(),
+        SelectionMode::LevelPlusManual,
+    )
+    .expect("level-only selection cannot be rejected")
+}
 
-    // Resolve overlapping alternatives after ordinary policy selection. A
-    // scrub action, for example, supersedes routine cleanup at aggressive level.
-    let mut winners = HashMap::<String, (u8, String)>::new();
-    for item in &planned {
-        if !matches!(item.selection, PlanSelection::Selected) {
+/// The ordinary severity/staleness decision for one candidate, before
+/// exclusive alternatives, safe-plan limits, or manual choices are applied.
+fn policy_selection(
+    target: &DetectedTarget,
+    level: CleanupLevel,
+    explicitly_named_ids: &[String],
+    ignore_staleness: bool,
+) -> PlanSelection {
+    match target.policy_status(
+        level,
+        explicitly_named_ids.iter().any(|id| id == &target.id),
+        ignore_staleness,
+    ) {
+        PolicyStatus::Eligible => PlanSelection::Selected {
+            source: SelectionSource::Level,
+        },
+        status => PlanSelection::Skipped(status.reason()),
+    }
+}
+
+/// Apply per-candidate choices before resolving exclusive alternatives. Manual
+/// choices supersede policy only; refused/informational rows remain untouchable.
+pub fn plan_cleanup_with_selection(
+    targets: Vec<DetectedTarget>,
+    level: CleanupLevel,
+    explicitly_named_ids: &[String],
+    ignore_staleness: bool,
+    manual: &HashSet<CandidateKey>,
+    mode: SelectionMode,
+) -> Result<Vec<PlannedTarget>, SelectionError> {
+    // Capture the ordinary plan first, including exclusive alternatives and
+    // conservative safe limits, so a manual override explains the actual
+    // decision the user would have seen without the explicit choice.
+    let mut planned: Vec<_> = if manual.is_empty() {
+        targets
+            .into_iter()
+            .map(|target| {
+                let selection =
+                    policy_selection(&target, level, explicitly_named_ids, ignore_staleness);
+                PlannedTarget {
+                    candidate_key: CandidateKey::from_target(&target),
+                    target,
+                    selection,
+                }
+            })
+            .collect()
+    } else {
+        // Recursing with no manual picks yields the complete level-only plan.
+        plan_cleanup(targets, level, explicitly_named_ids, ignore_staleness)
+    };
+    let keys: HashSet<_> = planned.iter().map(|item| &item.candidate_key).collect();
+    if let Some(key) = manual.iter().find(|key| !keys.contains(key)) {
+        return Err(SelectionError(format!("unknown candidate: {key}")));
+    }
+
+    let mut manual_groups = HashMap::<String, usize>::new();
+    for index in 0..planned.len() {
+        let item = &mut planned[index];
+        let key = item.candidate_key.clone();
+        if manual.contains(&key) {
+            if let CandidateSafety::Refused(reason) = &item.target.safety {
+                return Err(SelectionError(format!(
+                    "cannot select {key}: safety refusal: {reason}"
+                )));
+            }
+            if matches!(item.target.operation, PlannedOperation::Informational) {
+                return Err(SelectionError(format!(
+                    "cannot select {key}: informational only; no cleanup operation"
+                )));
+            }
+            let overrode = match &item.selection {
+                PlanSelection::Skipped(reason) => Some(reason.clone()),
+                _ => None,
+            };
+            item.selection = PlanSelection::Selected {
+                source: SelectionSource::Manual { overrode },
+            };
+            if let Some(group) = item.target.exclusive_group.clone() {
+                if let Some(other) = manual_groups.insert(group.clone(), index) {
+                    return Err(SelectionError(format!(
+                        "manual selections conflict in exclusive group {group}: {} and {key}",
+                        planned[other].candidate_key
+                    )));
+                }
+            }
+        } else if mode == SelectionMode::ManualOnly
+            && matches!(item.selection, PlanSelection::Selected { .. })
+        {
+            item.selection = PlanSelection::Skipped("not manually selected".into());
+        }
+    }
+
+    // Compare by row index rather than target ID: multiple candidates can share
+    // an ID, yet an exclusive group must still have exactly one winner.
+    let mut winners = manual_groups;
+    for (index, item) in planned.iter().enumerate() {
+        if !matches!(item.selection, PlanSelection::Selected { .. }) {
             continue;
         }
         let Some(group) = &item.target.exclusive_group else {
             continue;
         };
-        let candidate = (item.target.exclusive_priority, item.target.id.clone());
         winners
             .entry(group.clone())
             .and_modify(|winner| {
-                if candidate > *winner {
-                    *winner = candidate.clone();
+                let existing = &planned[*winner];
+                if !matches!(
+                    existing.selection,
+                    PlanSelection::Selected {
+                        source: SelectionSource::Manual { .. }
+                    }
+                ) && (item.target.exclusive_priority, &item.target.id)
+                    > (existing.target.exclusive_priority, &existing.target.id)
+                {
+                    *winner = index;
                 }
             })
-            .or_insert(candidate);
+            .or_insert(index);
     }
-    for item in &mut planned {
-        let Some(group) = &item.target.exclusive_group else {
-            continue;
-        };
-        if matches!(item.selection, PlanSelection::Selected)
-            && winners
-                .get(group)
-                .is_some_and(|(_, id)| id != &item.target.id)
-        {
-            let winner = &winners[group].1;
-            item.selection = PlanSelection::Skipped(format!("superseded by {winner}"));
+    for index in 0..planned.len() {
+        if let Some(group) = &planned[index].target.exclusive_group {
+            if matches!(planned[index].selection, PlanSelection::Selected { .. })
+                && winners[group] != index
+            {
+                let winner = &planned[winners[group]].target.id;
+                planned[index].selection =
+                    PlanSelection::Skipped(format!("superseded by {winner}"));
+            }
         }
     }
+    // Automatic safe selection retains its conservative limits. Explicit
+    // manual choices are reviewed separately; unattended execution still
+    // enforces the count/byte boundary over the entire reviewed set.
     if level == CleanupLevel::Safe {
         const MAX_UNATTENDED_TARGETS: usize = 100;
         const MAX_UNATTENDED_BYTES: u64 = 50 * 1024 * 1024 * 1024;
         let selected_count = planned
             .iter()
-            .filter(|item| matches!(item.selection, PlanSelection::Selected))
+            .filter(|item| {
+                matches!(
+                    item.selection,
+                    PlanSelection::Selected {
+                        source: SelectionSource::Level
+                    }
+                )
+            })
             .count();
         let selected_bytes = planned
             .iter()
-            .filter(|item| matches!(item.selection, PlanSelection::Selected))
+            .filter(|item| {
+                matches!(
+                    item.selection,
+                    PlanSelection::Selected {
+                        source: SelectionSource::Level
+                    }
+                )
+            })
             .map(|item| item.target.usage.sortable_bytes())
             .fold(0_u64, u64::saturating_add);
         if selected_count > MAX_UNATTENDED_TARGETS || selected_bytes > MAX_UNATTENDED_BYTES {
             for item in &mut planned {
-                if matches!(item.selection, PlanSelection::Selected) {
+                if matches!(
+                    item.selection,
+                    PlanSelection::Selected {
+                        source: SelectionSource::Level
+                    }
+                ) {
                     item.selection = PlanSelection::Skipped(
                         "unattended plan exceeds the conservative count/byte limit".into(),
                     );
@@ -474,7 +739,7 @@ pub fn plan_cleanup(
             }
         }
     }
-    planned
+    Ok(planned)
 }
 
 /// Detect all selected built-in workspace targets from one explicit scan.
@@ -956,7 +1221,12 @@ mod tests {
         ));
 
         let standard = plan_cleanup(targets, CleanupLevel::Standard, &[], true);
-        assert_eq!(standard[0].selection, PlanSelection::Selected);
+        assert_eq!(
+            standard[0].selection,
+            PlanSelection::Selected {
+                source: SelectionSource::Level
+            }
+        );
     }
 
     #[test]
@@ -1094,7 +1364,7 @@ mod tests {
         assert_eq!(
             planned
                 .iter()
-                .filter(|item| matches!(item.selection, PlanSelection::Selected))
+                .filter(|item| matches!(item.selection, PlanSelection::Selected { .. }))
                 .count(),
             1
         );
@@ -1104,5 +1374,247 @@ mod tests {
                 PlanSelection::Skipped(reason) if reason == "superseded by mode.broad"
             )
         }));
+    }
+    fn manual_fixture() -> (tempfile::TempDir, DetectedTarget) {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("package.json"), b"{}").unwrap();
+        std::fs::create_dir(fixture.path().join("node_modules")).unwrap();
+        let scan = crate::Scanner::new(crate::ScanOptions::default())
+            .scan(fixture.path())
+            .unwrap();
+        let target = detect_workspace_targets(&scan, BUILTIN_TARGETS, None).remove(0);
+        (fixture, target)
+    }
+
+    fn manually_plan(
+        targets: Vec<DetectedTarget>,
+        manual_indices: &[usize],
+        mode: SelectionMode,
+    ) -> Result<Vec<PlannedTarget>, SelectionError> {
+        let keys = manual_indices
+            .iter()
+            .map(|index| CandidateKey::from_target(&targets[*index]))
+            .collect();
+        plan_cleanup_with_selection(targets, CleanupLevel::Safe, &[], false, &keys, mode)
+    }
+
+    #[test]
+    fn manual_selection_overrides_level_and_records_reason() {
+        let (_fixture, mut target) = manual_fixture();
+        target.stale = Some(true);
+        let planned = manually_plan(vec![target], &[0], SelectionMode::ManualOnly).unwrap();
+        assert_eq!(
+            planned[0].selection,
+            PlanSelection::Selected {
+                source: SelectionSource::Manual {
+                    overrode: Some("requires standard cleanup level".into())
+                }
+            }
+        );
+        let json = serde_json::to_value(&planned[0]).unwrap();
+        assert_eq!(json["selection"]["status"], "selected");
+        assert_eq!(json["selection"]["source"]["kind"], "manual");
+    }
+
+    #[test]
+    fn manual_selection_overrides_staleness_and_unknown_age() {
+        let (_fixture, mut target) = manual_fixture();
+        target.minimum_level = CleanupLevel::Safe;
+        target.properties = TargetClass::Cheap.properties();
+        for (stale, reason) in [
+            (Some(false), "target is not stale"),
+            (None, "target age is unknown"),
+        ] {
+            target.stale = stale;
+            let planned =
+                manually_plan(vec![target.clone()], &[0], SelectionMode::ManualOnly).unwrap();
+            assert_eq!(
+                planned[0].selection,
+                PlanSelection::Selected {
+                    source: SelectionSource::Manual {
+                        overrode: Some(reason.into())
+                    }
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn manual_selection_is_explicit_naming_for_user_data() {
+        let (_fixture, mut target) = manual_fixture();
+        target.minimum_level = CleanupLevel::Safe;
+        target.class = TargetClass::Irreplaceable;
+        target.properties = target.class.properties();
+        target.stale = Some(true);
+        let planned = manually_plan(vec![target], &[0], SelectionMode::ManualOnly).unwrap();
+        assert_eq!(
+            planned[0].selection,
+            PlanSelection::Selected {
+                source: SelectionSource::Manual {
+                    overrode: Some("not selected by cleanup level".into())
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn manual_selection_cannot_override_refusal_or_information() {
+        let (_fixture, target) = manual_fixture();
+        let mut refused = target.clone();
+        refused.safety = CandidateSafety::Refused("dataless content".into());
+        assert!(
+            manually_plan(vec![refused], &[0], SelectionMode::ManualOnly)
+                .unwrap_err()
+                .to_string()
+                .contains("safety refusal: dataless content")
+        );
+        let mut information = target;
+        information.operation = PlannedOperation::Informational;
+        assert!(
+            manually_plan(vec![information], &[0], SelectionMode::ManualOnly)
+                .unwrap_err()
+                .to_string()
+                .contains("informational only")
+        );
+    }
+
+    #[test]
+    fn exclusive_manual_conflicts_name_both_candidates_and_manual_wins() {
+        let (_fixture, mut target) = manual_fixture();
+        target.minimum_level = CleanupLevel::Safe;
+        target.properties = TargetClass::Cheap.properties();
+        target.stale = Some(true);
+        target.exclusive_group = Some("alternatives".into());
+        let mut alternative = target.clone();
+        alternative.id = "alternative".into();
+        alternative.exclusive_priority = 255;
+        let error = manually_plan(
+            vec![target.clone(), alternative.clone()],
+            &[0, 1],
+            SelectionMode::LevelPlusManual,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(&CandidateKey::from_target(&target).to_string()));
+        assert!(error.contains(&CandidateKey::from_target(&alternative).to_string()));
+        let planned = manually_plan(
+            vec![target, alternative],
+            &[0],
+            SelectionMode::LevelPlusManual,
+        )
+        .unwrap();
+        assert!(matches!(
+            planned[0].selection,
+            PlanSelection::Selected {
+                source: SelectionSource::Manual { overrode: Some(ref reason) }
+            } if reason == "superseded by alternative"
+        ));
+        assert_eq!(
+            planned[1].selection,
+            PlanSelection::Skipped("superseded by node.modules".into())
+        );
+    }
+
+    #[test]
+    fn selection_modes_control_level_selected_siblings() {
+        let (_fixture, mut target) = manual_fixture();
+        target.minimum_level = CleanupLevel::Safe;
+        target.properties = TargetClass::Cheap.properties();
+        target.stale = Some(true);
+        let mut sibling = target.clone();
+        sibling.path = Some(
+            target
+                .path
+                .as_ref()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("sibling"),
+        );
+        for (mode, count) in [
+            (SelectionMode::ManualOnly, 1),
+            (SelectionMode::LevelPlusManual, 2),
+        ] {
+            let planned = manually_plan(vec![target.clone(), sibling.clone()], &[0], mode).unwrap();
+            assert_eq!(
+                planned
+                    .iter()
+                    .filter(|item| matches!(item.selection, PlanSelection::Selected { .. }))
+                    .count(),
+                count
+            );
+        }
+        assert!(
+            manually_plan(vec![target], &[], SelectionMode::ManualOnly)
+                .unwrap()
+                .iter()
+                .all(|item| matches!(item.selection, PlanSelection::Skipped(_)))
+        );
+    }
+
+    #[test]
+    fn candidate_keys_preserve_exact_command_identity_and_serde() {
+        let (_fixture, mut target) = manual_fixture();
+        target.path = None;
+        target.operation = PlannedOperation::Command {
+            command: CommandSpec {
+                executable: "/fixture/tool".into(),
+                args: vec!["one two".into()],
+                environment: BTreeMap::new(),
+            },
+        };
+        let key = CandidateKey::from_target(&target);
+        let decoded: CandidateKey =
+            serde_json::from_str(&serde_json::to_string(&key).unwrap()).unwrap();
+        assert_eq!(key, decoded);
+        if let PlannedOperation::Command { command } = &mut target.operation {
+            command.args = vec!["one".into(), "two".into()];
+        }
+        assert_ne!(key, CandidateKey::from_target(&target));
+        target.provider.context = Some("other daemon".into());
+        assert_ne!(key, CandidateKey::from_target(&target));
+    }
+    #[test]
+    fn manual_selection_overrides_explicit_only_generated_policy() {
+        let (_fixture, mut target) = manual_fixture();
+        target.minimum_level = CleanupLevel::Safe;
+        target.properties = TargetClass::Cheap.properties();
+        target.properties.automation = Automation::ExplicitTargetOnly;
+        target.stale = Some(true);
+        let planned = manually_plan(vec![target], &[0], SelectionMode::ManualOnly).unwrap();
+        assert_eq!(
+            planned[0].selection,
+            PlanSelection::Selected {
+                source: SelectionSource::Manual {
+                    overrode: Some("not selected by cleanup level".into())
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn manual_choice_does_not_widen_automatic_safe_limits() {
+        let (fixture, mut target) = manual_fixture();
+        target.minimum_level = CleanupLevel::Safe;
+        target.properties = TargetClass::Cheap.properties();
+        target.stale = Some(true);
+        let targets = (0..101)
+            .map(|index| {
+                let path = fixture.path().join(format!("candidate-{index}"));
+                std::fs::create_dir(&path).unwrap();
+                let mut candidate = target.clone();
+                candidate.path = Some(path);
+                candidate
+            })
+            .collect();
+        let planned = manually_plan(targets, &[0], SelectionMode::LevelPlusManual).unwrap();
+        assert!(matches!(&planned[0].selection, PlanSelection::Selected {
+            source: SelectionSource::Manual { overrode: Some(reason) }
+        } if reason.contains("conservative count/byte limit")));
+        assert!(
+            planned[1..]
+                .iter()
+                .all(|item| matches!(item.selection, PlanSelection::Skipped(_)))
+        );
     }
 }

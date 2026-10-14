@@ -1,6 +1,6 @@
 //! TTY-aware human output. JSON, completions, and man pages bypass this module.
 
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,10 +13,15 @@ use comfy_table::{
 use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use cleanrs_core::targets::{CandidateSafety, DetectedTarget, PlanSelection, UsageEstimate};
+use cleanrs_core::targets::{
+    Automation, CandidateSafety, DetectedTarget, PlanSelection, PlannedOperation, Recoverability,
+    SelectionSource, UsageEstimate,
+};
 use cleanrs_core::{Confidence, DoctorReport, ScanObserver, ScanProgress};
 
+use crate::pipeline::{ExecutionEvent, ExecutionObserver, PlanEvent, PlanObserver};
 use crate::{CleanOutput, Metric, ScanOutput, TargetsOutput, format_interval, human_bytes};
+use cleanrs_core::execution::{OutputStream, command_argv};
 
 /// Presentation policy derived from the actual output streams and `NO_COLOR`.
 pub(crate) struct TerminalUi {
@@ -376,8 +381,25 @@ impl TerminalUi {
         ]);
         for planned in &output.targets {
             let (action, reason, color) = match &planned.selection {
-                PlanSelection::Selected => ("plan", "selected", Color::Yellow),
-                PlanSelection::Skipped(reason) => ("skip", reason.as_str(), Color::DarkGrey),
+                PlanSelection::Selected {
+                    source: SelectionSource::Level,
+                } => ("plan", "selected".to_owned(), Color::Yellow),
+                PlanSelection::Selected {
+                    source: SelectionSource::Manual { overrode },
+                } => (
+                    "plan (manual)",
+                    overrode
+                        .clone()
+                        .unwrap_or_else(|| "selected manually".into()),
+                    if planned.target.properties.recoverability == Recoverability::UserData
+                        || planned.target.properties.automation == Automation::ExplicitTargetOnly
+                    {
+                        Color::Red
+                    } else {
+                        Color::Yellow
+                    },
+                ),
+                PlanSelection::Skipped(reason) => ("skip", reason.clone(), Color::DarkGrey),
             };
             let (usage, _) = usage_display(&planned.target.usage);
             plan.add_row(vec![
@@ -386,7 +408,16 @@ impl TerminalUi {
                 Cell::new(target_project_name(&planned.target)),
                 Cell::new(target_location(&planned.target)),
                 Cell::new(&planned.target.id),
-                Cell::new(reason),
+                if matches!(
+                    planned.selection,
+                    PlanSelection::Selected {
+                        source: SelectionSource::Manual { .. }
+                    }
+                ) {
+                    self.value(reason, color)
+                } else {
+                    Cell::new(reason)
+                },
             ]);
         }
         println!("{plan}");
@@ -435,7 +466,21 @@ impl TerminalUi {
         self.print_provider_statuses(&output.providers);
         if output.execution.starts_with("dry-run") {
             println!();
-            if output.selected_targets > 0 {
+            if output.targets.iter().any(|item| {
+                matches!(
+                    item.selection,
+                    PlanSelection::Selected {
+                        source: SelectionSource::Manual { .. }
+                    }
+                )
+            }) {
+                println!(
+                    "{} Only your {} candidates are selected. Review manual overrides, then add {} to execute.",
+                    self.muted("TIP"),
+                    self.warning("--select"),
+                    self.warning("--apply")
+                );
+            } else if output.selected_targets > 0 {
                 println!(
                     "{} This was a dry run. Add {} to execute the reviewed plan.",
                     self.muted("TIP"),
@@ -688,7 +733,7 @@ fn target_location(target: &DetectedTarget) -> String {
     )
 }
 
-fn usage_display(usage: &UsageEstimate) -> (String, Option<Confidence>) {
+pub(crate) fn usage_display(usage: &UsageEstimate) -> (String, Option<Confidence>) {
     match usage {
         UsageEstimate::Filesystem { reclaimable, .. } => {
             (format_interval(reclaimable), Some(reclaimable.confidence))
@@ -785,6 +830,96 @@ fn grouped(value: u64) -> String {
         output.push(character);
     }
     output
+}
+
+/// Adapt pipeline notifications to the existing CLI scan indicator. Phase
+/// counters are available to future views without adding redirected output.
+pub(crate) struct CliPlanObserver {
+    pub(crate) progress: Option<Arc<ScanProgressIndicator>>,
+}
+impl PlanObserver for CliPlanObserver {
+    fn on_event(&self, event: PlanEvent) {
+        match event {
+            PlanEvent::PhaseStarted { phase } => tracing::debug!(phase, "planning started"),
+            PlanEvent::PhaseFinished { phase, count } => {
+                tracing::debug!(phase, count, "planning finished")
+            }
+            PlanEvent::CargoMetadata { completed, total } => {
+                tracing::debug!(completed, total, "cargo metadata")
+            }
+        }
+    }
+    fn on_scan_progress(&self, progress: ScanProgress) {
+        if let Some(indicator) = &self.progress {
+            indicator.on_progress(progress);
+        }
+    }
+}
+
+pub(crate) struct CliExecutionObserver {
+    json: bool,
+    progress: Option<ActionProgressIndicator>,
+}
+impl CliExecutionObserver {
+    pub(crate) fn new(json: bool) -> Self {
+        Self {
+            json,
+            progress: None,
+        }
+    }
+}
+impl ExecutionObserver for CliExecutionObserver {
+    fn on_event(&mut self, event: ExecutionEvent<'_>) {
+        match event {
+            ExecutionEvent::RunStarted { total } => tracing::debug!(total, "cleanup started"),
+            ExecutionEvent::ActionStarted { index, target } => {
+                tracing::debug!(index, target = target.id, "action started");
+                match &target.operation {
+                    PlannedOperation::DirectDelete { path, .. } => {
+                        eprintln!(
+                            "Applying {}: permanent delete {}",
+                            target.id,
+                            path.display()
+                        );
+                        self.progress = ActionProgressIndicator::create(
+                            &target.id,
+                            !self.json && stderr_is_terminal(),
+                        );
+                    }
+                    PlannedOperation::Command { command } => {
+                        eprintln!("Applying {}: argv = {:?}", target.id, command_argv(command))
+                    }
+                    PlannedOperation::Informational => {}
+                }
+            }
+            ExecutionEvent::OutputLine {
+                index,
+                stream,
+                line,
+            } => {
+                tracing::trace!(index, ?stream, "provider output");
+                if !self.json {
+                    match stream {
+                        OutputStream::Stdout => {
+                            let _ = io::stdout().lock().write_all(line);
+                        }
+                        OutputStream::Stderr => {
+                            let _ = io::stderr().lock().write_all(line);
+                        }
+                    }
+                }
+            }
+            ExecutionEvent::ActionFinished { index, result } => {
+                tracing::debug!(index, status = ?result.status, "action finished");
+                if let Some(progress) = self.progress.take() {
+                    progress.finish(result.status);
+                }
+            }
+            ExecutionEvent::RunFinished { summary } => {
+                tracing::debug!(outcome = summary.outcome, "cleanup finished")
+            }
+        }
+    }
 }
 
 #[cfg(test)]

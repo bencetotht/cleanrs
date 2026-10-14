@@ -241,6 +241,18 @@ pub fn inspect_cargo_builds(
     home: Option<&Path>,
     stale_after_days: u32,
 ) -> ProviderInventory {
+    inspect_cargo_builds_with_progress(scan, host, home, stale_after_days, |_, _| {})
+}
+
+/// Publish bounded metadata inspection progress using the already discovered
+/// manifest list; no extra walk or subprocess is needed for these counters.
+pub fn inspect_cargo_builds_with_progress(
+    scan: &ScanResult,
+    host: &dyn ProviderHost,
+    home: Option<&Path>,
+    stale_after_days: u32,
+    mut progress: impl FnMut(usize, usize),
+) -> ProviderInventory {
     let mut inventory = ProviderInventory::default();
     let Ok(Some(cargo)) = host.resolve_executable("cargo") else {
         inventory.statuses.push(ProviderStatus {
@@ -279,7 +291,9 @@ pub fn inspect_cargo_builds(
     manifests.truncate(MAX_CARGO_METADATA_COMMANDS);
     let mut groups = BTreeMap::<PathBuf, (PathBuf, NodeIndex, Vec<PathBuf>)>::new();
     let mut failures = omitted_manifests;
-    for (manifest_index, manifest) in manifests {
+    let total = manifests.len();
+    for (position, (manifest_index, manifest)) in manifests.into_iter().enumerate() {
+        progress(position, total);
         let spec = CommandSpec {
             executable: cargo.clone(),
             args: vec![
@@ -322,6 +336,8 @@ pub fn inspect_cargo_builds(
             })
             .or_insert_with(|| (workspace_root.clone(), manifest_index, vec![workspace_root]));
     }
+
+    progress(total, total);
 
     for (target_dir, (workspace_root, manifest_index, owners)) in groups {
         let target_index = (0..scan.arena.nodes.len())

@@ -22,6 +22,11 @@ pub struct JournalAction {
     pub context: Option<String>,
     pub argv: Option<Vec<String>>,
     pub status: String,
+    /// Missing in pre-M0 journals; absence means selection by level.
+    #[serde(default = "level_selection_source")]
+    pub selection_source: String,
+    #[serde(default)]
+    pub overridden_skip_reason: Option<String>,
     pub planned_allocated: Option<u64>,
     pub estimated_floor: Option<u64>,
     pub estimated_ceiling: Option<u64>,
@@ -33,6 +38,10 @@ pub struct JournalAction {
     pub stdout_summary: Option<String>,
     pub stderr_summary: Option<String>,
     pub error: Option<String>,
+}
+
+fn level_selection_source() -> String {
+    "level".into()
 }
 
 impl JournalAction {
@@ -233,5 +242,26 @@ mod tests {
             .unwrap();
         assert!(fixture.path().join("history.jsonl.1").exists());
         assert_eq!(journal.read().unwrap().len(), 2);
+    }
+    #[test]
+    fn old_actions_without_selection_fields_still_parse() {
+        let action: JournalAction = serde_json::from_value(serde_json::json!({
+            "target_id": "fixture", "provider_id": "workspace", "status": "success"
+        }))
+        .unwrap();
+        assert_eq!(action.selection_source, "level");
+        assert_eq!(action.overridden_skip_reason, None);
+        let fixture = tempdir().unwrap();
+        let path = fixture.path().join("history.jsonl");
+        fs::write(&path, serde_json::json!({
+            "schema": 1, "run_id": "old", "timestamp_unix_seconds": 1,
+            "cleanrs_version": "test", "scope": fixture.path(), "level": "safe",
+            "explicitly_named_ids": [], "outcome": "success",
+            "actions": [{"target_id": "fixture", "provider_id": "workspace", "status": "success"}]
+        }).to_string() + "\n").unwrap();
+        assert_eq!(
+            Journal::new(path).read().unwrap()[0].actions[0].selection_source,
+            "level"
+        );
     }
 }

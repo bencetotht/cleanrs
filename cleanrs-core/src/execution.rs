@@ -144,6 +144,41 @@ pub fn execute_command(
     stream: bool,
     max_summary_bytes: usize,
 ) -> ActionResult {
+    execute_command_with_observer(
+        command,
+        planned_executable,
+        max_summary_bytes,
+        |stream_kind, line| {
+            if stream {
+                match stream_kind {
+                    OutputStream::Stdout => {
+                        let _ = io::stdout().lock().write_all(line);
+                    }
+                    OutputStream::Stderr => {
+                        let _ = io::stderr().lock().write_all(line);
+                    }
+                }
+            }
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// Stream bounded output fragments to the calling thread while both pipes are
+/// drained concurrently. Lines include their original newline; long lines are
+/// split to keep memory bounded. Bytes are preserved even for non-UTF-8 output
+/// or an unterminated final line. No reader thread calls presentation code.
+pub fn execute_command_with_observer(
+    command: &CommandSpec,
+    planned_executable: ExecutableIdentity,
+    max_summary_bytes: usize,
+    mut output: impl FnMut(OutputStream, &[u8]),
+) -> ActionResult {
     let current = match executable_identity(&command.executable) {
         Ok(identity) => identity,
         Err(error) => {
@@ -173,10 +208,22 @@ pub fn execute_command(
     };
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let stdout_thread =
-        thread::spawn(move || capture_stream(stdout, stream, false, max_summary_bytes));
-    let stderr_thread =
-        thread::spawn(move || capture_stream(stderr, stream, true, max_summary_bytes));
+    let (sender, receiver) = crossbeam_channel::bounded(64);
+    let stdout_sender = sender.clone();
+    let stdout_thread = thread::spawn(move || {
+        capture_stream(
+            stdout,
+            stdout_sender,
+            OutputStream::Stdout,
+            max_summary_bytes,
+        )
+    });
+    let stderr_thread = thread::spawn(move || {
+        capture_stream(stderr, sender, OutputStream::Stderr, max_summary_bytes)
+    });
+    for (stream, line) in receiver {
+        output(stream, &line);
+    }
     let status = child.wait();
     let stdout = stdout_thread
         .join()
@@ -204,26 +251,30 @@ pub fn execute_command(
 
 fn capture_stream<R: Read>(
     mut reader: R,
-    stream: bool,
-    stderr: bool,
+    sender: crossbeam_channel::Sender<(OutputStream, Vec<u8>)>,
+    stream: OutputStream,
     max_summary_bytes: usize,
 ) -> Vec<u8> {
     let mut captured = Vec::new();
     let mut buffer = [0_u8; 8192];
+    let mut pending = Vec::new();
     loop {
         let read = match reader.read(&mut buffer) {
             Ok(0) | Err(_) => break,
             Ok(read) => read,
         };
-        if stream {
-            if stderr {
-                let _ = io::stderr().lock().write_all(&buffer[..read]);
-            } else {
-                let _ = io::stdout().lock().write_all(&buffer[..read]);
+        for byte in &buffer[..read] {
+            pending.push(*byte);
+            if *byte == b'\n' || pending.len() >= 8192 {
+                let _ = sender.send((stream, pending.clone()));
+                pending.clear();
             }
         }
         let remaining = max_summary_bytes.saturating_sub(captured.len());
         captured.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+    if !pending.is_empty() {
+        let _ = sender.send((stream, pending.clone()));
     }
     captured
 }
@@ -733,5 +784,36 @@ mod tests {
         );
         assert_ne!(result.status, ActionStatus::Success);
         assert!(target.join("must-survive").exists());
+    }
+    #[test]
+    fn output_events_preserve_bytes_and_unterminated_lines_with_bounded_summaries() {
+        let fixture = tempdir().unwrap();
+        let executable = fixture.path().join("output-provider");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '\\377raw\\nlast'\nprintf 'err' >&2\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let command = CommandSpec {
+            executable: executable.clone(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let result = execute_command_with_observer(
+            &command,
+            executable_identity(&executable).unwrap(),
+            4,
+            |stream, line| match stream {
+                OutputStream::Stdout => stdout.extend_from_slice(line),
+                OutputStream::Stderr => stderr.extend_from_slice(line),
+            },
+        );
+        assert_eq!(result.status, ActionStatus::Success);
+        assert_eq!(stdout, b"\xffraw\nlast");
+        assert_eq!(stderr, b"err");
+        assert_eq!(result.stdout_summary.as_deref(), Some("\u{fffd}raw"));
     }
 }
