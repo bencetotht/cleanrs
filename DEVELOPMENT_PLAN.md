@@ -55,15 +55,21 @@ installed versions, so cleanrs initially classifies that mixed action as
 | 1 | Fast read-only scanner and diagnostics | **Useful MVP implemented; performance and UX work remains** |
 | 2 | Developer-storage inventory and cleanup plans | **Complete** |
 | 3 | Cleanup execution and lightweight history | **Complete** |
-| 5A | Interactive TUI: explore, select, clean (pulled forward from Phase 5) | **M0–M5 complete; Phase 4 next** |
-| 4 | Project hygiene and stale-project intelligence | **Next priority** |
+| 5A | Interactive TUI: explore, select, clean (pulled forward from Phase 5) | **M0–M5 complete** |
+| 4A | Target coverage and system scope (split out of Phase 4) | **Next priority** |
+| 4 | Project hygiene and stale-project intelligence | **After 4A** |
 | 5 | Index, scheduling, and remaining ratatui daily-driver work | **Terminal groundwork only** |
+| 6 | Extensibility and optional portability | **Deferred** |
 
 **Correction (2026-10-13):** Phase 4 was previously the next priority. The
 interactive TUI was split out of Phase 5 as Phase 5A and moved ahead of it;
 the reasons are recorded in the Phase 5A decision record. Phase numbers are
 kept stable so existing references remain valid.
-| 6 | Extensibility and optional portability | **Deferred** |
+
+**Correction (2026-10-14):** after 5A, Phase 4 was again listed as next. Real
+TUI use showed that the limiting factor is detector and provider coverage, not
+repository evidence, so the coverage half of Phase 4 was split out as Phase 4A
+and moved ahead of it. See the Phase 4A decision record.
 
 Phases define dependency order, but small supporting improvements may land when
 they directly unblock the active phase. A phase does not need laboratory-grade
@@ -282,6 +288,9 @@ Start with tools actually present on the development Macs, then widen coverage:
   when encountered locally rather than being Phase 2 exit gates.
 - VMware/other VM disks and Claude Cowork storage as informational or
   explicit-only targets, not generic caches.
+- **Update (2026-10-14):** Gradle, Android SDK, Metro/Expo/Watchman, Go, Maven,
+  Playwright/Puppeteer, and the still-unimplemented VMware, Claude Cowork, and
+  wallpaper-cache providers are scheduled in Phase 4A.
 
 Each provider implements a read-only `detect`/`inspect`/`plan` path before any
 execution exists. A planned command is stored as an executable plus argv array;
@@ -544,6 +553,9 @@ plan, revalidation, and journal pipeline the CLI uses.
   3. **Targets are scoped to the chosen directory by default.** Machine-wide
      providers (Cargo registry, npm/pnpm/Bun caches, Homebrew, Docker, …) are
      hidden unless toggled on with a key.
+     **Correction (2026-10-14):** the in-list `m` toggle is superseded by a
+     separate system-only scope (`S`) in Phase 4A; folder and system targets
+     will no longer share one list.
   4. **Entry point is `cleanrs tui [PATH]`**, defaulting to the working
      directory like `scan` (never implicitly the home directory). Launching the
      TUI from a bare `cleanrs` invocation is a desirable follow-up once the TUI
@@ -662,7 +674,8 @@ toggled on.
 - **Level presets** `1`/`2`/`3` reset the selection to `safe`/`standard`/
   `aggressive`. Manual ticks are discarded by a preset (the header says so).
 - **Scope toggle** `m` adds/removes machine-wide providers; the header shows
-  `scope: folder` or `scope: folder + machine`.
+  `scope: folder` or `scope: folder + machine`. *(Superseded by Phase 4A's
+  `S` system scope; kept here as the 5A implementation record.)*
 - Re-entering `T` on the same directory reuses the result and shows its age;
   `r` re-detects.
 
@@ -1368,6 +1381,143 @@ Rust 1.85 compatibility is checked by the existing CI MSRV job.
 - Index-backed instant startup and background refresh (Phase 5).
 - Project-hygiene/Git evidence panes once Phase 4 provides the data.
 - Mouse support.
+- **Moved to Phase 4A (2026-10-14):** a dedicated system-wide target scan
+  (`S`) replacing the in-list `m` machine-scope toggle.
+
+---
+
+## Phase 4A — Target coverage and system scope
+
+**Goal:** make cleanrs recognize the generated storage that actually exists in
+a developer folder and on the machine, and give folder-level and system-level
+cleanup separate, first-class entry points in both the CLI and the TUI.
+
+### Decision record (2026-10-14)
+
+- **Observation.** Real TUI use against `~/Developer` mostly surfaced
+  `node_modules`, `.next`, `dist`, and Cargo `target`. That reflects what
+  cleanrs can detect, not necessarily what is on disk: `BUILTIN_TARGETS`
+  contains exactly four workspace detectors (`cargo.target`, `node.modules`,
+  `node.next`, `node.dist`). Python environments, tool caches, Expo/React
+  Native build output, Gradle output and similar directories cannot appear.
+- **Correction.** Phase 4 listed "detect project-local `node_modules`, `.venv`,
+  Gradle output, Xcode build output…" as one bullet inside the Git/hygiene
+  work. Detector coverage does not depend on Git evidence for unambiguous
+  directory names, so it moves here. Ambiguous names that need gitignore
+  evidence stay gated on Phase 4 (see tier 2 below).
+- **Two scopes, named explicitly.** The codebase already separates
+  *workspace targets* (marker-based, scoped to an explicit path) from
+  *providers* (machine-wide: Homebrew, Nix, JS/Python package managers,
+  Cargo/rustup, Docker/OrbStack, Xcode, CocoaPods). User-facing terminology
+  becomes **folder targets** and **system targets**. What is missing is UX:
+  - the CLI has `--workspace-only` but no system-only mode, so inspecting
+    providers always costs a folder scan;
+  - the TUI hides providers behind `m` inside a folder's Targets view, which
+    mixes both scopes in one list and ties machine-wide actions to an
+    unrelated directory.
+- **Settled product decisions** (agreed with the author):
+  1. The TUI gets a global `S` shortcut that runs a **system-only** target
+     scan (providers only, no folder detection, no filesystem scan needed).
+  2. Selection → review → execute for system targets is **identical** to the
+     folder workflow: same Targets view, presets, manual-tick rules, review
+     groups, run and results screens, and the same shared pipeline/journal.
+  3. The `m` toggle is removed; one Targets list never mixes the two scopes.
+     The header shows `scope: folder <path>` or `scope: system`.
+  4. The CLI gains `--system` for `targets` and `clean` (no path; providers
+     only), the counterpart of `--workspace-only`.
+
+### Detector model extension
+
+The current workspace detector is "one marker file → one sibling directory".
+Most new targets cannot be expressed that way. Extend `TargetDefinition` (and
+the config `detect` form, keeping unknown-field rejection) with:
+
+- **Any-of markers:** e.g. `pyproject.toml | requirements.txt | setup.py |
+  Pipfile` for Python projects.
+- **Nested relative paths** for both marker and directory: e.g.
+  `ios/Podfile` → `ios/Pods`, `android/build.gradle` → `android/.gradle`.
+- **Inner markers:** a directory is recognized by a file it contains, e.g. a
+  Python virtual environment by `pyvenv.cfg`, independent of its name.
+- **Nested-target collapsing** must keep working: a `__pycache__` inside a
+  detected `.venv` or `node_modules` is not a separate candidate.
+
+Every new detector inherits the existing guarantees unchanged: candidate-level
+cloud/dataless refusal, mount-boundary refusal, §8.2 path invariants, identity
+capture, deduplication, and staleness from marker/artifact mtimes.
+
+### Folder targets — tier 1 (unambiguous names, this phase)
+
+| Ecosystem | Directories | Notes |
+|---|---|---|
+| Python | `.venv`/`venv` (via `pyvenv.cfg`), `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.tox`, `.nox` | Virtual environments are `network` class (packages re-downloaded) and may contain manually installed packages, so not `safe`; tool caches are `free`/`cheap`. |
+| JS/TS frameworks | `.turbo`, `.nuxt`, `.svelte-kit`, `.parcel-cache`, `.angular/cache`, `node_modules/.cache` | `node_modules/.cache` collapses into a selected `node_modules`. |
+| Expo / React Native | `.expo`, `ios/Pods` (marker `ios/Podfile`), `android/.gradle`, `android/app/.cxx` | **Never** target `ios/` or `android/` themselves: they are generated under Expo prebuild but source code in the bare workflow, and the filesystem cannot distinguish the two. |
+| Gradle / JVM | `.gradle` (marker `settings.gradle[.kts]`/`build.gradle[.kts]`) | Project-local Gradle state only; the shared `~/.gradle` cache is a system target. |
+| Other | `.dart_tool` (Flutter/Dart), `.zig-cache`/`zig-cache`, `.terraform` | `.terraform` is downloadable provider state (`network`). |
+
+### Folder targets — tier 2 (ambiguous names, gated on Phase 4)
+
+`build/`, `out/`, `coverage/`, `ios/build`, `android/build`,
+`android/app/build`, and similar generic names are frequently source or user
+content. They become detectors only once Phase 4 supplies Git evidence, and
+then only when the directory is **gitignored** inside a repository. Outside a
+repository they remain undetected. Gitignore status is recorded as evidence on
+the candidate.
+
+### System targets — new providers
+
+Same read-only `detect`/`inspect`/`plan` contract as Phase 2 providers, native
+commands preferred over direct deletion, argv arrays only:
+
+- **Gradle:** `~/.gradle/caches`, wrapper distributions, daemon logs (cache
+  and wrapper dists are `network`).
+- **Android SDK:** system images and build tools as expensive downloadable
+  targets; AVDs (emulator disks) are `user_data`, informational/explicit-only.
+- **Metro / Expo / Watchman:** Metro and haste-map caches under `$TMPDIR`,
+  `~/.expo` cache, `watchman watch-del-all` as an informational or confirmed
+  action.
+- **Go:** `go clean -cache` (build cache, `cheap`) separate from
+  `go clean -modcache` (`network`).
+- **Maven:** `~/.m2/repository` (`network`, standard).
+- **Browser automation:** Playwright (`~/Library/Caches/ms-playwright`) and
+  Puppeteer downloads (`expensive`, `network`).
+- **Small caches:** node-gyp headers, SwiftPM cache, TypeScript server cache.
+- **§7.3 baseline leftovers (still unimplemented):** VMware `.vmwarevm`
+  bundles (informational `user_data`), Claude Cowork VM bundle
+  (explicit-only, informational first), and the version-validated wallpaper
+  cache (`confirmed`).
+
+### System scope UX
+
+- **CLI:** `cleanrs targets --system` and `cleanrs clean --system [--apply]`
+  take no path, skip the filesystem scan and workspace detection, and inspect
+  providers only. `--system` conflicts with a path argument and with
+  `--workspace-only`. `--only`/`--exclude`/levels/`--select` behave as today.
+- **TUI:** `S` from any non-modal screen opens the Targets view in system
+  scope. Provider inspection runs on the worker with the usual activity line
+  (per-provider progress, since some commands are slow). Results are cached
+  for the session with their age, `r` re-inspects, and `Esc` returns to the
+  screen `S` was pressed on.
+- Remove `m` and the `machine` flag from the folder Targets view; update the
+  help overlay, README keymap table, and VISION/README wording together.
+
+### Practical completion criteria
+
+- [ ] Detector model supports any-of markers, nested relative paths, and inner
+      markers; config parsing rejects incomplete/contradictory forms.
+- [ ] Each tier-1 detector has a fixture test, including nested collapsing
+      (`__pycache__` in `.venv`) and a dataless/cloud refusal case.
+- [ ] Expo fixtures prove `ios/` and `android/` are never candidates while
+      `ios/Pods` and `android/.gradle` are.
+- [ ] `targets --system` / `clean --system` inspect providers only, without a
+      filesystem scan, and refuse a path argument.
+- [ ] TUI `S` opens a system-scope Targets view whose selection, review, run,
+      and results behave and journal identically to the folder flow; `m` is
+      gone and no list mixes scopes.
+- [ ] New providers have command-output/fixture parser tests and never require
+      deleting real data; Android AVDs, VMware bundles, and Cowork state are
+      unreachable by any level.
+- [ ] README, VISION (§7 provider table, §7.3), and the TUI help agree.
 
 ---
 
@@ -1393,8 +1543,12 @@ risk depends on project state.
 - Record remote presence, upstream synchronization, dirty/untracked state,
   recent commits, and filesystem activity signals without reading arbitrary
   project contents.
-- Detect project-local `node_modules`, `.venv`, Cargo `target`, Gradle output,
-  Xcode build output, and other regenerated artifacts.
+- ~~Detect project-local `node_modules`, `.venv`, Cargo `target`, Gradle output,
+  Xcode build output, and other regenerated artifacts.~~ **Moved to Phase 4A
+  (2026-10-14)** for unambiguous names. What remains here: record gitignore
+  status as candidate evidence and use it to enable Phase 4A's tier-2
+  detectors (`build/`, `out/`, `coverage/`, `ios/build`, `android/build`, …)
+  only for gitignored directories inside a repository.
 - Consume and revalidate Phase 2's shared/custom `CARGO_TARGET_DIR` ownership
   map instead of rediscovering or double-counting the same build directory.
 - Build on Phase 2's approximately 14-day Cargo build candidates with stronger
@@ -1485,7 +1639,8 @@ moved to Phase 5A. Phase 5 extends that TUI with:
 
 - Overview of container/volume state, recognized developer storage, large
   unknown paths, and recent cleanup history.
-- Machine-wide provider/action inventory grouped by severity.
+- ~~Machine-wide provider/action inventory grouped by severity.~~ **Moved to
+  Phase 4A (2026-10-14)** as the `S` system-scope Targets view.
 - Project-hygiene findings and explanations (data from Phase 4).
 - Fast startup from the index with visible freshness state and background
   refresh, extending the TUI's static restart cache.
@@ -1563,22 +1718,31 @@ Work should continue in this order:
 1. **Phase 5A M0–M5 complete:** shared cleanup pipeline, per-candidate
    selection, browser/targets/review/run/results, cached totals, safety parity,
    freshness, terminal polish and documentation are implemented (details above).
-2. Begin **Phase 4 project hygiene** using the shared pipeline: Cargo
+2. **Phase 4A target coverage and system scope** (next), in this order:
+   1. detector model extension (any-of markers, nested paths, inner markers)
+      plus the tier-1 folder detectors and their fixtures;
+   2. system scope: `--system` in the CLI, `S` in the TUI, removal of `m`;
+   3. new system providers (Gradle, Android, Metro/Expo/Watchman, Go, Maven,
+      Playwright/Puppeteer, small caches), then the §7.3 leftovers (VMware,
+      Claude Cowork, wallpaper cache).
+3. Then **Phase 4 project hygiene** using the shared pipeline: Cargo
    shared-target ownership and project-activity evidence first, then repository
-   state, worktree, lockfile and process-activity evidence.
-3. **Resolved Cargo observation (2026-10-13):** stale `cargo.target` actions
+   state (including gitignore evidence that unlocks Phase 4A tier-2
+   detectors), worktree, lockfile and process-activity evidence.
+4. **Resolved Cargo observation (2026-10-13):** stale `cargo.target` actions
    intentionally require aggressive severity; the targets UI now says “needs
    aggressive” at lower levels. Fourteen days is an artifact threshold, not
    proof that the repository is abandoned.
-4. Alongside normal feature work, finish the Phase 1 largest-file view,
+5. Alongside normal feature work, finish the Phase 1 largest-file view,
    packed-record parser fixtures and a checked-in performance baseline.
-5. Keep the TUI follow-ups listed above: bare `cleanrs` launch, history view,
+6. Keep the TUI follow-ups listed above: bare `cleanrs` launch, history view,
    index-backed startup and mouse support. Browser-arena discovery reuse and
    selection-scoped fresh review are implemented in the post-M5 improvements.
-6. Revisit Trash only as an explicit moved-not-reclaimed workflow, and add
+7. Revisit Trash only as an explicit moved-not-reclaimed workflow, and add
    observed APFS container-free-space evidence only when its measurement
    boundary is truthful and reproducible.
 
 Phases 0–3 now provide accounting, read-only inventory, immutable cleanup plans,
 guarded execution, persistent config trust, and lightweight history. Phase 5A
-(the interactive TUI) now completes the next feature boundary; Phase 4 is next.
+(the interactive TUI) now completes the next feature boundary; Phase 4A (target
+coverage and system scope) is next, followed by Phase 4.
