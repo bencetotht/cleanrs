@@ -1,552 +1,218 @@
 # cleanrs
 
-Storage usage analyzer and cleaner for developers, written in Rust. Fully transparent.
+cleanrs is a macOS-first storage analyzer and developer-cache cleaner written in
+Rust. It separates how much storage a directory occupies from how much deleting
+it might reclaim: APFS clones and snapshots make those different questions.
+Browse developer artifacts, inspect tool-managed caches, and review cleanup
+plans with reclaimability intervals. Cleanup defaults to a dry run.
 
-> **Status: Phases 0–4 (including 4A) and Phase 5A implemented.** The read-only `scan`, `doctor`, and
-> workspace/provider `targets` commands are joined by immutable cleanup plans,
-> guarded `clean --apply`, persistent command-config trust, and action-level
-> `history`. Direct deletion is descriptor-relative and provider commands are
-> revalidated before execution. `cleanrs tui` now supports progressive sizes,
-> navigation, accounting details, scoped target selection, and reviewed cleanup
-> through the same guarded pipeline. `cleanrs projects` adds Git/worktree state,
-> activity evidence, retention rules and artifact recommendations. Phase 5
-> indexing, scheduling and the remaining TUI overview work come next. Deeper
-> snapshot and File Provider research remain deferred unless they enable a concrete
-> capability. See
-> [the findings](docs/findings-phase0.md), [VISION.md](VISION.md), and the
-> explicit progress boundary in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
+## Install
 
-## Why
+Homebrew (macOS and Linux):
 
-A directory walker can tell you how much space a file *occupies*. It cannot
-reliably tell you how much space *deleting it will return*.
-
-On APFS those are different questions. Blocks can be shared between cloned
-files, pinned by snapshots, held as purgeable, hidden behind protected paths, or
-managed inside a provider's own storage such as Docker's disk image. `du` gets
-blocks and hardlinks right; none of the rest is visible to any walker.
-
-cleanrs answers the second question:
-
-> **Where did my disk go, and how much do I actually get back if I delete this?**
-
-Its practical focus is recurring developer storage: discover caches, build
-artifacts, runtimes, environments, and other known storage across tools such as
-Homebrew, Nix, package managers, Docker/OrbStack, Cargo, and Xcode; then show or
-run the correct native cleanup action at an explicit severity. Fast low-level
-scanning supports that workflow rather than trying to replace a general-purpose
-disk browser.
-
-## What it does
-
-**Analyze.** A scan built on `getattrlistbulk(2)` — attributes arrive with
-directory entries instead of one `lstat` per file — reporting apparent,
-allocated, and *immediately private* sizes, with clone and hardlink sharing
-accounted for. Browsable in a TUI or scriptable via `--json`.
-
-**Reconcile.** `cleanrs doctor` explains the gap between what storage reports
-and what a walk can see: snapshots, purgeable space, and coverage the scan could
-not achieve — without pretending the categories add up. Reconciliation is
-**container-scoped**, because APFS volumes share one free-space pool; swap on
-`/System/Volumes/VM` and a Nix store on `/nix` are invisible to any
-single-volume accounting.
-
-**Clean.** Known developer storage sinks — Xcode `DerivedData`, `node_modules`,
-Docker and OrbStack build cache, Homebrew, pnpm/npm/Bun data, cargo artifacts,
-Nix, and validated macOS caches — classified by how they recover and what that
-costs, reclaimed at a chosen intensity.
-
-**Protect.** Large but stateful objects such as VMware machines, Docker volumes,
-Claude's Cowork VM, simulator device data, and macOS swap are still identified
-and explained, but never mistaken for disposable cache data. System-managed
-swap is diagnostic-only; user data requires an explicitly named action. Cowork
-bundles remain inventory-only: local tasks may still need the VM, and no safe
-host-side prune/reset interface has been verified. See the
-[Cowork investigation](DEVELOPMENT_PLAN.md#cowork-storage-review-2026-10-15).
-
-The initial known-location acceptance inventory—including the motivating
-machine's home, Library and Developer trees, both container runtimes, package
-manager caches, VMs, wallpaper cache, swap, and Xcode data—is mapped explicitly
-in [VISION.md §7.3](VISION.md#73-baseline-known-location-coverage).
-
-**Verify.** Every applied run records the reviewed estimate, action outcome,
-removed tree allocation or provider-reported result, exact argv, exit status,
-and bounded output/error evidence. `history` distinguishes success, failure,
-skip, and validation abort.
-
-**Correction:** an earlier README said Phase 3 already measured APFS container
-free-space deltas and classified every discrepancy. It does not yet. Current
-history calls its evidence “removed allocation” or “provider reported” and does
-not attribute noisy container free-space changes to cleanrs. Container-delta
-calibration remains planned accounting work.
-
-## Honesty about numbers
-
-Reclaimable space is reported as an **interval with a derived confidence**, not
-as a promise:
-
-```
-18.2 GiB reclaimable · high confidence
-
-12.4–18.2 GiB reclaimable · medium confidence
-Cloned blocks shared with paths outside this selection
+```sh
+brew install bencetotht/tap/cleanrs
 ```
 
-The reason is that group deletion is *superadditive*: two files that clone only
-each other each report zero bytes as privately theirs, yet deleting both frees
-everything. Summing per-file figures — which is the obvious implementation —
-under-reports worst exactly where the tool is most useful, in build trees that
-clone internally. So cleanrs brackets the answer instead: a floor of what is
-provably private, a ceiling of clone-deduplicated allocation. When nothing is
-shared the two collapse into one number, which is the common case.
+Nix (Apple Silicon macOS and Linux):
 
-Confidence is that interval's tightness, not an adjective added afterwards.
+```sh
+nix run github:bencetotht/cleanrs -- --help
+nix profile install github:bencetotht/cleanrs
+```
 
-Exact freeable bytes is a research goal, not a claimed capability. What is
-actually derivable from APFS metadata is the first thing the project will
-establish, before anything is built on top of it.
+Prebuilt tarballs for Apple Silicon, Intel Macs, and x86_64/aarch64 Linux are
+published on [GitHub Releases](https://github.com/bencetotht/cleanrs/releases).
+They include the binary, manual page, and bash/zsh/fish completions.
+
+From source (Rust 1.85 or later):
+
+```sh
+cargo install --locked --git https://github.com/bencetotht/cleanrs cleanrs
+```
+
+See [installation](docs/installation.md) for checksums, shell setup, upgrades,
+Full Disk Access, and Gatekeeper. Release channels become available with the
+first published release; signing depends on the maintainer's Apple secrets.
+
+## Quick start — TUI
+
+```sh
+cleanrs tui ~/Developer
+# Or browse the current working directory:
+cleanrs tui
+```
+
+The TUI requires an interactive terminal of at least 80×20. It respects
+`NO_COLOR`. Browse folders, open **Targets** with `T`, tick individual candidates,
+press `x` to rebuild and review the plan, then press `y` to run permanent cleanup.
+The run screen streams provider output; results distinguish removed allocation,
+provider-reported bytes, skips, and failures. `?` opens context-sensitive help.
+
+| Group | Keys | Action |
+|---|---|---|
+| Navigation | `j` / `↓`, `k` / `↑` | Next / previous row |
+| Navigation | `gg`, `G` | First / last row |
+| Navigation | `Ctrl-d`, `Ctrl-u` | Half page down / up |
+| Navigation | `l` / `Enter` / `→` | Open a browser directory |
+| Navigation | `h` / `←` / `Backspace`, `-` | Parent / previous directory |
+| Navigation | `/`, `n`, `N` | Filter; next / previous match |
+| Navigation | `s`, `r` | Cycle size/name/age sort; rescan or re-detect |
+| Navigation | `i` | Browser accounting info |
+| Selection / targets | `T`, `S` | Folder targets / separate system-provider scope |
+| Selection / targets | `Space`, `v` | Toggle item and move down / visual range |
+| Selection / targets | `Ctrl-a`, `Ctrl-r`, `u` | Select eligible / invert tickable / clear ticks |
+| Selection / targets | `1`, `2`, `3` | Safe / standard / aggressive preset; replaces manual ticks |
+| Review / run | `x` | Rebuild selected plan and review |
+| Review / run | `y`, `n` | Confirm cleanup / cancel review; confirm / cancel a stop request during run |
+| Review / run | `[`, `]` | Scroll provider output up / down during run |
+| Global | `?` | Toggle help |
+| Global | `q` / `Esc`, `Ctrl-c` | Back or request quit; during run, request stop after current action |
+
+These are the bindings in [keymap.rs](cleanrs/src/tui/keymap.rs). While filtering,
+`Enter` confirms the filter and `Esc` clears it. On review, `Enter` never confirms
+cleanup. Browser quit asks for confirmation; other screens go back one screen.
+
+### How it decides
+
+- Detection and planning are read-only. The TUI requires review and `y` before
+  running; CLI cleanup requires `--apply`.
+- `safe`, `standard`, and `aggressive` select actions by recoverability, rebuild
+  cost, minimum level, and staleness. Manual ticks can override level/age policy;
+  they cannot override safety refusals.
+- Filesystem estimates are intervals with confidence. Tool-reported estimates
+  and unknown sizes are labelled separately.
+- Trash means moved bytes, not reclaimed bytes. Trash execution is currently
+  deferred: the reserved `--trash` flag refuses execution.
+- Synced cloud content is refused. User data requires explicit selection;
+  increasing the cleanup level never selects it implicitly.
+
+### Your first target scan
+
+1. Run `cleanrs tui ~/Developer` and wait for folder sizes to populate.
+2. Highlight a project directory and press `T`. If the highlighted row is itself
+   a target directory, cleanrs uses its containing folder for detection.
+3. Read the candidate's classification, consequence, age, and refusal/skip reason.
+   Use `Space` to tick a candidate; `u` clears all ticks.
+4. Press `x`. Cleanrs refreshes the selected evidence and presents exact paths or
+   argv commands in review. A changed or refused candidate cannot run.
+5. Press `n` to return with ticks retained, or `y` to confirm permanent cleanup.
+   After execution, inspect results and use `cleanrs history` for the journal.
+
+Folder Targets inspect workspace artifacts; `S` opens machine-wide providers in
+an independent scope. Some detected storage is informational only and cannot
+be selected for deletion.
+
+## CLI
+
+| Command | Purpose |
+|---|---|
+| `scan [PATH]` | Scan metadata without reading file contents |
+| `tui [PATH]` | Browse, select, review, and run in a terminal |
+| `doctor` | Inspect container, volumes, snapshots, swap, and access state |
+| `targets [PATH]` | Detect and size targets without executing cleanup |
+| `projects [PATH]` | Explain activity, Git evidence, and artifact recommendations |
+| `clean [PATH]` | Plan cleanup; execute only with `--apply` |
+| `history` | Show cleanup runs and action outcomes |
+| `trust-config [PATH]` | Persist, list, or revoke command-config trust |
+| `completions <SHELL>` | Write shell completions to stdout |
+| `man` | Write the cleanrs(1) manual page to stdout |
+| `help [COMMAND]` | Show command usage |
+
+```sh
+# Display one level, while scanning the complete subtree:
+cleanrs scan ~/Developer --depth 1
+
+# Machine-readable accounting:
+cleanrs scan . --json
+
+# Inventory known targets (add --workspace-only to skip system providers):
+cleanrs targets .
+
+# Review the default safe plan without executing it:
+cleanrs clean .
+
+# Explicitly select a candidate path, review, then confirm execution:
+cleanrs clean . --select /absolute/path/to/project/node_modules --apply
+
+# Inspect previous action outcomes and system accounting:
+cleanrs history
+cleanrs doctor
+
+# Generate shell integration:
+cleanrs completions zsh
+```
+
+`--apply` is always explicit in the CLI, and the plan is revalidated before
+execution. Omitted paths mean the working directory. `--depth` limits display,
+not traversal; `--cross-mounts` opts into mount traversal. `scan --reclaimable`
+shows intervals, and `scan --explain <path>` explains one path's accounting.
+Use `cleanrs <command> --help` for the complete flag reference.
+
+## Extending cleanrs
+
+Add no-code targets to `~/.config/cleanrs/targets.toml`, for example:
+
+```toml
+[[target]]
+id = "custom.gradle-cache"
+description = "Gradle dependency cache; downloads may be needed again"
+detect = { path = "~/.gradle/caches" }
+class = "network"
+minimum_level = "standard"
+reclaim = { method = "delete-children" }
+```
+
+A path target must be within the explicit scan scope. Command targets use argv
+arrays; commands in the default user config are implicitly trusted. Commands in
+an explicitly named `--config` require `cleanrs trust-config /path/to/targets.toml`
+(or `--trust-config-commands`) after reviewing the file.
+
+For deeper integrations, implement the Rust `Provider` trait in
+[providers.rs](cleanrs-core/src/providers.rs). See the [provider guide](docs/providers.md)
+and [configuration reference](docs/configuration.md). System package managers
+requiring root (`apt`, `dnf`/`yum`, `pacman`) are not supported yet: cleanrs refuses
+to execute cleanup as root.
+
+## Platform support
+
+| Platform | Accounting and targets |
+|---|---|
+| macOS | Native APFS private-size and clone metadata, container diagnostics, workspace and system targets; missing capabilities remain explicit |
+| Linux | Portable allocated/apparent accounting and reduced `doctor`; no APFS clone/private-size accounting; macOS-specific system targets hidden |
+
+Linux's portable backend uses allocated size as its private-size fallback; it
+cannot detect sharing on reflink filesystems. Neither platform promises exact
+container free-space recovery for every cleanup. See [accounting](docs/accounting.md).
 
 ## Safety
 
-- Dry-run is the **default**. CLI mutation requires `--apply`; the TUI requires
-  an explicit `y` on its review screen.
-- `--apply` deletes permanently, because moving files to the Trash does not
-  return space to the disk. `--trash` is intentionally deferred and currently
-  refuses; its future accounting must report *moved, not reclaimed*.
-- **Synced cloud storage is never deleted.** iCloud Drive and
-  `~/Library/CloudStorage` hold dataless files whose deletion propagates to every
-  other device, with no undo. Those locations are refused outright, and — because
-  an ordinary `node_modules` detector will happily match inside a synced folder —
-  every individual candidate path is also checked for dataless status before it
-  can enter a plan. Freeing local space there means **evict**, not delete.
-- Scanning never materializes cloud content. A tool that downloads 200 GB while
-  claiming to save space is worse than useless.
-- Targets are classified by how they recover (`generated`, `downloadable`,
-  `user_data`) and what rebuilding costs. No intensity level ever touches
-  `user_data` such as Docker volumes; those must be named explicitly.
-- Where a tool owns its storage, cleanrs runs its native planned action after
-  revalidation rather than deleting files behind the provider's back.
-- Provider identity is part of every target. Docker contexts such as OrbStack
-  and Docker Desktop are inventoried separately, and a plan is pinned to the
-  context it inspected so a context change cannot redirect cleanup.
-- cleanrs **never loads configuration from the current directory**. A cloned
-  repository cannot make `cleanrs clean --apply` run its commands. Commands are
-  argv arrays executed directly; there is no shell anywhere.
-- Deletion is guarded by enforced path invariants, not by dry-run alone.
-- Every action is journalled and readable via `cleanrs history`.
+- Dry-run is the default. Review exact paths and commands before confirming.
+- Symlinks, protected roots, cloud paths, dataless candidates, and unsafe ancestry
+  are checked in code; dry-run is not the safety boundary.
+- No cleanup level implicitly selects `user_data`; explicit choices remain
+  subject to safety checks.
+- Configuration is never discovered in the working directory. Explicit command
+  configs are trusted by canonical path and SHA-256; edits invalidate trust.
+- Commands use executable-plus-argv arrays, never shell evaluation. Execution
+  refuses root and rechecks candidate/provider identity immediately before acting.
+- Removed allocation and provider-reported bytes are evidence, not a measured
+  increase in free space. Moving to Trash would not reclaim storage.
 
-## Command surface
+Details and enforcement locations are in [safety](docs/safety.md).
 
-```
-cleanrs scan [PATH]      One-shot analysis (--json, --reclaimable, --explain)
-cleanrs doctor           Reconcile container state; report the unexplained gap
-cleanrs targets [PATH]   List workspace targets and machine-wide provider actions
-cleanrs projects [PATH]  Explain project/Git activity and artifact recommendations
-cleanrs clean [PATH]     Plan cleanup; --select PATH picks items; --apply executes
-cleanrs history          Action outcomes and evidence from applied runs
-cleanrs trust-config     Trust/list/revoke an explicit command config by hash
-cleanrs tui [PATH]       Browse storage, select targets, review and run cleanup
-cleanrs schedule         Planned launchd maintenance
-cleanrs index            Planned cache control
-```
+## Documentation
 
-Targets live in `~/.config/cleanrs/targets.toml`, or can be defined entirely on
-the command line — no config file is required:
-
-```
-cleanrs targets . --target '~/Library/Developer/Xcode/DerivedData:free:delete-children'
-cleanrs clean . --target-argv '["/absolute/tool", "cache", "prune"]'
-cleanrs targets --export
-```
-
-`--target` uses `PATH:CLASS[:delete|delete-children]`; `--target-argv` is a JSON
-argv array and is never parsed by a shell. `--targets-only-cli` ignores both
-built-ins and config files, while `--no-builtin-targets` retains configured and
-CLI targets. The implicit config location is only
-`~/.config/cleanrs/targets.toml`; another file must be named with `--config`.
-Explicit config files containing commands require persistent trust tied to the
-canonical path and current SHA-256 content. Review and trust one with
-`cleanrs trust-config PATH`; editing or replacing it invalidates trust.
-`--trust-config-commands` is a convenience that records that same persistent
-decision for the explicitly named `--config`.
-
-```toml
-disable = ["docker.images"]
-
-[[target]]
-id = "workspace.coverage"
-description = "generated test coverage"
-detect = { marker = "Cargo.toml", dir = "coverage" }
-class = "free"
-reclaim = { method = "delete" }
-stale_after = "14d"
-scope = ["~/Developer"]
-```
-
-The TOML schema rejects unknown fields, incomplete detectors, invalid age
-values, and mismatched detector/operation pairs. A command target must use
-`reclaim = { method = "run", argv = [...] }`, and its first argv element must
-exactly match `detect.command`.
-
-## Platform
-
-macOS first, targeting APFS specifics directly. Linux support is planned;
-several parts of the design have platform seams, not just the filesystem layer.
-
-## Build and try it
-
-Rust 1.85 or newer is required.
-
-```sh
-cargo build --release
-./target/release/cleanrs scan .
-./target/release/cleanrs scan . --reclaimable --depth 2
-./target/release/cleanrs doctor
-./target/release/cleanrs doctor --scan .
-./target/release/cleanrs targets .
-./target/release/cleanrs projects .
-./target/release/cleanrs clean . --level standard
-./target/release/cleanrs history
-```
-
-`scan` defaults to the current directory and allocated-size ranking. It never
-defaults to the home directory, never follows symlinks, and never reads file
-contents. JSON output, metric selection, depth/minimum-size filters, exclusions,
-path explanations, shell completions, and a generated man page are available in
-`cleanrs --help`.
-
-`targets` also defaults its workspace scan to the current directory rather than
-the home directory. It combines marker-scoped Node.js artifacts, Cargo-aware
-workspace builds, configured targets, and machine-wide provider inventory;
-deduplicates candidates, applies staleness policy, and displays the same honest
-reclaimability intervals. `--workspace-only` skips provider inspection.
-Candidate-level cloud/dataless and mount-boundary
-checks can refuse a finding without hiding it. Configured paths additionally
-refuse symlinked ancestors and paths that escape the explicit scan scope.
-Targets nested beneath an already detected artifact root are collapsed, so
-package metadata inside `node_modules` does not flood or double-count the
-result. Human output is sorted by reclaimable ceiling and shows the largest 25
-targets by default; use `--top N` or `--min-size SIZE` to tune it. JSON remains
-complete unless one of those filters is supplied.
-The default `targets` and `clean` tables lead with reclaimable size, project
-name, and a home-relative location such as
-`~/Developer/Projects/example/target`. Exact commands, consequences, provider
-identities, and evidence remain in `--json`, keeping ordinary terminal rows
-compact enough to scan quickly.
-
-Homebrew is detected through its resolved executable, version, and prefix.
-Routine cleanup, scrub, and autoremove are separate actions with exact argv
-plans and explicit consequences. Native dry-run estimates remain labelled
-provider-reported rather than being mixed with APFS intervals; overlapping
-routine and scrub estimates are never added together. Ordinary Homebrew cleanup
-starts at `standard` because the native operation mixes stale downloads with old
-installed versions, while scrub starts at `aggressive`.
-
-The provider inventory also covers Nix; pnpm, npm/npx, Yarn, and Bun; uv, pip,
-Poetry, and Conda; Cargo and rustup; CocoaPods; Docker and OrbStack; and Xcode.
-Each action has its own stable ID, severity, consequence, provider identity,
-and exact argv when a supported native action exists. Provider rows distinguish
-occupied allocation from cleanup yield: partial GC/prune never inherits the
-whole cache's size. JSON `storage` entries retain each measured path, allocation,
-interval and filesystem identity. CLI tables show an OCCUPIED column; TUI details
-show occupied storage separately from reclamation and retain failure reasons.
-
-Supported cache inventory includes pnpm, npm's content and npx caches, installed
-Yarn Classic/modern variants, Bun, uv, pip, Poetry's PyPI repository cache,
-Conda package directories, Cargo registry/Git caches, CocoaPods downloads,
-Homebrew and Xcode paths. Full-cache actions use filesystem intervals where their
-scope is established; partial pruning can still have unknown yield. Corepack
-network access/project selection is disabled. Inspection and command execution
-run from `/`, with explicit manifest/project arguments where needed, so caller
-repository configuration cannot redirect global providers.
-
-**Correction (2026-10-15):** npx cleanup is now available when installed npm
-advertises `cache npx rm`; older variants remain informational. Yarn Classic
-cleans its measured cache root, while modern Yarn uses the global mirror.
-Conda cache cleanup deliberately preserves extracted packages, which may back
-symlinked environments; it removes download archives, indexes and logs. Poetry
-clears the PyPI repository cache, retaining other repositories and artifacts.
-CocoaPods inventory reads its bounded user cache configuration and metadata;
-it avoids `pod cache list`, whose initialization can change old caches.
-
-Unused local Docker volumes are separate anonymous/named targets. Cleanup uses
-`volume rm` for exact reviewed names, checks running AND stopped references,
-and pins context, endpoint and creation identity. **Correction:** the planned
-anonymous-volume prune was replaced with exact removal because a broad prune
-could sweep newly orphaned, unreviewed volumes. Named volumes require individual
-TUI ticks or CandidateKeys; naming the provider ID cannot select every volume.
-Non-default Rust toolchains and non-base/inactive Conda environments also support
-individual reviewed removal. Known Rust overrides are protected; dependencies
-outside inspected roots remain unknown. Unavailable simulators are measured and
-reviewed per UUID as user data, rather than deleted through a bulk action.
-
-Whole-cache Xcode DerivedData remains high-cost and explicit-ID-only. Gradle
-supports already installed wrapper distributions without executing project
-`gradlew` scripts or downloading distributions; cleanup still requires successful
-daemon inspection. Homebrew routine/scrub actions retain native estimates beside
-cache allocation; they are not full-download-cache deletion commands.
-
-**Remaining boundaries:** global Poetry environment removal, Cargo shared-cache
-GC, per-machine OrbStack allocation/removal, VMware/Cowork resets and wallpaper
-cleanup remain informational with specific reasons. Native macOS cleanup and
-regeneration have not been exercised on this Linux development host. See the
-[Phase 4B implementation and validation record](DEVELOPMENT_PLAN.md#phase-4b--complete-provider-sizing-and-cleanup-coverage).
-
-For Rust projects, Cargo metadata is queried with `--frozen --no-deps` for at
-most 256 manifests under the explicit scan root. Workspace members sharing a
-target directory collapse into one candidate. Activity is the newest
-`Cargo.toml` or build-artifact timestamp, with 14 days as the default stale
-threshold; `--cargo-stale-after DAYS` changes it for one inspection. A
-workspace-local `target/` receives an exact, workspace-pinned
-`cargo clean --frozen --manifest-path ... --target-dir ...` plan. Custom,
-shared, or out-of-scope target directories are still shown but refused until
-complete ownership can be proven; source repositories are never cleanup
-targets.
-
-`clean --select PATH` selects an individual detected candidate; repeat the flag
-for multiple items. It selects exactly those items, overriding severity and
-staleness policy, while safety refusals remain enforced. Manual choices are
-marked in the plan and history; explicit-only/user-data actions still require
-interactive confirmation. Command candidates can be selected by the exact
-`candidate_key` string from `clean --json`. Dry-run remains the default.
-
-`clean` uses the same explicit workspace scan, candidate safety checks, and
-provider inspection, then explains which actions the selected cleanup level and
-staleness policy include. Dry-run remains the default. `--apply` executes that
-same owned reviewed plan after confirmation (or `--yes`), refusing root
-execution and revalidating identities immediately before each action. JSON apply
-requires `--yes`. Direct deletion performs another metadata-only cloud, mount,
-coverage, and identity preflight before descriptor-relative traversal; provider
-commands revalidate their executable and provider context and never use a shell.
-Informational findings cannot enter a plan, explicit-only/user-data actions
-require a named ID and interactive confirmation, and unattended plans are
-capped at 100 actions or 50 GiB. Use `--ignore-staleness` only when intentionally
-reviewing currently active artifacts.
-
-All destructive project tests use unique temporary fixture directories. During
-manual development, never run `--apply` without a specific sandbox path.
-
-Applied runs are appended to a private, rotating JSONL journal under
-`$XDG_STATE_HOME/cleanrs/history.jsonl` or
-`~/.local/state/cleanrs/history.jsonl`. A pending record is durable before the
-first mutation and each completed action adds a newer snapshot, so interruption
-remains visible. `cleanrs history` collapses those snapshots into one run and
-shows what ran, what was skipped, and what failed. `[manual]` means
-“policy-eligible, picked by hand”; `[manual: <reason>]` means an explicit policy
-override. Every final TUI tick, including a preset pick, is journalled as manual.
-
-`doctor --scan PATH` reconciles one explicit scan scope against Data-volume
-usage and labels the remainder as unattributed. Without `--scan`, it stays cheap
-and reports the path attribution as unknown rather than inventing a number.
-
-### Project hygiene
-
-`cleanrs projects PATH` is read-only. It ranks project/worktree findings by
-inactivity evidence and potential artifact cleanup, showing attributed storage,
-Git state, evidence, reclaimable intervals/confidence, exact proposed actions
-and rebuild consequences. `--json` provides the full report; `--top N` and
-`--min-size SIZE` filter projects. The same evidence enriches `targets` and
-`clean` plans, including the TUI's shared planning pipeline.
-
-Git inspection disables fsmonitor and repository content filters and refuses
-external config includes/partial clones. Filtered repositories may appear dirty
-conservatively. It distinguishes dirty/untracked work, missing remotes/upstreams,
-unpushed commits, behind/diverged branches and synchronization against local
-remote refs. It never fetches. Source/manifest/dependency-lockfile timestamps,
-recent commits, newest build output and sibling worktree activity contribute
-to the explanation. Dormancy defaults to 90 days; Cargo's 14-day artifact
-threshold does not mean that the repository is abandoned. Old, clean or pushed
-source is never permission to delete a repository, and project reports do not
-create repository-deletion actions.
-
-Generated artifacts can be cleaned while dirty or unpushed source stays intact.
-Tracked files inside an artifact directory refuse cleanup, and the check runs
-again before execution. Shared/custom Cargo directories retain observed owners,
-are counted once, and remain refused while complete ownership is unproven.
-Cargo metadata resolution and target safety are revalidated before its native
-cleanup command. Node dependencies, Cargo output, Gradle build/cache output,
-gitignored project/mobile build output and Python environments are attributed
-separately. An environment is recognized by `pyvenv.cfg` under any name and is
-`network` class: excluded from `safe`, with a warning about manually installed
-packages. Generic `build`, `out`, `coverage` and mobile build paths require Git-
-ignore evidence, which is recorded and rechecked before cleanup.
-
-Retention policy lives in the existing user or explicitly named TOML config:
-
-```toml
-[[retention]]
-path = "~/Developer"
-artifact_days = 30
-dormant_days = 120
-
-[[retention]]
-path = "~/Developer/expensive-rust-project"
-project_only = true
-artifact_days = 180
-dormant_days = 365
-keep = true
-```
-
-Exact project rules override root rules; otherwise the most-specific root wins.
-`keep` prevents selection by a level even with `--ignore-staleness`; an explicit
-`--select PATH` still requires review. Policy is never discovered from the
-working directory. Reports and history retain the policy/ownership evidence.
-
-Inspection is sequential and bounded to 128 repositories/768 Git commands,
-with a 15-second budget checked between commands and a 2-second timeout/4 MiB
-output limit per command. Unsafe metadata, out-of-scope repositories/worktrees,
-failures and exhausted budgets are visible as uncertainty. Unknown repository
-inspection refuses artifact cleanup; out-of-scope sibling worktrees prevent a
-dormancy conclusion. No live-process state is inferred from lockfile age.
-See [the fixture benchmark](docs/benchmarks-phase4.md) for measured costs.
-
-**Correction:** the earlier status still described Phase 5A polish and Phase 4
-as upcoming. Phases 4/4A and 5A are now implemented; Phase 5 is next. Wallpaper cleanup
-stays disabled pending observed macOS version/layout and regeneration validation.
-
-### Expanded target coverage and system scope
-
-```sh
-cleanrs targets --system --all          # providers only; no folder traversal
-cleanrs clean --system                  # dry-run system plan
-cleanrs clean --system --only go.build-cache  # native Go build-cache action
-cleanrs targets . --workspace-only --all # folder artifacts only
-```
-
-`--system` rejects a path and `--workspace-only`; normal filters, levels and
-selection apply. System inspection measures known provider cache trees for
-honest intervals; it does not scan the working directory or search the home.
-The TUI always separates folder and system scope.
-
-Folder coverage includes Python caches/environments, JS framework caches,
-Expo/mobile build caches and Pods, Gradle, Dart, Zig and Terraform. It never
-targets the `ios/` or `android/` source roots. New system inventory covers Gradle,
-Android SDK/AVDs, Metro/Expo/Watchman, Go, Maven, Playwright/Puppeteer, node-gyp,
-SwiftPM, TypeScript, VMware and Cowork. AVDs/VM bundles remain informational.
-Maven repositories with local unpublished installations are protected.
-
-Wallpaper discovery looks for `extension-com.apple.wallpaper.extension.image`
-inside the wallpaper agent container and records the installed macOS version.
-**Deletion is disabled:** neither the recalled partial path nor a matching
-version string validates generated contents, safe quiescing or regeneration.
-See the open validation gate in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
-
-Custom folder detectors accept `markers = ["build.gradle", "settings.gradle.kts"]`
-with `dir = "android/.gradle"`, or `inner_marker = "pyvenv.cfg"` for any environment
-name. Paths are normal relative components; mixed detector forms are rejected.
-
-### Interactive cleanup
-
-`cleanrs tui [PATH]` requires a terminal and starts in the working directory
-when PATH is omitted. Use `j`/`k` to move, `l`/Enter to open, `h` to go up,
-`/` to filter, `s` to sort, and `i` for accounting details. `T` opens cleanup
-targets for the highlighted directory, or the current directory for a file.
-On a recognized target row such as `node_modules/`, `T` uses the containing
-folder and focuses that target.
-
-In targets, Space toggles an item and moves down; `v` starts a range (move,
-then `v` or Space to select it; Esc cancels). Ctrl-a adds level-eligible items,
-Ctrl-r inverts selectable items, and `u` clears ticks. `1`/`2`/`3` reset to
-safe/standard/aggressive, discarding manual ticks. `S` opens a separate system
-Targets view from Browser, Targets or Results; `r` re-detects the current scope.
-Folder and system lists stay separate. Esc returns to the originating screen. Re-detection retains choices for surviving selectable
-candidates. Returning with `q`/Esc keeps the cached selection and detection age until that
-scope is evicted from the bounded session cache. The project-path column is
-relative to the targets scope; the detail pane keeps the exact operation.
-
-The selected interval updates immediately from cached detection facts, using
-the same set accounting as CLI plans; ticks and level presets do not rescan.
-`T` reuses completed browser scans when all child directories are available;
-incomplete scans or newly added/replaced directories fall back to a full scan.
-`r` always scans fresh. Cached detection keeps the browser facts' original age.
-`x` rebuilds and reviews exactly the ticked candidates with visible progress,
-scanning their trees and ancestor listings rather than unrelated projects.
-If an item vanished, changed identity/operation, or became refused since
-detection, review names the dropped selection. Ticking is explicit
-naming: level/staleness overrides appear in a warned group, and explicit-only
-or user-data choices carry a stronger warning. Refused and informational items
-cannot be selected. Only `y` on review confirms permanent deletion; Enter does
-not confirm, and `n`/Esc returns with ticks intact. During a run, `q` or Ctrl-c
-asks to stop after the current action; `[`/`]` scroll provider output. Results
-separate removed allocation from provider reports, show the run ID, and point
-to `cleanrs history`. Returning to the browser refreshes affected directories.
-
-Completed browser scans persist across restarts in
-`$XDG_CACHE_HOME/cleanrs/tui-v1` (absolute paths only), or
-`~/.cache/cleanrs/tui-v1`. Reopening restores filesystem facts with their original
-age (including across reboots) and a “cached scan” label. Root identity/mtime checks detect replacements
-and top-level changes; changes deeper in a tree may stay cached until `r`.
-Refresh bypasses the disk cache, and cleanup invalidates overlapping entries.
-Partial scans are not saved. Corrupt/version-mismatched entries fall back to
-scanning; failed writes show a warning while retaining sizes in the session.
-The cache requires local, unsynced storage. It is owner-only, checksummed, writes
-atomically, and evicts oldest completed entries above
-1 GiB/1,024 entries (each entry is limited to 256 MiB). It never stores cleanup
-selections or permissions to delete.
-
-Memory caches keep up to 250,000 arena nodes/4,096 aliases, 32 visited listings
-and 250,000 inactive rows, plus eight target scopes/250,000 detection nodes.
-Evicting an arena releases its aliases and row references while keeping the
-parent's measured sizes and cursor, so returning to a visited parent does not
-rescan it. Worker accounting maps are released when their scan completes.
-Active views, reviewed plans and in-flight work may exceed memory cache limits.
-**Correction:** the previous cache was session-only, and arena eviction could
-also evict a visited parent's listing; restart persistence and independent
-listing retention are now implemented.
-
-`q`, Esc or Ctrl-c asks before leaving the browser. `y` quits; `n`, Esc or
-Enter stays. Esc still clears a filter, cancels a range, or returns from another
-screen before it becomes a quit request. During cleanup, the existing stop-after-
-current-action confirmation applies.
-
-Review groups show action counts, numbered operations, confidence and rebuild
-consequences above the permanent-deletion confirmation.
-
-`?` shows context help (scroll with `j`/`k`). `NO_COLOR` preserves meaningful
-symbols. Browser scan age and target detection age use seconds/minutes/hours;
-data older than ten minutes is yellow with “press r to refresh”. Errors appear
-as red status messages; any key dismisses them and navigation still works.
-The TUI supports terminals of at least 80×20, and shows a centered message
-below that size. Diagnostics go to `~/.local/state/cleanrs/tui.log` (or
-`$XDG_STATE_HOME/cleanrs/tui.log`) beside the history journal.
-
-| Screen | Main keys |
-|---|---|
-| All | `?` help; `q`/Esc back (confirm quit in browser); Ctrl-c asks to quit (ask to stop during a run) |
-| Lists | `j`/`k` or arrows move; `gg`/`G` first/last; Ctrl-d/Ctrl-u half page; `/` filter; `n`/`N` matches; `s` sort |
-| Browser | `l`/Enter/right open; `h`/left/Backspace parent; `-` previous directory; `T` targets; `i` info; `r` rescan |
-| Browser / Targets / Results | `S` system targets; Esc returns to origin |
-| Targets | Space toggle; `v` range; Ctrl-a eligible; Ctrl-r invert; `u` clear; `1`/`2`/`3` presets; `r` re-detect; `x` review |
-| Review | `y` confirm; `n`/Esc cancel; Enter does not confirm |
-| Run | `q`/Esc/Ctrl-c ask to stop; `y`/`n` answer; `[`/`]` scroll provider output |
-| Results | `j`/`k`, `gg`/`G`, Ctrl-d/Ctrl-u scroll; `q`/Esc returns to refreshed browser |
-
-To clean only some items:
-
-1. Start `cleanrs tui PATH`, navigate to a project, and press `T`.
-2. Press `u` to clear the initial preset. Move to each desired item and press
-   Space; only those ticks will enter review. `[!]` warns about a policy
-   override and `✗` marks an untickable refusal.
-3. Press `x`, wait for the fresh reviewed plan, and read its actions and any
-   dropped-item notice. Press `n` to revise your picks or `y` to delete exactly
-   the reviewed items permanently.
-4. Read results and use `cleanrs history` for the recorded evidence.
-
-### Terminal output
-
-Interactive scans show live directory, entry, and allocated-byte counters while
-the filesystem walk is running. Human-readable `scan` and `doctor` results use
-compact tables with consistent colors for confidence, coverage, warnings, and
-unknown values. Output automatically adapts to its destination:
-
-- TTY: Unicode tables, color, and an animated progress indicator.
-- Pipe or redirected output: ASCII tables and no progress animation.
-- `NO_COLOR` set: no ANSI colors.
-- `--json`: stable JSON on stdout and no progress animation; `--apply` still
-  prints the exact destructive operation to stderr immediately before it runs.
-
-Completion scripts and man pages remain raw output suitable for redirection.
+- [Installation](docs/installation.md): packages, completions, macOS permissions.
+- [Configuration](docs/configuration.md): target schema, CLI targets, trust.
+- [Providers](docs/providers.md): TOML recipes and Rust integrations.
+- [Accounting](docs/accounting.md): intervals, APFS facts, diagnostics, limitations.
+- [Architecture](docs/architecture.md): modules, pipeline, state locations.
+- [Safety](docs/safety.md): enforced invariants and code references.
+- [Releasing](docs/releasing.md): maintainer workflow and prerequisites.
+- [VISION.md](VISION.md): design reference, including future work.
+- [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md): roadmap / progress.
 
 ## License
 
-See [LICENSE](LICENSE).
+[MIT](LICENSE).

@@ -6,7 +6,8 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/bence/cleanrs"
+repository = "https://github.com/bencetotht/cleanrs"
+homepage = "https://github.com/bencetotht/cleanrs"
 rust-version = "1.85"
 
 [workspace.dependencies]

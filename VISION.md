@@ -7,7 +7,8 @@
 > Phase 4B adds portable provider sizing and individually reviewed cleanup;
 > live macOS validation and unsupported-capability gates remain open.
 > Empirical results and unresolved gates are tracked in
-> [docs/findings-phase0.md](docs/findings-phase0.md). This file remains the
+> [docs/accounting.md](docs/accounting.md) (the Phase 0 findings log was condensed
+> into docs/accounting.md on 2026-10-15; the full log is in git history). This file remains the
 > reference for what cleanrs is, why it exists, and how it should be built.
 > The implementation roadmap now prioritizes fast developer-storage inventory,
 > native cleanup orchestration, scheduling, indexing, and the remaining TUI
@@ -23,6 +24,16 @@
 > their original labels.
 
 ---
+
+**Correction (2026-10-15):** Linux now builds and runs with the portable
+allocated/apparent backend and reduced `doctor`; macOS-specific system targets
+are hidden. It has no APFS clone/private-size accounting. Earlier portability
+sections describe broader future work, not an absence of Linux execution.
+Trash execution remains deferred despite its reserved CLI flag; `schedule` and
+`index` are not exposed CLI commands. Target export is an inspection report, not
+a round-trip import format. README/docs and command `--help` describe the
+implemented interface; later command sketches in this design retain future work.
+See [configuration](docs/configuration.md).
 
 ## 1. Thesis
 
