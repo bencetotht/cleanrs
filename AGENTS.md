@@ -11,6 +11,11 @@ VISION.md             The design reference. Read it before proposing anything.
 DEVELOPMENT_PLAN.md   Phased build order with exit criteria. Follow it; don't skip ahead.
 README.md             Short public summary. Must stay consistent with VISION.md.
 AGENTS.md             This file.
+docs/                 installation, configuration, providers, accounting, architecture,
+                      safety, releasing (all .md).
+scripts/              Versioning, packaging, and fixture verification.
+packaging/            Homebrew formula template.
+flake.nix             Nix packages and development shell (flake.lock pins inputs).
 ```
 
 Code layout: `cleanrs-core` (library) + `cleanrs` (binary), with `fs`, `accounting`, `targets`, `providers`, `index`, `journal` as modules. Resist splitting into more crates early, only if you really deem it necessary.
@@ -25,6 +30,7 @@ Code layout: `cleanrs-core` (library) + `cleanrs` (binary), with `fs`, `accounti
 
 These come from VISION.md and are not open for convenience trade-offs:
 
+- Release via the dispatch-only Release workflow; never tag or bump versions by hand.
 - **Dry-run is the default.** `--apply` is always explicit.
 - **Never delete synced cloud content** (§2, §8.2). Deletion propagates to every device. Check dataless status per candidate path, not just target roots.
 - **Never delete `user_data`** without explicit naming — no level reaches it.

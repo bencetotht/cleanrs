@@ -61,6 +61,7 @@ installed versions, so cleanrs initially classifies that mixed action as
 | 4B | Complete provider sizing and cleanup coverage | **Portable implementation in progress; macOS validation and capability gates remain** |
 | 5 | Index, scheduling, and remaining ratatui daily-driver work | **Terminal groundwork only** |
 | 6 | Extensibility and optional portability | **Deferred** |
+| Release readiness | Documentation, dispatch release, tarballs, Homebrew, Nix | **Implemented locally; publication prerequisites open** |
 
 **Correction (2026-10-13):** Phase 4 was previously the next priority. The
 interactive TUI was split out of Phase 5 as Phase 5A and moved ahead of it;
@@ -99,7 +100,8 @@ turning the project into an APFS research program.
 - A real clone fixture verifies that macOS clone metadata reaches the scanner.
 - An explicitly prepared 32 MiB iCloud Drive placeholder remained dataless with
   zero allocated blocks across the initial traversal and five repeated scans.
-- The findings and limits are recorded in `docs/findings-phase0.md`.
+- The findings and limits are recorded in [docs/accounting.md](docs/accounting.md) (the Phase 0 findings log was condensed into
+  docs/accounting.md on 2026-10-15; the full log is in git history).
 - A one-tier extended attribute request is the current implementation choice.
 
 ### Reworked from the original plan
@@ -1924,9 +1926,13 @@ risk depends on project state.
   owners and changed target resolution, retention precedence/keep, Python
   network/safe-exclusion policy, and human/JSON CLI parity. Existing execution fixtures now
   resolve their sandbox tools through PATH so they also run on NixOS.
-- A reproducible multi-repository benchmark and measured Linux baseline live in
-  [docs/benchmarks-phase4.md](docs/benchmarks-phase4.md). The fixture is generated
-  in a unique temporary directory; it never scans or cleans the real home.
+- Accounting evidence is consolidated in [docs/accounting.md](docs/accounting.md)
+  (the Phase 0 findings log was condensed into docs/accounting.md on 2026-10-15;
+  the full log is in git history). The retired Phase 4 benchmark report and JSONL
+  measurements are also retained in git history. The reproducible
+  [project fixture](cleanrs-core/examples/project_hygiene.rs) and
+  [benchmark workflow](.github/workflows/benchmark.yml) remain; fixtures use unique
+  temporary directories and never scan or clean the real home.
 
 **Correction:** the previous state said Git/project intelligence was absent.
 It is implemented above. Shared/custom Cargo ownership is deliberately still
@@ -2078,8 +2084,10 @@ workflow is solid.
   filesystem accounting, mount topology, event monitoring, scheduling, Trash,
   and provider policy—not merely compilation fixes.
 
-The existing filesystem trait and portable fallback are useful development
-seams but do not constitute supported Linux behavior.
+**Correction (2026-10-15):** the earlier statement that the portable fallback
+did not constitute supported Linux behavior is obsolete. Linux builds and runs
+with allocated/apparent accounting, reduced doctor and platform-filtered system
+targets. APFS private/clone accounting remains macOS-only; broader parity is deferred.
 
 ---
 
@@ -2140,3 +2148,110 @@ Work should continue in this order:
 Their implementations are now integrated on `feature/phase-4a-target-coverage`.
 The wallpaper deletion gate above is intentionally unresolved; no supported
 macOS version is claimed without observed schema/regeneration evidence.
+
+## Release readiness (2026-10-15)
+
+### Decisions
+
+- [x] Release is `workflow_dispatch` only: one run computes the version, commits
+      a bump if needed, tags, builds, publishes, then updates the tap. No tag-push
+      trigger is needed; `GITHUB_TOKEN` tag pushes do not start other workflows.
+- [x] Push/PR CI remains Linux-only. macOS release builds share one `macos-15`
+      job; the existing manual benchmark workflow and fixture remain available.
+- [x] Distribution channels are GitHub Release tarballs, the public Homebrew tap,
+      and a Nix flake for four Linux/macOS architecture combinations. No crates.io,
+      deb/rpm, AUR, installer script or Windows channel was added.
+- [x] Apple signing/notarization is optional when no certificate secret exists;
+      once enabled, missing credentials or rejected notarization fail the build.
+- [x] The first release seeds the current 0.1.0 without editing manifests.
+      Automatic breaking changes while 0.x bump minor; explicit `major` permits
+      1.0.0. Release versions/tags are owned by the dispatch workflow.
+- [x] Root package managers remain out of scope: the current shared execution
+      boundary refuses root. Scheduling/index behavior and all Rust source remain
+      unchanged; neither unfinished command is exposed in the current CLI.
+
+### Implementation
+
+- [x] Corrected workspace repository metadata and inherited homepage in both
+      crate manifests; kept Cargo version 0.1.0 and the real lockfile unchanged.
+- [x] Added `scripts/bump-version.sh`, portable to bash 3.2, with conventional
+      commit parsing, targeted workspace version edits, lockfile refresh/checks,
+      dry-run output and GitHub outputs. `scripts/test-bump-version.sh` confines
+      all fixture commits/tags to an automatically removed temporary repository.
+- [x] Added `scripts/package-release.sh`: one-directory tarballs with binary,
+      README/license, generated bash/zsh/fish completions, man page and SHA-256.
+      Optional native generator supports the cross-built Intel macOS archive.
+- [x] Added `flake.nix` / `flake.lock`, Cargo-derived version/description,
+      filtered source, workspace tests, native man/completion installation,
+      package/app/check outputs, developer shells and nixfmt; ignored Nix results.
+      Added a Linux Nix CI job without changing existing jobs or the commented
+      macOS CI matrix entry.
+- [x] Replaced `.github/workflows/release.yml` with version, macOS, native Linux
+      musl matrix, Nix, publish and tap jobs. Dry runs overlay bumped manifests
+      in every builder so binary versions match without pushing. Jobs use scoped
+      permissions, strict smoke/version checks and signed-asset checksums.
+- [x] Added `packaging/homebrew/cleanrs.rb.tmpl`; rendering validates placeholders,
+      four checksums and Ruby syntax. Publication precedes the tap update.
+- [x] Rewrote README (218 lines) and added `docs/{architecture,accounting,safety,
+      configuration,providers,installation,releasing}.md`. Updated AGENTS structure
+      and release rule, VISION implementation corrections and historical pointers.
+      Condensed SDK/fixture evidence into accounting; removed Phase 0 findings
+      and Phase 4 benchmark Markdown/JSONL logs, retaining history and fixture/workflow.
+- [x] Added only an explanatory ShellCheck suppression to the existing benchmark
+      workflow: single-quoted commands intentionally expand in hyperfine's shell.
+
+### Local verification
+
+- [x] `cargo fmt --all -- --check`, strict workspace/all-target Clippy, and
+      `cargo test --workspace --all-targets`: passed, 201 tests (63 + 50 + 88),
+      with example harnesses also passing. No Rust source/test behavior changed.
+- [x] Bump fixtures: seed, dry-run immutability, fix patch, feature minor,
+      breaking/scoped/footer auto minor at 0.x, ignored release-commit bodies,
+      explicit major, no-new-commits failure and invalid-mode failure. Real-repo
+      `scripts/bump-version.sh --dry-run` reports 0.1.0 / v0.1.0 without edits.
+- [x] Native release build and packaging: archive layout inspected with `tar -tzf`;
+      `sha256sum -c` passed. Generated all three completions and cleanrs(1).
+- [x] CLI help and source keymap checked against README; temp-fixture scan,
+      configured/CLI target detection, dry-run cleanup and explicit command-config
+      trust checks passed without touching real home storage.
+- [x] Actionlint on all workflows, `bash -n`, ShellCheck on all scripts, dummy
+      formula rendering plus `ruby -c`, all 81 relative Markdown links and
+      `git diff --check`: passed.
+- [x] `nix flake lock` generated the lock; a generated override pins compatible
+      unstable as explained below. Final `nix build .#default -L` and
+      `nix flake check -L` passed with that lock (200 tests passed, exactly one
+      Linux sandbox fixture filtered). `./result/bin/cleanrs --version` reports
+      `cleanrs 0.1.0`; `share/man/man1/cleanrs.1.gz` and bash/zsh/fish completions
+      are present. `nix flake check --all-systems --no-build -L` passed evaluation
+      for all flake systems. The flake's nixfmt formatting check also passed.
+
+The initial Nix build found one sandbox-only fixture failure:
+`execution::tests::symlinked_executable_entry_is_pinned_with_its_resolved_target`.
+A separate sandbox probe confirmed `/bin/sh` dispatches BusyBox by argv[0], so
+invoking its symlink as `provider` fails with `provider: applet not found`.
+The flake skips exactly this test on Linux; it passes in the ordinary host suite.
+All other checks remain enabled, including temporary Git repository fixtures.
+
+All-system flake evaluation also exposed the current nixos-unstable removal of
+Intel macOS. **Correction (review, 2026-10-15):** an interim lock pinned
+nixpkgs `d25a391b` (2026-06-19) to keep `x86_64-darwin`. That was dropped
+because it would freeze the flake toolchain; the flake now tracks current
+unstable for `x86_64-linux`, `aarch64-linux` and `aarch64-darwin`, and Intel
+Macs are served by Homebrew and the prebuilt tarball.
+
+The direct x86_64 musl build could not find the target standard library; this
+NixOS host has no rustup. A Nix static-toolchain dry-run requires building LLVM
+and Rust, so musl execution is deferred to native release runners rather than
+claimed verified. macOS execution/SDK, ARM64 builds, codesigning/notarization,
+GitHub publication and tap pushes cannot be validated on this Linux host.
+
+### Open prerequisites
+
+- [ ] Make `bencetotht/cleanrs` public before the first release.
+- [ ] Create the public `bencetotht/homebrew-tap` with an initial default branch
+      and `Formula/` directory, and configure `HOMEBREW_TAP_TOKEN` (tap Contents
+      read/write only). Permit Actions pushes to main; add a bypass if needed.
+- [ ] Supply the six Apple secrets for signed/notarized assets, or accept the
+      documented unsigned warning. No signing credentials were exercised locally.
+- [ ] Run the first complete release dry run, inspect all platform artifacts,
+      then perform the first published run. Actual remote operations remain untested.

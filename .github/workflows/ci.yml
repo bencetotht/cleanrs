@@ -36,3 +36,11 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Build release binary
         run: cargo build --workspace --release
+
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - run: nix build .#default -L
+      - run: nix flake check -L
