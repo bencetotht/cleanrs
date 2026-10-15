@@ -1698,6 +1698,38 @@ Official capability references used during this implementation:
 No installed macOS SDK is available on this Linux host; no new SDK claim or
 live macOS cleanup/regeneration result is asserted.
 
+### Target detail readability follow-up (2026-10-15)
+
+- The selected item's details start with its complete target ID, independent of
+  the fixed-width Target column. The panel measures wrapped text at the current
+  terminal width rather than reserving seven lines; it retains space for the
+  table and footer. This also gives long paths and provider consequences room.
+- Rendering regression covers 80, 100 and 150 column terminals, preserving the
+  complete ID, wrapped consequence, recoverability, occupied storage,
+  reclaimable confidence and navigation footer.
+
+### Cowork storage review (2026-10-15)
+
+- Existing `claude.cowork` discovery already measures each recognized VM bundle.
+  It remains informational user data, with no deletion or prune action. The
+  explanation now says local tasks can still require this VM and suggests
+  exporting needed task data in Claude.
+- **Correction:** a VM image being downloadable does not establish that all
+  bundle contents are cache. Anthropic's [architecture overview](https://support.claude.com/en/articles/14479288-claude-cowork-architecture-overview)
+  documents local VM execution; its [migration guidance](https://support.claude.com/en/articles/15520349-use-claude-cowork-on-web-desktop-and-mobile)
+  preserves existing local tasks and scheduled tasks and provides task-data
+  export. No reviewed official documentation supplies a stable host prune/reset
+  API or a versioned list of disposable bundle files. Whole-bundle deletion,
+  guessed image-file removal and pruning inside guest disks remain unsupported.
+- This Linux workspace cannot inspect the installed macOS Claude application or
+  verify bundle regeneration. README and VISION retain the same capability
+  boundary; no live cleanup or macOS SDK claim is introduced.
+
+Validation for these follow-ups: **201 workspace tests passed** (63 binary,
+50 CLI, 88 core), including the existing VM-bundle protection fixture and new
+terminal rendering regression. Formatting, clippy with warnings denied and diff
+checks passed. No real provider cleanup was performed.
+
 ### Provider accounting and inspection
 
 - [ ] **Yarn:** resolve the installed variant's actual cache location and scope,

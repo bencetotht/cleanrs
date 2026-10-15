@@ -59,7 +59,10 @@ costs, reclaimed at a chosen intensity.
 **Protect.** Large but stateful objects such as VMware machines, Docker volumes,
 Claude's Cowork VM, simulator device data, and macOS swap are still identified
 and explained, but never mistaken for disposable cache data. System-managed
-swap is diagnostic-only; user data requires an explicitly named action.
+swap is diagnostic-only; user data requires an explicitly named action. Cowork
+bundles remain inventory-only: local tasks may still need the VM, and no safe
+host-side prune/reset interface has been verified. See the
+[Cowork investigation](DEVELOPMENT_PLAN.md#cowork-storage-review-2026-10-15).
 
 The initial known-location acceptance inventory—including the motivating
 machine's home, Library and Developer trees, both container runtimes, package

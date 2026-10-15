@@ -634,6 +634,9 @@ pub fn inspect(
                 }
             }
             "claude" => {
+                // A downloadable VM is not proof that its entire bundle is cache.
+                // Existing local tasks can still need it; keep all bundle contents
+                // protected until a versioned, data-preserving prune API is verified.
                 for path in child_directories(
                     &home.join("Library/Application Support/Claude/vm_bundles"),
                     128,
@@ -649,7 +652,7 @@ pub fn inspect(
                         TargetClass::Irreplaceable,
                         CleanupLevel::Aggressive,
                         0,
-                        "Cowork VM/session state may be persistent; no validated reset API, inventory only",
+                        "Keep: local Cowork tasks can still need this VM; bundle contents are not verified disposable cache. Export needed task data in Claude; no validated host prune/reset API",
                         identity(provider, &path, None, None),
                         None,
                         true,

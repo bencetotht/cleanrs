@@ -548,6 +548,16 @@ generated-cache schema/quiescence/regeneration evidence has been supplied. The
 §7.3 size is historical motivation, not verified reclaimable cache or permission
 to delete the extension tree. No macOS SDK claim was verified on this Linux host.
 
+**Cowork review (2026-10-15):** correction to any assumption that recreating the
+VM makes its whole bundle disposable: Anthropic's [architecture overview](https://support.claude.com/en/articles/14479288-claude-cowork-architecture-overview)
+still documents local VM execution for existing desktop deployments. Its
+[migration guidance](https://support.claude.com/en/articles/15520349-use-claude-cowork-on-web-desktop-and-mobile)
+says existing local tasks and scheduled tasks remain local and offers task-data
+export. These sources do not establish which bundle files are safe to prune or
+a supported host cleanup API. Keep `claude.cowork` informational; neither age
+nor cloud migration proves an installed bundle is unused. The provider explains
+this protection and points to task export; it does not infer disposable subpaths.
+
 **Phase 4B implementation boundary (2026-10-15):** provider storage measurements
 are separate from native cleanup yield. Cached arenas are reused and merged for
 set accounting; inspection/apply validate local paths, cloud/dataless state and

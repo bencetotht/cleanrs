@@ -439,6 +439,49 @@ fn rendered(app: &App, colors: bool, width: u16, height: u16) -> (String, ratatu
     (text, buffer)
 }
 #[test]
+fn selected_target_details_show_full_names_and_wrapped_explanations() {
+    let (_dir, mut app) = fixture();
+    let mut plan = fabricated(app.target_scope.as_ref().unwrap());
+    plan.targets.truncate(1);
+    let target = &mut plan.targets[0].target;
+    target.id = "docker.volumes-anonymous".into();
+    target.consequence = "This provider explanation is deliberately long enough to wrap on an eighty column terminal while keeping the reclaimable confidence visible below it.".into();
+    let generation = app.targets().unwrap().generation;
+    app.on_worker(WorkerEvent::Planned {
+        scope: app.target_scope.clone().unwrap(),
+        generation,
+        purpose: PlanPurpose::Detect,
+        result: Ok(Arc::new(plan)),
+    });
+    for (width, height) in [(80, 24), (100, 28), (150, 32)] {
+        let (_, buffer) = rendered(&app, false, width, height);
+        // Ignore line padding when checking text that wraps across terminal rows.
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for expected in [
+            "Target: docker.volumes-anonymous",
+            "delete directory",
+            "recoverability: generated",
+            "Occupied",
+            "keeping the reclaimable confidence visible below it.",
+            "Reclaimable",
+            "confidence Medium",
+            "q back",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing {expected} at {width}x{height}: {text}"
+            );
+        }
+    }
+}
+#[test]
 fn all_screens_render_semantic_states_and_warnings_without_color() {
     for colors in [false, true] {
         let (_dir, mut app) = fixture();
