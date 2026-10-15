@@ -59,7 +59,10 @@ costs, reclaimed at a chosen intensity.
 **Protect.** Large but stateful objects such as VMware machines, Docker volumes,
 Claude's Cowork VM, simulator device data, and macOS swap are still identified
 and explained, but never mistaken for disposable cache data. System-managed
-swap is diagnostic-only; user data requires an explicitly named action.
+swap is diagnostic-only; user data requires an explicitly named action. Cowork
+bundles remain inventory-only: local tasks may still need the VM, and no safe
+host-side prune/reset interface has been verified. See the
+[Cowork investigation](DEVELOPMENT_PLAN.md#cowork-storage-review-2026-10-15).
 
 The initial known-location acceptance inventory—including the motivating
 machine's home, Library and Developer trees, both container runtimes, package
@@ -242,24 +245,52 @@ installed versions, while scrub starts at `aggressive`.
 The provider inventory also covers Nix; pnpm, npm/npx, Yarn, and Bun; uv, pip,
 Poetry, and Conda; Cargo and rustup; CocoaPods; Docker and OrbStack; and Xcode.
 Each action has its own stable ID, severity, consequence, provider identity,
-and exact argv when a supported native action exists. Unsupported or stateful
-objects—npm's separate npx cache, manager-owned Python environments, Rust toolchains and
-shared Cargo caches, OrbStack machines, Docker volumes, Xcode archives/device
-support/simulator data—remain informational. Whole-cache Xcode DerivedData is
-generated but high-cost and enters a plan only when its stable ID is named.
-Docker inspects local Unix-socket
-contexts separately, pins both context name and endpoint, skips remote contexts,
-and never combines build cache, stopped containers, images, and volumes into a
-generic prune.
+and exact argv when a supported native action exists. Provider rows distinguish
+occupied allocation from cleanup yield: partial GC/prune never inherits the
+whole cache's size. JSON `storage` entries retain each measured path, allocation,
+interval and filesystem identity. CLI tables show an OCCUPIED column; TUI details
+show occupied storage separately from reclamation and retain failure reasons.
 
-**Planned, not yet implemented (Phase 4B):** complete provider sizing and
-cleanup coverage, including Gradle installations using only `gradlew`, measured
-Homebrew caches and Xcode DerivedData, and separate unused anonymous/named
-Docker-volume targets. **Correction:** the earlier blanket volume-cleanup ban
-is superseded in the design. Anonymous-volume pruning will be a confirmed
-action; named-volume removal will require explicit selection and remain outside
-all level presets. Current volume inventory is still informational. See
-[the Phase 4B checklist](DEVELOPMENT_PLAN.md#phase-4b--complete-provider-sizing-and-cleanup-coverage).
+Supported cache inventory includes pnpm, npm's content and npx caches, installed
+Yarn Classic/modern variants, Bun, uv, pip, Poetry's PyPI repository cache,
+Conda package directories, Cargo registry/Git caches, CocoaPods downloads,
+Homebrew and Xcode paths. Full-cache actions use filesystem intervals where their
+scope is established; partial pruning can still have unknown yield. Corepack
+network access/project selection is disabled. Inspection and command execution
+run from `/`, with explicit manifest/project arguments where needed, so caller
+repository configuration cannot redirect global providers.
+
+**Correction (2026-10-15):** npx cleanup is now available when installed npm
+advertises `cache npx rm`; older variants remain informational. Yarn Classic
+cleans its measured cache root, while modern Yarn uses the global mirror.
+Conda cache cleanup deliberately preserves extracted packages, which may back
+symlinked environments; it removes download archives, indexes and logs. Poetry
+clears the PyPI repository cache, retaining other repositories and artifacts.
+CocoaPods inventory reads its bounded user cache configuration and metadata;
+it avoids `pod cache list`, whose initialization can change old caches.
+
+Unused local Docker volumes are separate anonymous/named targets. Cleanup uses
+`volume rm` for exact reviewed names, checks running AND stopped references,
+and pins context, endpoint and creation identity. **Correction:** the planned
+anonymous-volume prune was replaced with exact removal because a broad prune
+could sweep newly orphaned, unreviewed volumes. Named volumes require individual
+TUI ticks or CandidateKeys; naming the provider ID cannot select every volume.
+Non-default Rust toolchains and non-base/inactive Conda environments also support
+individual reviewed removal. Known Rust overrides are protected; dependencies
+outside inspected roots remain unknown. Unavailable simulators are measured and
+reviewed per UUID as user data, rather than deleted through a bulk action.
+
+Whole-cache Xcode DerivedData remains high-cost and explicit-ID-only. Gradle
+supports already installed wrapper distributions without executing project
+`gradlew` scripts or downloading distributions; cleanup still requires successful
+daemon inspection. Homebrew routine/scrub actions retain native estimates beside
+cache allocation; they are not full-download-cache deletion commands.
+
+**Remaining boundaries:** global Poetry environment removal, Cargo shared-cache
+GC, per-machine OrbStack allocation/removal, VMware/Cowork resets and wallpaper
+cleanup remain informational with specific reasons. Native macOS cleanup and
+regeneration have not been exercised on this Linux development host. See the
+[Phase 4B implementation and validation record](DEVELOPMENT_PLAN.md#phase-4b--complete-provider-sizing-and-cleanup-coverage).
 
 For Rust projects, Cargo metadata is queried with `--frozen --no-deps` for at
 most 256 manifests under the explicit scan root. Workspace members sharing a

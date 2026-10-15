@@ -23,6 +23,10 @@ use crate::targets::{
     cargo_activity_age_days, subtree_sizes, validate_scanned_candidate,
 };
 
+mod storage;
+mod volumes;
+pub use storage::revalidate_storage;
+
 /// Confirm that Cargo still resolves the same workspace-local build directory.
 /// A config/environment change may otherwise redirect a previously reviewed clean.
 pub fn revalidate_cargo_build(
@@ -135,6 +139,8 @@ pub const BUILTIN_PROVIDER_ACTION_IDS: &[&str] = &[
     "docker.stopped-containers",
     "docker.images",
     "docker.volumes",
+    "docker.volumes-anonymous",
+    "docker.volumes-named",
 ];
 
 /// Result of probing one provider, including absence and inspection failures.
@@ -191,6 +197,13 @@ impl std::error::Error for ProviderError {}
 pub trait ProviderHost {
     fn resolve_executable(&self, name: &str) -> Result<Option<PathBuf>, ProviderError>;
     fn run_inspection(&self, command: &CommandSpec) -> Result<CommandOutput, ProviderError>;
+    /// Fixtures opt in to storage discovery; default hosts never inspect HOME.
+    fn home(&self) -> Option<PathBuf> {
+        None
+    }
+    fn variable(&self, _name: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Real provider host with subprocess time and output bounds.
@@ -223,6 +236,12 @@ impl SystemProviderHost {
 }
 
 impl ProviderHost for SystemProviderHost {
+    fn home(&self) -> Option<PathBuf> {
+        env::var_os("HOME").map(PathBuf::from)
+    }
+    fn variable(&self, name: &str) -> Option<String> {
+        env::var(name).ok()
+    }
     fn resolve_executable(&self, name: &str) -> Result<Option<PathBuf>, ProviderError> {
         resolve_from_path(name)
     }
@@ -331,6 +350,8 @@ pub fn inspect_builtin_providers_with_progress(
             },
         }
     }
+    progress("provider storage accounting");
+    storage::complete_inventory(&mut inventory, host, selected_ids);
     inventory
 }
 
@@ -495,6 +516,7 @@ pub fn inspect_cargo_builds_with_progress(
         let mut properties = TargetClass::Cheap.properties();
         properties.rebuild_cost = Some(RebuildCost::High);
         inventory.items.push(DetectedTarget {
+            storage: Vec::new(),
             gitignore: None,
             cargo_ownership: Some(crate::targets::CargoOwnership {
                 target_directory: target_dir.clone(),
@@ -721,6 +743,15 @@ fn inspect_simple_action(
     executable: &Path,
     action: &SimpleAction,
 ) -> DetectedTarget {
+    storage::inspect_action(host, identity, executable, action)
+}
+
+fn inspect_simple_action_base(
+    host: &dyn ProviderHost,
+    identity: &ProviderIdentity,
+    executable: &Path,
+    action: &SimpleAction,
+) -> DetectedTarget {
     let mut evidence = Vec::new();
     let mut safety = CandidateSafety::Eligible;
     let mut reported_bytes = None;
@@ -728,7 +759,7 @@ fn inspect_simple_action(
     if !action.location_args.is_empty() {
         match host.run_inspection(&plain_inspection_command(executable, action.location_args)) {
             Ok(output) if output.exit_code == Some(0) => {
-                let location = concise_output(&output.stdout);
+                let location = output.stdout.trim().to_owned();
                 if !location.is_empty() {
                     item_identity.context = Some(location.clone());
                     evidence.push(format!("configured location/context: {location}"));
@@ -742,7 +773,11 @@ fn inspect_simple_action(
         match host.run_inspection(&plain_inspection_command(executable, action.inspect_args)) {
             Ok(output) if output.exit_code == Some(0) => {
                 let summary = concise_output(&output.stdout);
-                reported_bytes = output.stdout.trim().parse::<u64>().ok();
+                reported_bytes = storage::reported_bytes(action.id, &output.stdout);
+                match storage::inspection_evidence(action.id, &output.stdout) {
+                    Ok(details) => evidence.extend(details),
+                    Err(reason) => safety = CandidateSafety::Refused(reason),
+                }
                 if !summary.is_empty() {
                     evidence.push(format!("provider inspection: {summary}"));
                 }
@@ -763,7 +798,7 @@ fn inspect_simple_action(
             },
         }
     };
-    let usage = reported_bytes.map_or_else(
+    let mut usage = reported_bytes.map_or_else(
         || UsageEstimate::Unknown {
             explanation:
                 "provider exposes the storage/action but no trustworthy read-only byte estimate"
@@ -775,6 +810,12 @@ fn inspect_simple_action(
             explanation: "bytes reported by the provider inspection command".into(),
         },
     );
+    if let CandidateSafety::Refused(reason) = &safety {
+        evidence.push(reason.clone());
+        usage = UsageEstimate::Unknown {
+            explanation: format!("inspection failed: {reason}"),
+        };
+    }
     provider_item(
         action.id,
         &item_identity,
@@ -795,7 +836,12 @@ fn plain_inspection_command(executable: &Path, args: &[&str]) -> CommandSpec {
     CommandSpec {
         executable: executable.to_path_buf(),
         args: args.iter().map(|arg| (*arg).into()).collect(),
-        environment: BTreeMap::new(),
+        environment: BTreeMap::from([
+            ("COREPACK_ENABLE_NETWORK".into(), "0".into()),
+            ("COREPACK_ENABLE_PROJECT_SPEC".into(), "0".into()),
+            ("YARN_IGNORE_PATH".into(), "1".into()),
+            ("YARN_ENABLE_SCRIPTS".into(), "0".into()),
+        ]),
     }
 }
 
@@ -1067,19 +1113,6 @@ const ORBSTACK_ACTIONS: [SimpleAction; 1] = [SimpleAction {
     exclusive_group: None,
     priority: 0,
 }];
-const XCODE_ACTIONS: [SimpleAction; 1] = [SimpleAction {
-    id: "xcode.simulators-unavailable",
-    description: "delete simulator devices unavailable to the active Xcode SDK",
-    class: TargetClass::Cheap,
-    level: CleanupLevel::Standard,
-    location_args: &[],
-    inspect_args: &["simctl", "list", "devices", "unavailable", "--json"],
-    plan_args: &["simctl", "delete", "unavailable"],
-    consequence: "unavailable simulator device data is permanently removed",
-    informational: false,
-    exclusive_group: None,
-    priority: 0,
-}];
 const COCOAPODS_ACTIONS: [SimpleAction; 1] = [SimpleAction {
     id: "cocoapods.cache-clean",
     description: "clear CocoaPods' downloaded pod cache",
@@ -1112,12 +1145,12 @@ static NPM_PROVIDER: SimpleProvider = SimpleProvider {
     version_args: &["--version"],
     actions: &NPM_ACTIONS,
 };
-// Corepack shims may download Yarn merely to answer --version, so detection is
-// intentionally executable-only and never invokes Yarn until an action is run.
+// Corepack network and project selection are disabled by the inspection host,
+// allowing installed Yarn variants to be distinguished without downloading one.
 static YARN_PROVIDER: SimpleProvider = SimpleProvider {
     id: "yarn",
     executable: "yarn",
-    version_args: &[],
+    version_args: &["--version"],
     actions: &YARN_ACTIONS,
 };
 static BUN_PROVIDER: SimpleProvider = SimpleProvider {
@@ -1175,11 +1208,13 @@ static COCOAPODS_PROVIDER: SimpleProvider = SimpleProvider {
     actions: &COCOAPODS_ACTIONS,
 };
 
-const DOCKER_IDS: [&str; 4] = [
+const DOCKER_IDS: [&str; 6] = [
     "docker.build-cache",
     "docker.stopped-containers",
     "docker.images",
     "docker.volumes",
+    "docker.volumes-anonymous",
+    "docker.volumes-named",
 ];
 
 struct DockerProvider;
@@ -1247,6 +1282,35 @@ impl Provider for DockerProvider {
                 }
                 _ => BTreeMap::new(),
             };
+            let mut context_identity = identity.clone();
+            context_identity.context = Some(format!("{name} ({endpoint})"));
+            if selected_ids.contains("docker.volumes-anonymous")
+                || selected_ids.contains("docker.volumes-named")
+            {
+                match volumes::inspect(host, &context_identity, name, selected_ids) {
+                    Ok(volumes) => items.extend(volumes),
+                    Err(error) => items.push(provider_item(
+                        if selected_ids.contains("docker.volumes-anonymous") {
+                            "docker.volumes-anonymous"
+                        } else {
+                            "docker.volumes-named"
+                        },
+                        &context_identity,
+                        "Docker volume inspection failed",
+                        TargetClass::Irreplaceable,
+                        CleanupLevel::Standard,
+                        UsageEstimate::Unknown {
+                            explanation: format!("inspection failed: {error}"),
+                        },
+                        CandidateSafety::Refused(error.to_string()),
+                        PlannedOperation::Informational,
+                        None,
+                        0,
+                        "no volume cleanup is authorized without complete inspection",
+                        vec![error.to_string()],
+                    )),
+                }
+            }
             for action in docker_actions() {
                 if !selected_ids.contains(action.id) {
                     continue;
@@ -1302,6 +1366,11 @@ impl Provider for DockerProvider {
                         "pinned Docker context and endpoint: {name} ({endpoint})"
                     )],
                 ));
+                // One context-level failure is useful; repeating it for every
+                // action obscures the actual unavailable daemon and stderr.
+                if !matches!(&output, Ok(output) if output.exit_code == Some(0)) {
+                    break;
+                }
             }
         }
         Ok(items)
@@ -1427,10 +1496,9 @@ impl Provider for XcodeProvider {
             .ok_or_else(|| ProviderError::new("xcrun executable identity is missing"))?;
         let mut items = Vec::new();
         if selected_ids.contains("xcode.simulators-unavailable") {
-            let action = &XCODE_ACTIONS[0];
-            items.push(inspect_simple_action(host, identity, executable, action));
+            items.extend(storage::simulators(host, identity, executable));
         }
-        let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        let Some(home) = host.home() else {
             return Ok(items);
         };
         let paths = [
@@ -1724,6 +1792,7 @@ fn provider_item(
     evidence: Vec<String>,
 ) -> DetectedTarget {
     DetectedTarget {
+        storage: Vec::new(),
         cargo_ownership: None,
         gitignore: None,
         id: id.into(),
@@ -1903,6 +1972,9 @@ fn run_bounded(
     poll_interval: Duration,
 ) -> Result<CommandOutput, ProviderError> {
     let mut command = Command::new(&specification.executable);
+    // Global tool inspection must never inherit configuration from the caller's
+    // repository. Cargo/Git commands carry explicit manifests or -C arguments.
+    command.current_dir("/");
     if specification.environment.contains_key("GIT_NO_LAZY_FETCH") {
         // Ambient Git variables must not redirect inspection to another repo,
         // inject config, or cause writes through an alternate index.

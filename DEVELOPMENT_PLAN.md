@@ -58,7 +58,7 @@ installed versions, so cleanrs initially classifies that mixed action as
 | 5A | Interactive TUI: explore, select, clean (pulled forward from Phase 5) | **M0–M5 complete** |
 | 4A | Target coverage and system scope (split out of Phase 4) | **Inventory implemented; remaining cleanup tracked in 4B** |
 | 4 | Project hygiene and stale-project intelligence | **Implemented** |
-| 4B | Complete provider sizing and cleanup coverage | **Planned; next priority before Phase 5** |
+| 4B | Complete provider sizing and cleanup coverage | **Portable implementation in progress; macOS validation and capability gates remain** |
 | 5 | Index, scheduling, and remaining ratatui daily-driver work | **Terminal groundwork only** |
 | 6 | Extensibility and optional portability | **Deferred** |
 
@@ -1588,8 +1588,8 @@ commands preferred over direct deletion, argv arrays only:
 
 ## Phase 4B — Complete provider sizing and cleanup coverage
 
-**Status: planned (2026-10-14). Next provider milestone, before Phase 5
-indexing/scheduling.** This phase completes the provider workflows exposed by
+**Status: portable implementation and Linux fixtures added (2026-10-15); macOS
+validation and unsupported-capability gates remain open before Phase 5.** This phase completes the provider workflows exposed by
 Phases 2/3/4A; it is not a requirement to add more crates.
 
 **Correction:** “provider implemented” in earlier phases often means executable
@@ -1619,6 +1619,116 @@ Phase 4A's completed inventory boundary does not complete the work below.
   `/var/folders/...` temporary path exposes existing canonical-path fixture
   failures (`/var` versus `/private/var`); those tests pass with the canonical
   temporary root. No real provider cleanup was performed.
+
+### Implementation record (2026-10-15, Linux)
+
+- [x] Added shared provider-owned storage measurement with path, apparent and
+  allocated bytes, interval/confidence and captured device/inode/type identity.
+  Alternative actions reuse scans; the existing pipeline merges accounting
+  arenas instead of adding per-file private sizes or overlapping row estimates.
+  Native command roots are scanned/revalidated before execution, including roots
+  whose partial-GC yield is unknown. Changed root sets/identities abort.
+- [x] Implemented measured inventory and pinned native scopes for pnpm, npm/npx,
+  Yarn Classic/modern, Bun, uv, pip, Poetry PyPI cache, Conda caches, Cargo shared
+  caches, individual Rust toolchains, CocoaPods, Homebrew and known Xcode paths.
+  pnpm's versioned store location is resolved again with the pinned --store-dir;
+  Yarn Classic measures/cleans the parent of its reported versioned cache.
+- [x] Installed npm usage gates native npx cleanup. Older npm stays informational.
+  Corepack network access/project selection is disabled; global inspections and
+  command execution use `/` so repository-local configuration is not inherited.
+- [x] pip's labeled human report has a dedicated parser; Conda JSON is validated
+  with tarball subtotals/warnings recorded separately from unknown index/log yield.
+  **Correction:** routine Conda cleanup preserves extracted packages, since native
+  package pruning can break environments linked into the package cache.
+- [x] CocoaPods inventory resolves CP_CACHE_DIR, CP_HOME_DIR and supported scalar
+  cache_root in bounded user configuration, and measures only downloaded Pods.
+  Unsupported YAML requires an explicit CP_CACHE_DIR. It never runs cache list:
+  native cache initialization can alter old cache schemas during inspection.
+- [x] Added separate docker.volumes-anonymous and docker.volumes-named findings,
+  local-driver/options checks, all-container reference inspection, creation/context
+  identity, per-volume engine reports when available and exact reviewed argv.
+  **Correction to the planned prune below:** both use native `volume rm` on exact
+  names without force. A broad anonymous prune cannot guarantee the reviewed set
+  if containers disappear and make more volumes eligible. Newly orphaned volumes
+  require fresh review. Named volumes remain individually selected user data.
+- [x] Conda environment and rustup toolchain inventory is per installation.
+  Native removal requires an individual CandidateKey/TUI tick; provider-wide IDs
+  cannot authorize mass removal. Base/active Conda environments and known active,
+  default or overridden Rust toolchains remain protected. Other-project toolchain
+  dependencies are unknown and disclosed; Poetry removal remains informational
+  without a verified owning project.
+- [x] DerivedData has measured intervals and retains explicit-ID/high-rebuild-cost
+  policy. Unavailable simulators have per-UUID inventory, sizing and explicit
+  user-data review; bulk `simctl delete unavailable` is no longer planned.
+- [x] Gradle-only-wrapper installations use cached distribution executables, never
+  project gradlew scripts. Every discovered installation must report no running
+  daemons. Missing distributions/failed status remain inventory only.
+- [x] Homebrew cache allocation and removable-formula roots are measured beside
+  native estimates; a separate whole-download-cache deletion remains unsupported.
+  Nix measures a bounded set of currently unreachable paths while retaining unknown
+  GC yield. Cowork enumerates individual recognized bundles rather than one name.
+- [x] CLI shows OCCUPIED separately; CLI/TUI distinguish inventory-only, unknown
+  yield, not measured and refused/failed inspection. Bun preserves stderr and can
+  measure a fallback cache without authorizing a failed native action.
+
+Validation: **200 workspace tests passed** (62 binary, 50 CLI, 88 core),
+including sandboxed npx execution and Docker reference/replacement/new-orphan
+regressions. Formatting, clippy with warnings denied and diff checks passed.
+Tests use temporary fixture trees and stub executables; no real provider cleanup
+was performed. Provider installation inspection is capped at 128 objects and
+reuses protection facts rather than querying them once per environment/toolchain.
+
+**Remaining gates:** live macOS/version validation, APFS recovery measurements,
+wallpaper schema/quiescence/regeneration, individual OrbStack host allocation,
+VMware/Cowork native decommission/reset, global Poetry environment ownership,
+validated stable Cargo granular GC, and a separate Homebrew full-download-cache
+operation. These are concrete unsupported capabilities, not executable guesses.
+The provider checklists below remain open wherever their full end-to-end macOS
+completion criteria have not been met.
+
+Official capability references used during this implementation:
+[npm cache](https://docs.npmjs.com/cli/cache/),
+[Yarn modern cache](https://yarnpkg.com/cli/cache/clean),
+[Yarn Classic cache](https://classic.yarnpkg.com/lang/en/docs/cli/cache/),
+[Conda clean](https://docs.conda.io/projects/conda/en/latest/commands/clean.html),
+[Poetry cache](https://python-poetry.org/docs/cli/),
+[CocoaPods cache initialization](https://github.com/CocoaPods/CocoaPods/blob/master/lib/cocoapods/command/cache.rb),
+[CocoaPods cache configuration](https://github.com/CocoaPods/CocoaPods/blob/master/lib/cocoapods/config.rb),
+[Docker volumes](https://docs.docker.com/engine/storage/volumes/).
+No installed macOS SDK is available on this Linux host; no new SDK claim or
+live macOS cleanup/regeneration result is asserted.
+
+### Target detail readability follow-up (2026-10-15)
+
+- The selected item's details start with its complete target ID, independent of
+  the fixed-width Target column. The panel measures wrapped text at the current
+  terminal width rather than reserving seven lines; it retains space for the
+  table and footer. This also gives long paths and provider consequences room.
+- Rendering regression covers 80, 100 and 150 column terminals, preserving the
+  complete ID, wrapped consequence, recoverability, occupied storage,
+  reclaimable confidence and navigation footer.
+
+### Cowork storage review (2026-10-15)
+
+- Existing `claude.cowork` discovery already measures each recognized VM bundle.
+  It remains informational user data, with no deletion or prune action. The
+  explanation now says local tasks can still require this VM and suggests
+  exporting needed task data in Claude.
+- **Correction:** a VM image being downloadable does not establish that all
+  bundle contents are cache. Anthropic's [architecture overview](https://support.claude.com/en/articles/14479288-claude-cowork-architecture-overview)
+  documents local VM execution; its [migration guidance](https://support.claude.com/en/articles/15520349-use-claude-cowork-on-web-desktop-and-mobile)
+  preserves existing local tasks and scheduled tasks and provides task-data
+  export. No reviewed official documentation supplies a stable host prune/reset
+  API or a versioned list of disposable bundle files. Whole-bundle deletion,
+  guessed image-file removal and pruning inside guest disks remain unsupported.
+- This Linux workspace cannot inspect the installed macOS Claude application or
+  verify bundle regeneration. README and VISION retain the same capability
+  boundary; no live cleanup or macOS SDK claim is introduced.
+
+Validation for these follow-ups: **201 workspace tests passed** (63 binary,
+50 CLI, 88 core), including the existing VM-bundle protection fixture and new
+terminal rendering regression. Formatting, clippy with warnings denied and diff
+checks passed. No real provider cleanup was performed.
 
 ### Provider accounting and inspection
 
@@ -2010,7 +2120,8 @@ Work should continue in this order:
    is informational until that evidence exists.
 3. **Phase 4 project hygiene implemented:** repository/worktree activity,
    retention, shared Cargo ownership safeguards, and Git-ignore evidence for tier-2
-   detectors. Phase 4B provider sizing/cleanup completion above comes next, before Phase 5
+   detectors. Phase 4B now has portable provider implementation and fixtures; finish its
+   macOS validation and unsupported-capability gates above before Phase 5
    indexing/scheduling and the remaining TUI work.
 4. **Resolved Cargo observation (2026-10-13):** stale `cargo.target` actions
    intentionally require aggressive severity; the targets UI now says “needs

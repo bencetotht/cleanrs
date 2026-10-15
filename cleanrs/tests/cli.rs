@@ -2064,3 +2064,149 @@ esac
     assert_eq!(runs[0]["scope"], "[system]");
     assert_eq!(runs[0]["actions"][0]["target_id"], "go.build-cache");
 }
+
+#[test]
+#[cfg(unix)]
+fn npx_cache_cleanup_is_measured_pinned_and_runs_only_inside_its_fixture() {
+    let fixture = tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let cache = root.join("npm/_npx");
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("payload"), vec![3; 32768]).unwrap();
+    fs::create_dir_all(root.join("npm/_cacache")).unwrap();
+    fs::write(root.join("npm/_cacache/preserve"), "content cache").unwrap();
+    let npm = bin.join("npm");
+    fs::write(&npm, r#"#!/bin/sh
+if [ "$PWD" != "/" ]; then echo 'repository cwd leaked into provider command' >&2; exit 9; fi
+if [ "$1" = "--version" ]; then
+  echo '11.2.0'
+elif [ "$1" = "config" ]; then
+  echo "$HOME/npm"
+elif [ "$1" = "cache" ] && [ "$2" = "--help" ]; then
+  echo 'npm cache npx rm [<key>...]'
+elif [ "$1" = "cache" ] && [ "$2" = "npx" ] && [ "$3" = "rm" ] && [ "$4" = "--force" ] && [ "$5" = "--cache=$HOME/npm" ]; then
+  echo "$*" > "$HOME/applied"
+  /bin/rm -r "$HOME/npm/_npx"
+else
+  echo 'unexpected fixture operation' >&2; exit 2
+fi
+"#).unwrap();
+    rewrite_fixture_tools(&npm);
+    fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
+    let invoke = |apply: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cleanrs"));
+        command
+            .args([
+                "clean",
+                root.to_str().unwrap(),
+                "--only",
+                "npm.npx-cache",
+                "--level",
+                "standard",
+                "--json",
+            ])
+            .current_dir(&root)
+            .env("HOME", &root)
+            .env("PATH", &bin)
+            .env("XDG_STATE_HOME", root.join("state"));
+        if apply {
+            command.args(["--apply", "--yes"]);
+        }
+        command.output().unwrap()
+    };
+    let dry = invoke(false);
+    assert!(
+        dry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&dry.stdout).unwrap();
+    assert_eq!(json["selected_targets"], 1);
+    assert_eq!(json["targets"][0]["usage"]["source"], "filesystem");
+    assert!(cache.join("payload").exists());
+    assert!(!root.join("applied").exists());
+    let applied = invoke(true);
+    assert!(
+        applied.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&applied.stderr),
+        String::from_utf8_lossy(&applied.stdout)
+    );
+    assert!(!cache.exists());
+    assert!(root.join("npm/_cacache/preserve").exists());
+    assert!(root.join("applied").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn docker_volume_apply_revalidates_references_and_never_sweeps_new_orphans() {
+    for mode in ["stable", "referenced", "recreated", "new-orphan"] {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let docker = bin.join("docker");
+        fs::write(&docker, r#"#!/bin/sh
+count=0
+if [ -f "$HOME/inspection-count" ]; then read count < "$HOME/inspection-count"; fi
+if [ "$1" = "version" ]; then
+  echo '29.0.0'
+elif [ "$1" = "context" ]; then
+  echo '{"Name":"local","DockerEndpoint":"unix:///fixture/docker.sock"}'
+elif [ "$3" = "system" ]; then
+  if [ "$5" = "--verbose" ]; then
+    echo '[{"Name":"anon1","Size":"1MB"}]'
+  else
+    echo '{"Type":"Local Volumes","Reclaimable":"1MB (100%)"}'
+  fi
+elif [ "$3" = "volume" ] && [ "$4" = "ls" ]; then
+  count=$((count + 1)); echo "$count" > "$HOME/inspection-count"
+  echo 'anon1'
+  if [ "$FIXTURE_MODE" = "new-orphan" ] && [ "$count" -gt 1 ]; then echo 'anon2'; fi
+elif [ "$3" = "volume" ] && [ "$4" = "inspect" ]; then
+  created='original'
+  if [ "$FIXTURE_MODE" = "recreated" ] && [ "$count" -gt 1 ]; then created='replacement'; fi
+  echo "[{\"Name\":\"$5\",\"Driver\":\"local\",\"CreatedAt\":\"$created\",\"Labels\":{\"com.docker.volume.anonymous\":\"\"},\"Options\":{}}]"
+elif [ "$3" = "container" ]; then
+  if [ "$FIXTURE_MODE" = "referenced" ] && [ "$count" -gt 1 ]; then echo 'stopped-container'; fi
+elif [ "$3" = "volume" ] && [ "$4" = "rm" ]; then
+  echo "$*" >> "$HOME/applied"
+else
+  exit 2
+fi
+"#).unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cleanrs"))
+            .args([
+                "clean",
+                root.to_str().unwrap(),
+                "--only",
+                "docker.volumes-anonymous",
+                "--level",
+                "standard",
+                "--apply",
+                "--yes",
+                "--json",
+            ])
+            .env("PATH", &bin)
+            .env("HOME", &root)
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("FIXTURE_MODE", mode)
+            .output()
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|_| panic!("{mode}: {}", String::from_utf8_lossy(&output.stderr)));
+        if matches!(mode, "stable" | "new-orphan") {
+            assert!(output.status.success(), "{mode}: {json}");
+            assert_eq!(
+                fs::read_to_string(root.join("applied")).unwrap(),
+                "--context local volume rm -- anon1\n"
+            );
+        } else {
+            assert!(!root.join("applied").exists(), "{mode}: no removal may run");
+            assert_eq!(json["results"][0]["result"]["status"], "validation_abort");
+        }
+    }
+}

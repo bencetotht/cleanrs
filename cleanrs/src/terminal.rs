@@ -392,6 +392,7 @@ impl TerminalUi {
         let mut targets = self.table();
         targets.set_header(vec![
             self.header("RECLAIMABLE"),
+            self.header("OCCUPIED"),
             self.header("PROJECT"),
             self.header("LOCATION"),
             self.header("AGE"),
@@ -404,6 +405,11 @@ impl TerminalUi {
                 |days| format!("{days}d / {}d", target.stale_after_days),
             );
             let status = match &target.safety {
+                CandidateSafety::Eligible
+                    if matches!(target.operation, PlannedOperation::Informational) =>
+                {
+                    self.value("inventory only", Color::Yellow)
+                }
                 CandidateSafety::Eligible if target.stale == Some(true) => {
                     self.value("eligible", Color::Green)
                 }
@@ -412,9 +418,10 @@ impl TerminalUi {
                     self.value(format!("refused: {reason}"), Color::Red)
                 }
             };
-            let (usage, _) = usage_display(&target.usage);
+            let (usage, _) = target_usage_display(target);
             targets.add_row(vec![
                 self.value(usage, Color::Cyan),
+                Cell::new(occupied_display(target)),
                 Cell::new(target_project_name(target)),
                 Cell::new(target_location(target)),
                 Cell::new(age),
@@ -518,7 +525,7 @@ impl TerminalUi {
                 ),
                 PlanSelection::Skipped(reason) => ("skip", reason.clone(), Color::DarkGrey),
             };
-            let (usage, _) = usage_display(&planned.target.usage);
+            let (usage, _) = target_usage_display(&planned.target);
             plan.add_row(vec![
                 self.value(action, color),
                 self.value(usage, Color::Cyan),
@@ -863,6 +870,47 @@ pub(crate) fn usage_display(usage: &UsageEstimate) -> (String, Option<Confidence
         ),
         UsageEstimate::Unknown { .. } => ("unknown".into(), None),
     }
+}
+
+/// Keep occupied allocation separate from native cleanup yield. Multiple roots
+/// are deliberately not summed here: sharing can span the individual trees.
+pub(crate) fn occupied_display(target: &DetectedTarget) -> String {
+    match target.storage.as_slice() {
+        [storage] => human_bytes(storage.allocated),
+        [] => match target.usage {
+            UsageEstimate::Filesystem { allocated, .. } => human_bytes(allocated),
+            _ if target
+                .evidence
+                .iter()
+                .any(|e| e.starts_with("storage absent")) =>
+            {
+                "absent".into()
+            }
+            _ => "not measured".into(),
+        },
+        roots => format!("{} measured roots", roots.len()),
+    }
+}
+
+pub(crate) fn target_usage_display(target: &DetectedTarget) -> (String, Option<Confidence>) {
+    if matches!(target.safety, CandidateSafety::Refused(_)) {
+        return ("inspection failed/refused".into(), None);
+    }
+    if matches!(target.operation, PlannedOperation::Informational) {
+        return ("inventory only".into(), None);
+    }
+    if matches!(target.usage, UsageEstimate::Unknown { .. }) {
+        return (
+            if target.storage.is_empty() {
+                "not measured"
+            } else {
+                "yield unknown"
+            }
+            .into(),
+            None,
+        );
+    }
+    usage_display(&target.usage)
 }
 
 /// An indeterminate spinner backed by the scanner's monotonic counters.

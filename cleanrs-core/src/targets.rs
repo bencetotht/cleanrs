@@ -773,6 +773,9 @@ pub enum CandidateSafety {
 /// A detected and sized target candidate.
 #[derive(Debug, Clone, Serialize)]
 pub struct DetectedTarget {
+    /// Occupied provider storage, separate from the yield of partial GC/prune.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub storage: Vec<StorageMeasurement>,
     pub gitignore: Option<GitIgnoreEvidence>,
     /// Structured Cargo ownership from metadata inspection; incomplete shared
     /// ownership is evidence only and never authorizes cleanup.
@@ -798,6 +801,17 @@ pub struct DetectedTarget {
     pub exclusive_priority: u8,
     pub consequence: String,
     pub evidence: Vec<String>,
+}
+
+/// Metadata-only measurement of one provider-owned storage root. These values
+/// are inventory evidence, never implicitly added to cleanup estimates.
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageMeasurement {
+    pub path: PathBuf,
+    pub apparent: u64,
+    pub allocated: u64,
+    pub reclaimable: ReclaimEstimate,
+    pub identity: CandidateIdentity,
 }
 
 /// Evidence required for ambiguous folder names, rechecked before deletion.
@@ -867,6 +881,16 @@ impl DetectedTarget {
         explicitly_named: bool,
         ignore_staleness: bool,
     ) -> PolicyStatus<'_> {
+        // A provider-wide ID must never select every protected object. These
+        // rows require an individual CandidateKey (or a TUI tick).
+        let explicitly_named = explicitly_named
+            && !matches!(
+                self.id.as_str(),
+                "docker.volumes-named"
+                    | "conda.environments"
+                    | "rustup.toolchains"
+                    | "xcode.simulators-unavailable"
+            );
         match &self.safety {
             CandidateSafety::Refused(reason) => PolicyStatus::Refused(reason),
             CandidateSafety::Eligible
@@ -1338,6 +1362,7 @@ pub fn detect_workspace_targets(
             detected
                 .entry(path.clone())
                 .or_insert_with(|| DetectedTarget {
+                    storage: Vec::new(),
                     cargo_ownership: None,
                     gitignore: None,
                     id: definition.id.into(),
@@ -1504,6 +1529,7 @@ pub fn detect_explicit_path_target(
         )
     };
     DetectedTarget {
+        storage: Vec::new(),
         cargo_ownership: None,
         gitignore: None,
         id,

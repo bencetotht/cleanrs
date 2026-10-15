@@ -1126,6 +1126,7 @@ fn ensure_no_symlink_ancestors(path: &Path) -> Result<(), String> {
 }
 
 fn revalidate_provider(target: &DetectedTarget, home: Option<&Path>) -> Result<(), String> {
+    cleanrs_core::providers::revalidate_storage(target, home)?;
     if matches!(target.provider.id.as_str(), "workspace" | "configuration") {
         return Ok(());
     }
@@ -1197,7 +1198,7 @@ fn revalidate_provider(target: &DetectedTarget, home: Option<&Path>) -> Result<(
     // reviewed identity (including endpoint), never whichever context is first.
     let current = candidates
         .iter()
-        .find(|item| item.provider == target.provider)
+        .find(|item| item.provider == target.provider && item.path == target.path)
         .ok_or_else(|| {
             format!(
                 "provider identity or context changed after planning (planned {:?}; no matching identity remains)",
@@ -1211,6 +1212,15 @@ fn revalidate_provider(target: &DetectedTarget, home: Option<&Path>) -> Result<(
     }
     if matches!(current.operation, PlannedOperation::Informational) {
         return Err("provider action no longer has a cleanup operation".into());
+    }
+    let roots = |item: &DetectedTarget| {
+        item.storage
+            .iter()
+            .map(|storage| (storage.path.clone(), storage.identity))
+            .collect::<Vec<_>>()
+    };
+    if roots(current) != roots(target) {
+        return Err("provider storage roots or identities changed after review".into());
     }
     if current.operation != target.operation {
         return Err("provider cleanup operation changed after planning".into());

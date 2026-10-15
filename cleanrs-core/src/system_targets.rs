@@ -198,6 +198,7 @@ fn directory(
         explanation: "provider path could not be safely measured".into(),
     };
     let mut age = None;
+    let mut storage = Vec::new();
     let mut planned = PlannedOperation::Informational;
     let mut evidence =
         vec!["system scope: exact provider-owned storage; no home-directory search".into()];
@@ -217,6 +218,21 @@ fn directory(
             }
         }
         let (apparent, allocated) = subtree_sizes(&scan.arena, root);
+        storage.push(crate::targets::StorageMeasurement {
+            path: path.clone(),
+            apparent,
+            allocated,
+            reclaimable: crate::accounting::estimate_subtree(
+                &scan.arena,
+                root,
+                scan.coverage_complete(),
+            ),
+            identity: CandidateIdentity {
+                device: metadata.device,
+                inode: metadata.inode,
+                kind: metadata.kind,
+            },
+        });
         usage = UsageEstimate::Filesystem {
             apparent,
             allocated,
@@ -282,6 +298,7 @@ fn directory(
         properties.automation = Automation::Confirmed;
     }
     inventory.items.push(DetectedTarget {
+        storage,
         gitignore: None,
         cargo_ownership: None,
         id: id.into(),
@@ -333,6 +350,33 @@ fn child_directories(root: &Path, limit: usize) -> Vec<PathBuf> {
         .collect::<Vec<_>>();
     entries.sort();
     entries
+}
+
+/// Use already installed distributions, never a project's gradlew script.
+/// `--status` is version-scoped, so inspect all known installed versions.
+fn gradle_installations(root: &Path, host: &dyn ProviderHost) -> Vec<PathBuf> {
+    let mut executables: Vec<_> = host
+        .resolve_executable("gradle")
+        .ok()
+        .flatten()
+        .into_iter()
+        .collect();
+    for distribution in child_directories(&root.join("wrapper/dists"), 32) {
+        for download in child_directories(&distribution, 32) {
+            for installation in child_directories(&download, 4) {
+                let executable = installation.join("bin/gradle");
+                if no_symlinks(&executable) && executable.is_file() {
+                    executables.push(executable);
+                }
+                if executables.len() > 32 {
+                    return Vec::new();
+                }
+            }
+        }
+    }
+    executables.sort();
+    executables.dedup();
+    executables
 }
 
 /// The user's remembered extension identifier is a discovery hint, not a
@@ -411,14 +455,16 @@ pub fn inspect(
         match provider {
             "gradle" => {
                 let root = context.path("GRADLE_USER_HOME", home.join(".gradle"));
-                let executable = host.resolve_executable("gradle").ok().flatten();
+                let installations = gradle_installations(&root, host);
+                let executable = installations.first().cloned();
                 let version = executable
                     .as_ref()
                     .and_then(|p| stdout(host, &command(p.clone(), &["--version"])));
-                let stopped = executable
-                    .as_ref()
-                    .and_then(|p| stdout(host, &command(p.clone(), &["--offline", "--status"])))
-                    .is_some_and(|text| text.contains("No Gradle daemons are running"));
+                let stopped = !installations.is_empty()
+                    && installations.iter().all(|p| {
+                        stdout(host, &command(p.clone(), &["--offline", "--status"]))
+                            .is_some_and(|text| text.contains("No Gradle daemons are running"))
+                    });
                 for (id, relative, class, consequence) in [
                     (
                         "gradle.caches",
@@ -514,7 +560,7 @@ pub fn inspect(
                         if valid {
                             let mut properties = TargetClass::Cheap.properties();
                             properties.automation = Automation::Confirmed;
-                            inventory.items.push(DetectedTarget { gitignore: None, cargo_ownership: None, id: "watchman.watches".into(),
+                            inventory.items.push(DetectedTarget { storage: Vec::new(), gitignore: None, cargo_ownership: None, id: "watchman.watches".into(),
                                 provider: identity(provider, Path::new("watchman"), Some(executable.clone()), version), description: "Reset Watchman watches".into(), project_root: None, path: None,
                                 class: TargetClass::Cheap, properties, minimum_level: CleanupLevel::Standard, usage: UsageEstimate::Unknown { explanation: "Watchman watch state is not a measured disk-reclamation estimate".into() }, age_days: None, stale_after_days: 0, stale: Some(true), safety: CandidateSafety::Eligible,
                                 operation: PlannedOperation::Command { command: command(executable, &["watch-del-all"]) }, exclusive_group: None, exclusive_priority: 0,
@@ -588,21 +634,30 @@ pub fn inspect(
                 }
             }
             "claude" => {
-                let path =
-                    home.join("Library/Application Support/Claude/vm_bundles/claudevm.bundle");
-                directory(
-                    &mut inventory,
-                    context,
-                    "claude.cowork",
-                    path.clone(),
-                    TargetClass::Irreplaceable,
-                    CleanupLevel::Aggressive,
-                    0,
-                    "Cowork VM/session state may be persistent; no validated reset API, inventory only",
-                    identity(provider, &path, None, None),
-                    None,
-                    true,
-                );
+                // A downloadable VM is not proof that its entire bundle is cache.
+                // Existing local tasks can still need it; keep all bundle contents
+                // protected until a versioned, data-preserving prune API is verified.
+                for path in child_directories(
+                    &home.join("Library/Application Support/Claude/vm_bundles"),
+                    128,
+                )
+                .into_iter()
+                .filter(|p| p.extension().is_some_and(|s| s == "bundle"))
+                {
+                    directory(
+                        &mut inventory,
+                        context,
+                        "claude.cowork",
+                        path.clone(),
+                        TargetClass::Irreplaceable,
+                        CleanupLevel::Aggressive,
+                        0,
+                        "Keep: local Cowork tasks can still need this VM; bundle contents are not verified disposable cache. Export needed task data in Claude; no validated host prune/reset API",
+                        identity(provider, &path, None, None),
+                        None,
+                        true,
+                    );
+                }
             }
             "wallpaper" => {
                 let version = host
@@ -1108,6 +1163,36 @@ mod tests {
                 .all(DetectedTarget::manually_selectable)
         );
         assert_eq!(inventory.items[0].class, TargetClass::Network);
+    }
+
+    #[test]
+    fn gradle_wrapper_only_uses_installed_distribution_and_refuses_active_daemons() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        cache(&root, ".gradle/caches");
+        let bin = cache(
+            &root,
+            ".gradle/wrapper/dists/gradle-8.12-bin/hash/gradle-8.12/bin",
+        );
+        std::fs::write(bin.join("gradle"), "fixture distribution").unwrap();
+        // No global executable is resolved; only a versioned cached Gradle
+        // distribution is present. A project gradlew is never executed.
+        let mut host = Host::default();
+        host.outputs.insert(
+            "gradle --offline --status".into(),
+            "No Gradle daemons are running".into(),
+        );
+        let inventory = inspect_ids(&host, &context(&root), &["gradle.caches"]);
+        assert!(inventory.items[0].manually_selectable());
+        assert_eq!(
+            inventory.items[0].provider.executable,
+            Some(bin.join("gradle"))
+        );
+        host.outputs
+            .insert("gradle --offline --status".into(), "1234 BUSY 8.12".into());
+        assert!(
+            !inspect_ids(&host, &context(&root), &["gradle.caches"]).items[0].manually_selectable()
+        );
     }
     #[test]
     fn go_pins_native_commands_and_separates_build_from_module_downloads() {

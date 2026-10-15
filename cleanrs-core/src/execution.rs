@@ -196,6 +196,7 @@ pub fn execute_command_with_observer(
     }
 
     let mut child = match Command::new(&command.executable)
+        .current_dir("/")
         .args(&command.args)
         .envs(&command.environment)
         .stdin(Stdio::null())
