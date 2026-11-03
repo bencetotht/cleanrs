@@ -1,7 +1,8 @@
 name: CI
 
+# PR-only: running on push as well duplicated every check on PR branches.
+# Merges to main are not re-checked; the PR run is the gate.
 on:
-  push:
   pull_request:
 
 permissions:

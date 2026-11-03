@@ -2158,6 +2158,9 @@ macOS version is claimed without observed schema/regeneration evidence.
       trigger is needed; `GITHUB_TOKEN` tag pushes do not start other workflows.
 - [x] Push/PR CI remains Linux-only. macOS release builds share one `macos-15`
       job; the existing manual benchmark workflow and fixture remain available.
+      **Correction (2026-11-03):** CI now triggers on `pull_request` only; the
+      `push` trigger ran every check twice on PR branches. Pushes to `main`
+      (merges and release bump commits) no longer run CI.
 - [x] Distribution channels are GitHub Release tarballs, the public Homebrew tap,
       and a Nix flake for four Linux/macOS architecture combinations. No crates.io,
       deb/rpm, AUR, installer script or Windows channel was added.

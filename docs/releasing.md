@@ -62,7 +62,8 @@ not prove their binaries build or run.
 
 ## Run a release
 
-1. Merge the intended release tree to `main` and check Linux CI.
+1. Merge the intended release tree to `main` once its PR's Linux CI passes
+   (CI runs on pull requests only, not on pushes to `main`).
 2. Open **Actions → Release → Run workflow**. Choose `main`, a `bump` input
    (`auto` normally), and **`dry_run = true` first**.
 3. Inspect artifacts and every build result. The dry run computes and applies
@@ -73,8 +74,8 @@ not prove their binaries build or run.
    differ if commits or tags changed since the dry run.
 
 Concurrency serializes releases without cancelling an earlier run. macOS runners
-are reserved for the release pipeline; push/PR CI stays Linux-only. The separate
-manual benchmark workflow remains available and is not part of push/PR CI.
+are reserved for the release pipeline; PR CI stays Linux-only. The separate
+manual benchmark workflow remains available and is not part of PR CI.
 
 | Job | Work |
 |---|---|
