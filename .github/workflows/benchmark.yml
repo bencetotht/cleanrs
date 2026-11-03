@@ -23,6 +23,8 @@ jobs:
           cargo run --release -p cleanrs-core --example synthetic_tree -- "$RUNNER_TEMP/cleanrs-fixture" 50000
       - name: Benchmark warm-cache scans
         run: |
+          # Expansion is intentionally deferred to the shell launched by hyperfine.
+          # shellcheck disable=SC2016
           hyperfine --warmup 3 --runs 10 --export-json benchmark.json \
             './target/release/cleanrs scan "$RUNNER_TEMP/cleanrs-fixture" --json --depth 0' \
             'du -sk "$RUNNER_TEMP/cleanrs-fixture"' \

@@ -1,7 +1,8 @@
 name: CI
 
+# PR-only: running on push as well duplicated every check on PR branches.
+# Merges to main are not re-checked; the PR run is the gate.
 on:
-  push:
   pull_request:
 
 permissions:
@@ -36,3 +37,11 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Build release binary
         run: cargo build --workspace --release
+
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - run: nix build .#default -L
+      - run: nix flake check -L
