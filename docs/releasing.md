@@ -7,11 +7,12 @@ do not start other workflows; the release does not depend on that behavior.
 
 ## One-time prerequisites
 
-- Make `bencetotht/cleanrs` public before the first published release. It is
-  currently private; package URLs and anonymous Nix/source installs assume public access.
-- Create the public repository `bencetotht/homebrew-tap`, with an initial commit,
+- `bencetotht/cleanrs` must be public: package URLs and anonymous Nix/source
+  installs assume public access. **Done (2026-11-03):** the repository is public.
+- The public repository `bencetotht/homebrew-tap`, with an initial commit,
   a default branch and a `Formula/` directory (Git needs a file to retain an empty
-  directory, such as `Formula/.gitkeep`). This repository does not yet exist.
+  directory, such as `Formula/.gitkeep`). **Done (2026-11-03):** created with
+  `main`, `README.md` and `Formula/.gitkeep`.
 - Allow GitHub Actions to write repository contents and push the release commit
   to `main`. If branch protection/rulesets are added, give the release actor a
   suitable bypass or adapt authorization before running; a token alone does not
@@ -19,9 +20,10 @@ do not start other workflows; the release does not depend on that behavior.
 - Configure `HOMEBREW_TAP_TOKEN`: a fine-grained PAT limited to
   `bencetotht/homebrew-tap`, with **Contents: read and write**. Store it as an
   Actions secret on `cleanrs`; do not grant unrelated repository access.
-- Configure Apple secrets below for signed/notarized macOS assets, or accept
-  an explicit unsigned-build warning. Once a certificate is supplied, incomplete
-  signing credentials or a non-Accepted notarization result fail the build.
+- Apple signing is **disabled** (2026-11-03): the secret wiring, sign/notarize
+  step and credential cleanup step in `build-macos` are commented out, and the job
+  always emits an unsigned-build warning. No Apple secrets are needed. See
+  [re-enabling Apple signing](#apple-signing-secrets) below.
 
 ## Version conventions
 
@@ -66,8 +68,7 @@ not prove their binaries build or run.
 3. Inspect artifacts and every build result. The dry run computes and applies
    the bump locally in its job, uploads the two manifests, and overlays them on
    the checked-out HEAD in every builder. Thus binaries report the computed
-   version, with no commit/tag/remote publication. Optional signing/notarization
-   still runs when credentials are supplied. Non-main dry runs are allowed.
+   version, with no commit/tag/remote publication. Non-main dry runs are allowed.
 4. Dispatch again from `main` with `dry_run = false` to publish. The version may
    differ if commits or tags changed since the dry run.
 
@@ -78,7 +79,7 @@ manual benchmark workflow remains available and is not part of push/PR CI.
 | Job | Work |
 |---|---|
 | `version` | Full history checkout, clean-tree guard, bump, optional bump commit, annotated tag, push main then tag; expose exact build SHA |
-| `build-macos` | One macos-15 runner builds ARM64 and Intel; optional signing/notarization; native fixture smoke checks; package both using native generators |
+| `build-macos` | One macos-15 runner builds ARM64 and Intel (unsigned; signing is commented out); native fixture smoke checks; package both using native generators |
 | `build-linux` | Native x86_64/ARM64 musl builds on Ubuntu, fixture smoke checks, packages |
 | `nix` | Build the flake at the release SHA and assert its version |
 | `publish` | Require every build, verify four tarballs/checksums, combine `SHA256SUMS`, create the GitHub Release with generated notes |
@@ -86,11 +87,18 @@ manual benchmark workflow remains available and is not part of push/PR CI.
 
 Smoke checks use temporary trees and dry-run cleanup, never `--apply` or the real
 home directory. The x86_64 macOS archive uses the ARM64 binary to generate
-completions/man pages. Signing precedes tarball checksums. Dry runs upload artifacts
+completions/man pages. Dry runs upload artifacts
 and skip commit, push, tag, Release creation and tap updates. The GitHub Release
 is published before the formula is pushed so its download URLs already resolve.
 
 ## Apple signing secrets
+
+**Disabled (2026-11-03).** This section describes the commented-out signing path.
+To re-enable it, uncomment the six `APPLE_*` env entries, the "Sign and notarize
+before packaging" step and the "Remove signing credentials" step in `build-macos`,
+restore the "Unsigned build notice" condition (`if: env.APPLE_CERTIFICATE_P12_BASE64 == ''`),
+then configure the secrets below. Once enabled, signing must precede packaging so
+tarball checksums cover the signed binaries.
 
 Use a Developer ID Application certificate with its private key, and an App
 Store Connect API key authorized for notarization. Export the certificate and
@@ -157,6 +165,6 @@ nix run nixpkgs#actionlint -- .github/workflows/*.yml
 ```
 
 Adjust the local target/version to match your build. Native macOS, ARM Linux,
-musl execution, signing/notarization and actual publication need release-runner
-validation; Linux fixture tests cannot establish those outcomes. The first real
-release, public visibility, tap setup and secrets remain maintainer prerequisites.
+musl execution and actual publication need release-runner validation; Linux
+fixture tests cannot establish those outcomes. Remaining maintainer prerequisites
+are the `HOMEBREW_TAP_TOKEN` secret and the first real release.

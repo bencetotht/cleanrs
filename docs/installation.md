@@ -124,13 +124,16 @@ to this formula. See [Homebrew's security documentation](https://docs.brew.sh/Ho
 Browser-downloaded tarballs commonly carry `com.apple.quarantine`, which can
 propagate to extracted binaries.
 
-When Apple signing secrets are configured, release binaries are Developer ID
-signed and notarized before packaging. Gatekeeper can obtain their notarization
-tickets online; bare Mach-O binaries cannot have a ticket stapled to them.
+**Current releases are unsigned.** Apple Developer ID signing and notarization
+are disabled in the release workflow (2026-11-03), so macOS binaries are neither
+signed nor notarized. Homebrew and Nix installs are unaffected by quarantine as
+described above; browser-downloaded tarballs need the fallback below.
+**Correction:** an earlier version of this page described signing as active
+whenever the maintainer's Apple secrets were configured. The signing steps are
+retained, commented out, in the workflow; if they are re-enabled, release
+binaries are signed and notarized before packaging, and Gatekeeper obtains their
+tickets online (bare Mach-O binaries cannot have a ticket stapled to them).
 See [Apple's notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
-**Correction:** signing is optional in the workflow, so a release without those
-secrets is unsigned; not every downloadable build is guaranteed to be notarized.
-Check the release's build information when this matters.
 
 For an unsigned build whose origin and checksum you have verified, the local
 fallback is:

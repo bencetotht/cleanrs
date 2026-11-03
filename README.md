@@ -33,7 +33,8 @@ cargo install --locked --git https://github.com/bencetotht/cleanrs cleanrs
 
 See [installation](docs/installation.md) for checksums, shell setup, upgrades,
 Full Disk Access, and Gatekeeper. Release channels become available with the
-first published release; signing depends on the maintainer's Apple secrets.
+first published release. macOS release binaries are currently unsigned and
+not notarized (Apple signing is disabled in the release workflow).
 
 ## Quick start — TUI
 

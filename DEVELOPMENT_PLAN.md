@@ -2163,6 +2163,12 @@ macOS version is claimed without observed schema/regeneration evidence.
       deb/rpm, AUR, installer script or Windows channel was added.
 - [x] Apple signing/notarization is optional when no certificate secret exists;
       once enabled, missing credentials or rejected notarization fail the build.
+      **Correction (2026-11-03):** signing is now disabled outright. The `APPLE_*`
+      env wiring, sign/notarize step and credential cleanup step in `build-macos`
+      are commented out (kept for re-enabling), and the job always warns that
+      macOS assets are unsigned. Distribution channels are unchanged: the Nix flake
+      and Homebrew tap, with GitHub Release tarballs kept because the formula
+      downloads them.
 - [x] The first release seeds the current 0.1.0 without editing manifests.
       Automatic breaking changes while 0.x bump minor; explicit `major` permits
       1.0.0. Release versions/tags are owned by the dispatch workflow.
@@ -2247,11 +2253,15 @@ GitHub publication and tap pushes cannot be validated on this Linux host.
 
 ### Open prerequisites
 
-- [ ] Make `bencetotht/cleanrs` public before the first release.
-- [ ] Create the public `bencetotht/homebrew-tap` with an initial default branch
-      and `Formula/` directory, and configure `HOMEBREW_TAP_TOKEN` (tap Contents
-      read/write only). Permit Actions pushes to main; add a bypass if needed.
-- [ ] Supply the six Apple secrets for signed/notarized assets, or accept the
-      documented unsigned warning. No signing credentials were exercised locally.
+- [x] Make `bencetotht/cleanrs` public before the first release. (Verified
+      public, 2026-11-03.)
+- [x] Create the public `bencetotht/homebrew-tap` with an initial default branch
+      and `Formula/` directory. (Created 2026-11-03: `main`, `README.md`,
+      `Formula/.gitkeep`.) Actions is enabled, `main` has no protection/rulesets,
+      and the `version` job requests `contents: write` itself.
+- [ ] Configure `HOMEBREW_TAP_TOKEN` on `cleanrs` (fine-grained PAT, tap
+      Contents read/write only).
+- [x] ~~Supply the six Apple secrets for signed/notarized assets~~ — not needed:
+      signing is disabled (2026-11-03) and the unsigned warning is accepted.
 - [ ] Run the first complete release dry run, inspect all platform artifacts,
       then perform the first published run. Actual remote operations remain untested.
