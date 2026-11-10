@@ -97,7 +97,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.sha }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: inputs.dry_run
         with:
           name: release-manifests
@@ -205,7 +205,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.sha }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: inputs.dry_run
         with:
           name: release-manifests
@@ -249,7 +249,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.sha }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: inputs.dry_run
         with:
           name: release-manifests
@@ -270,7 +270,7 @@ jobs:
       TAG: ${{ needs.version.outputs.tag }}
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           merge-multiple: true
@@ -307,7 +307,7 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.sha }}
           path: source
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           merge-multiple: true
