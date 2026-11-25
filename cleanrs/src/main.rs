@@ -44,6 +44,10 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
+    /// Terminal status and titles (never emitted for JSON or redirected streams).
+    #[arg(long, value_enum, default_value = "auto", global = true)]
+    terminal_integration: terminal::status::Integration,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -376,12 +380,23 @@ pub(crate) struct OutputEntry {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let json = match &cli.command {
+        Commands::Scan(a) => a.json,
+        Commands::Targets(a) | Commands::Projects(a) => a.json,
+        Commands::Clean(a) => a.json,
+        _ => true,
+    };
+    terminal::status::init(
+        cli.terminal_integration,
+        matches!(cli.command, Commands::Tui { .. }),
+        json && !matches!(cli.command, Commands::Tui { .. }),
+    );
     // TUI diagnostics must never be written over the alternate screen.
     if let Commands::Tui { path } = &cli.command {
         return tui::run(path, cli.verbose);
     }
     init_logging(cli.verbose);
-    match cli.command {
+    let result = match cli.command {
         Commands::Scan(args) => run_scan(args),
         Commands::Tui { .. } => unreachable!("TUI dispatched before terminal logging"),
         Commands::Doctor(args) => run_doctor(args),
@@ -398,7 +413,11 @@ fn main() -> Result<()> {
             clap_mangen::Man::new(Cli::command()).render(&mut io::stdout())?;
             Ok(())
         }
+    };
+    if !json {
+        terminal::status::finish(result.is_ok());
     }
+    result
 }
 
 #[derive(Debug, Serialize)]
@@ -668,6 +687,9 @@ fn run_targets(mut args: TargetArgs, projects_only: bool) -> Result<()> {
         println!();
     } else {
         TerminalUi::detect().print_targets(&output);
+        if !output.coverage_complete {
+            terminal::status::report("error", "Incomplete scan coverage");
+        }
     }
     Ok(())
 }
@@ -756,6 +778,9 @@ fn run_clean(args: CleanArgs) -> Result<()> {
             println!();
         } else {
             TerminalUi::detect().print_clean(&output);
+            if !output.coverage_complete {
+                terminal::status::report("error", "Incomplete scan coverage");
+            }
         }
         return Ok(());
     }
@@ -764,6 +789,9 @@ fn run_clean(args: CleanArgs) -> Result<()> {
     if !args.json {
         output.execution = "awaiting confirmation; no action has run".into();
         TerminalUi::detect().print_clean(&output);
+        if !output.coverage_complete {
+            terminal::status::report("error", "Incomplete scan coverage");
+        }
     }
     if !args.yes && !confirm_apply(&plan)? {
         bail!("cleanup cancelled; no action was run");
@@ -794,6 +822,7 @@ fn run_clean(args: CleanArgs) -> Result<()> {
 }
 
 fn confirm_apply(plan: &ReviewedPlan) -> Result<bool> {
+    terminal::status::report("blocked", "Review cleanup confirmation");
     if !io::stdin().is_terminal() {
         bail!("interactive confirmation requires a terminal; repeat with --yes after review");
     }
@@ -986,6 +1015,9 @@ fn run_scan(args: ScanArgs) -> Result<()> {
         println!();
     } else {
         TerminalUi::detect().print_scan(&output, metric);
+        if !output.coverage_complete {
+            terminal::status::report("error", "Incomplete scan coverage");
+        }
     }
     Ok(())
 }

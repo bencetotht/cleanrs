@@ -1,5 +1,6 @@
 //! TTY-aware human output. JSON, completions, and man pages bypass this module.
 
+pub(crate) mod status;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -927,6 +928,7 @@ pub(crate) struct ActionProgressIndicator {
 impl ActionProgressIndicator {
     pub(crate) fn create(label: &str, enabled: bool) -> Option<Self> {
         enabled.then(|| {
+            status::report("working", label);
             let bar = ProgressBar::new_spinner();
             bar.set_style(
                 ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -952,6 +954,7 @@ impl ActionProgressIndicator {
 impl ScanProgressIndicator {
     pub(crate) fn create(label: &str, enabled: bool) -> Option<Arc<Self>> {
         enabled.then(|| {
+            status::report("working", label);
             let bar = ProgressBar::new_spinner();
             bar.set_style(
                 ProgressStyle::with_template("{spinner:.cyan} {msg}  [{elapsed_precise}]")
@@ -966,6 +969,7 @@ impl ScanProgressIndicator {
     }
 
     pub(crate) fn message(&self, message: &str) {
+        status::report("working", message);
         self.bar.set_message(message.to_owned());
     }
 
@@ -976,7 +980,7 @@ impl ScanProgressIndicator {
 
 impl ScanObserver for ScanProgressIndicator {
     fn on_progress(&self, progress: ScanProgress) {
-        self.bar.set_message(format!(
+        self.message(&format!(
             "Scanning · {} dirs · {} entries · {} allocated",
             grouped(progress.directories),
             grouped(progress.entries),
@@ -1012,7 +1016,7 @@ impl PlanObserver for CliPlanObserver {
             PlanEvent::PhaseStarted { phase } => {
                 tracing::debug!(phase, "planning started");
                 if let Some(indicator) = &self.progress {
-                    indicator.bar.set_message(format!("Inspecting {phase}"));
+                    indicator.message(&format!("Inspecting {phase}"));
                 }
             }
             PlanEvent::PhaseFinished { phase, count } => {
@@ -1021,9 +1025,7 @@ impl PlanObserver for CliPlanObserver {
             PlanEvent::ProviderInspection { provider } => {
                 tracing::debug!(provider, "provider inspection");
                 if let Some(indicator) = &self.progress {
-                    indicator
-                        .bar
-                        .set_message(format!("Inspecting system provider: {provider}"));
+                    indicator.message(&format!("Inspecting system provider: {provider}"));
                 }
             }
             PlanEvent::CargoMetadata { completed, total } => {
@@ -1053,7 +1055,12 @@ impl CliExecutionObserver {
 impl ExecutionObserver for CliExecutionObserver {
     fn on_event(&mut self, event: ExecutionEvent<'_>) {
         match event {
-            ExecutionEvent::RunStarted { total } => tracing::debug!(total, "cleanup started"),
+            ExecutionEvent::RunStarted { total } => {
+                if !self.json {
+                    status::report("working", "Applying cleanup");
+                }
+                tracing::debug!(total, "cleanup started");
+            }
             ExecutionEvent::ActionStarted { index, target } => {
                 tracing::debug!(index, target = target.id, "action started");
                 match &target.operation {

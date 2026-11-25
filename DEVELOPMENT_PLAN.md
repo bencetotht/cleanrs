@@ -2268,3 +2268,28 @@ GitHub publication and tap pushes cannot be validated on this Linux host.
       signing is disabled (2026-11-03) and the unsigned warning is accepted.
 - [ ] Run the first complete release dry run, inspect all platform artifacts,
       then perform the first published run. Actual remote operations remain untested.
+
+## Terminal integration (2026-11-25)
+
+- [x] Step 1: shared best-effort OSC 7501 status and OSC 2 titles for CLI
+  scanning/planning/execution and TUI busy, review/quit attention and completion.
+  Repeat app identity on every report, encode free text as base64, bound messages,
+  strip terminal controls, throttle same-state updates to four per second and
+  bypass throttling on state changes. TUI restoration/panic sends idle.
+  CLI uses stderr, TUI stdout before drawing; JSON and redirected streams emit
+  no integration sequences. tmux sequences use passthrough framing (requires
+  user-enabled allow-passthrough). No subprocess or terminal-input probing.
+- [x] Global --terminal-integration=auto|always|never policy; auto also suppresses
+  dumb terminals. Always still respects JSON and stream isolation.
+- [ ] Add terminal.integration configuration through the existing trusted config
+  loader; currently the global CLI option provides the switch.
+- [ ] Step 2: OSC 9;4 progress fallback for other terminals. Verify terminal
+  support before documenting compatibility.
+- [ ] Step 3: explicitly opt-in OSC 9/777 completion notifications for long
+  scans/cleanup; verify accepted formats and avoid duplicate state notifications.
+- [ ] Live Rex/macOS and tmux visual validation; terminal support is not claimed
+  from encoder tests alone.
+- Verification: workspace/all-target tests passed (202 tests), strict
+  workspace/all-target Clippy, formatting and diff whitespace checks passed.
+  Encoder fixtures cover padding, control filtering, bounded Unicode payloads,
+  blocked kind and tmux escape doubling. Live terminal rendering remains pending.

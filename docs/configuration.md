@@ -159,3 +159,10 @@ source paths, and a built-in ID list without scanning. **Correction:** this is
 an inspection report, not an importable round-trip config: `builtin` and `sources`
 are output-only fields and enable/disable policy is not exported. Remove those
 fields and restore desired policy when using exported definitions as a new config.
+
+Terminal status and titles use OSC 7501 and OSC 2 on interactive output streams.
+Use the global option `--terminal-integration auto|always|never` to control them.
+Auto skips dumb terminals; all modes suppress integration for JSON and redirected
+streams. The TUI writes to stdout and CLI commands write to stderr. Under tmux,
+status forwarding requires the user's `allow-passthrough` setting. Unsupported
+terminals may ignore status sequences. Notifications are not sent.
