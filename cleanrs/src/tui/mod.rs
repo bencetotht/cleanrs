@@ -33,6 +33,7 @@ use worker::Workers;
 type PanicHook = Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync>;
 
 fn restore_terminal() {
+    crate::terminal::status::report("idle", "idle");
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
 }
@@ -208,6 +209,24 @@ pub fn run(path: &Path, verbose: u8) -> Result<()> {
         };
         app.page_width = size.width;
         app.page_rows = size.height.saturating_sub(overhead).max(1) as usize;
+        let state = if app.confirm_quit
+            || app.run.as_ref().is_some_and(|r| r.confirm_stop)
+            || app.screen() == app::Screen::Review
+        {
+            "blocked"
+        } else if app.status.as_ref().is_some_and(|(_, error)| *error)
+            || app.directory().coverage_error
+            || app.run.as_ref().is_some_and(|r| {
+                r.error.is_some() || r.summary.as_ref().is_some_and(|s| s.outcome != "success")
+            })
+        {
+            "error"
+        } else if app.busy() {
+            "working"
+        } else {
+            "done"
+        };
+        crate::terminal::status::report(state, &format!("{} · {}", state, app.current.display()));
         terminal.draw(|frame| views::render(frame, &app, theme))?;
         // Busy frames animate at 12.5 Hz; idle freshness updates once per
         // second so old data visibly becomes stale without keyboard input.
