@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "cleanrs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "cleanrs-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitflags",
  "crossbeam-channel",
